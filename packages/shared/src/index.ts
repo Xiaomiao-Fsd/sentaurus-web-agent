@@ -32,6 +32,11 @@ export type VmAgentStatus = {
   latestInstance?: string | null;
   mailbox?: string;
   messageCount?: number;
+  workerRunning?: boolean;
+  workerPid?: number | null;
+  llmConfigured?: boolean;
+  queueDepth?: number;
+  sentaurusTools?: Record<string, string | null>;
   error?: string;
   raw?: string;
 };

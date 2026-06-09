@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { ChatMessage, RunDetail, RunFile, RunSummary, VmAgentHistoryResponse, VmAgentMessage, VmAgentStatus, VmStatus } from "@sentaurus-agent/shared";
+import type { RunDetail, RunFile, RunSummary, VmAgentHistoryResponse, VmAgentMessage, VmAgentStatus, VmStatus } from "@sentaurus-agent/shared";
 import {
   cancelRun,
   connectVmAgent,
@@ -14,7 +14,6 @@ import {
   listRuns,
   logStreamUrl,
   prepareRemoteRun,
-  sendChat,
   sendVmAgentMessage,
   setAuthToken,
   submitRunJob,
@@ -30,7 +29,7 @@ export default function App() {
   const [vmAgent, setVmAgent] = useState<VmAgentStatus | null>(null);
   const [vmAgentMessages, setVmAgentMessages] = useState<VmAgentMessage[]>([]);
   const [vmAgentCursor, setVmAgentCursor] = useState(0);
-  const [vmAgentInput, setVmAgentInput] = useState("hello from web");
+  const [vmAgentInput, setVmAgentInput] = useState("请检查 Sentaurus 工具和最新 agent instance 状态");
   const [vmAgentBusy, setVmAgentBusy] = useState(false);
   const [vmAgentStreamState, setVmAgentStreamState] = useState("idle");
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -38,16 +37,6 @@ export default function App() {
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [runLog, setRunLog] = useState("");
   const [runAction, setRunAction] = useState<string | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: "welcome",
-      role: "system",
-      createdAt: new Date().toISOString(),
-      content: "Welcome. Configure AUTH_TOKEN and LLM/Sentaurus SSH settings in .env, then test VM status."
-    }
-  ]);
-  const [chatInput, setChatInput] = useState("帮我检查 Sentaurus VM 是否连通，并说明下一步应该怎么跑 SDE/SDevice。 ");
-  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     getHealth().then((h) => setHealth(`${h.service} OK @ ${h.time}`)).catch((err) => setHealth(String(err)));
@@ -185,23 +174,6 @@ export default function App() {
     // auth intentionally reconnects the stream after token save.
   }, [selectedRunId, auth]);
 
-  async function handleChat() {
-    const text = chatInput.trim();
-    if (!text) return;
-    setBusy(true);
-    const user: ChatMessage = { id: `local_${Date.now()}`, role: "user", content: text, createdAt: new Date().toISOString() };
-    setMessages((prev) => [...prev, user]);
-    setChatInput("");
-    try {
-      const response = await sendChat(text);
-      setMessages((prev) => [...prev, response.message]);
-    } catch (err) {
-      setMessages((prev) => [...prev, { id: `err_${Date.now()}`, role: "assistant", content: String(err), createdAt: new Date().toISOString() }]);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function handleCreateRun() {
     const title = window.prompt("Run title", "Manual TCAD run") || "Manual TCAD run";
     const result = await createRun(title);
@@ -269,8 +241,8 @@ export default function App() {
       <section className="hero">
         <div>
           <p className="eyebrow">Sentaurus TCAD · Web Agent</p>
-          <h1>Dashboard + Chat Bridge</h1>
-          <p className="muted">Host-side web backend, OpenAI-compatible LLM config, SSH bridge to <code>sentaurus-centos7</code>.</p>
+          <h1>VM Agent Console</h1>
+          <p className="muted">Browser message panel and host-side SSH relay for the CentOS Sentaurus agent.</p>
         </div>
         <div className="health">{health}</div>
       </section>
@@ -296,7 +268,7 @@ export default function App() {
         <div className="card wide">
           <h2>VM Agent</h2>
           <div className="row wrap">
-            <button onClick={handleConnectVmAgent} disabled={vmAgentBusy}>{vmAgentBusy ? "Working..." : "Connect"}</button>
+            <button onClick={handleConnectVmAgent} disabled={vmAgentBusy}>{vmAgentBusy ? "Working..." : "Start VM agent"}</button>
             <button className="secondary" onClick={refreshVmAgent} disabled={vmAgentBusy}>Status</button>
             <button className="secondary" onClick={handleRefreshVmAgentMessages} disabled={vmAgentBusy}>History</button>
             <small className={vmAgentStreamState === "live" ? "oktext" : "muted"}>stream: {vmAgentStreamState}</small>
@@ -309,18 +281,9 @@ export default function App() {
             {vmAgentMessages.length === 0 && <p className="muted">No VM agent messages yet.</p>}
           </div>
           <div className="row">
-            <input value={vmAgentInput} onChange={(event) => setVmAgentInput(event.target.value)} placeholder="Message to VM agent" />
+            <input value={vmAgentInput} onChange={(event) => setVmAgentInput(event.target.value)} placeholder="Message to CentOS VM agent" />
             <button onClick={handleVmAgentMessage} disabled={vmAgentBusy}>{vmAgentBusy ? "Sending..." : "Send"}</button>
           </div>
-        </div>
-
-        <div className="card wide">
-          <h2>Chat</h2>
-          <div className="messages">
-            {messages.map((m) => <div key={m.id} className={`msg ${m.role}`}><b>{m.role}</b><span>{m.content}</span></div>)}
-          </div>
-          <textarea value={chatInput} onChange={(e) => setChatInput(e.target.value)} rows={4} />
-          <button onClick={handleChat} disabled={busy}>{busy ? "Thinking..." : "Send"}</button>
         </div>
 
         <div className="card wide">
