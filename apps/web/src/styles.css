@@ -48,10 +48,12 @@ h2 { margin-top: 0; }
 .row { display: flex; gap: 0.75rem; align-items: center; }
 .wrap { flex-wrap: wrap; }
 .messages { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1rem; max-height: 360px; overflow: auto; }
+.messages.compact { margin-top: 1rem; max-height: 260px; }
 .msg { display: grid; gap: 0.25rem; padding: 0.8rem; border-radius: 12px; background: #111827; white-space: pre-wrap; }
 .msg.user { background: #172554; }
 .msg.assistant { background: #1e293b; }
 .msg.system { background: #312e81; }
+.msg.agent { background: #064e3b; }
 .okbox, .errbox { overflow: auto; border-radius: 12px; padding: 0.75rem; max-height: 360px; }
 .okbox { background: rgba(22, 101, 52, 0.28); color: #dcfce7; }
 .errbox { background: rgba(127, 29, 29, 0.35); color: #fee2e2; }

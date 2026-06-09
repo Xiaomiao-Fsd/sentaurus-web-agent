@@ -1,17 +1,20 @@
 import { useEffect, useState } from "react";
-import type { ChatMessage, RunDetail, RunFile, RunSummary, VmStatus } from "@sentaurus-agent/shared";
+import type { ChatMessage, RunDetail, RunFile, RunSummary, VmAgentMessage, VmAgentStatus, VmStatus } from "@sentaurus-agent/shared";
 import {
   cancelRun,
+  connectVmAgent,
   createRun,
   downloadUrl,
   getAuthToken,
   getHealth,
   getRun,
+  getVmAgentStatus,
   getVmStatus,
   listRuns,
   logStreamUrl,
   prepareRemoteRun,
   sendChat,
+  sendVmAgentMessage,
   setAuthToken,
   submitRunJob,
   uploadRunFile
@@ -22,6 +25,10 @@ export default function App() {
   const [health, setHealth] = useState<string>("checking...");
   const [vm, setVm] = useState<VmStatus | null>(null);
   const [vmLoading, setVmLoading] = useState(false);
+  const [vmAgent, setVmAgent] = useState<VmAgentStatus | null>(null);
+  const [vmAgentMessages, setVmAgentMessages] = useState<VmAgentMessage[]>([]);
+  const [vmAgentInput, setVmAgentInput] = useState("hello from web");
+  const [vmAgentBusy, setVmAgentBusy] = useState(false);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
@@ -53,6 +60,46 @@ export default function App() {
       setVm(await getVmStatus());
     } finally {
       setVmLoading(false);
+    }
+  }
+
+  async function refreshVmAgent() {
+    setVmAgentBusy(true);
+    try {
+      setVmAgent(await getVmAgentStatus());
+    } finally {
+      setVmAgentBusy(false);
+    }
+  }
+
+  async function handleConnectVmAgent() {
+    setVmAgentBusy(true);
+    try {
+      const response = await connectVmAgent();
+      setVmAgent(response.status);
+      if (response.message) setVmAgentMessages((prev) => [...prev, response.message!]);
+    } catch (err) {
+      setVmAgentMessages((prev) => [...prev, { id: `vm_err_${Date.now()}`, role: "system", content: String(err), createdAt: new Date().toISOString() }]);
+    } finally {
+      setVmAgentBusy(false);
+    }
+  }
+
+  async function handleVmAgentMessage() {
+    const text = vmAgentInput.trim();
+    if (!text) return;
+    setVmAgentBusy(true);
+    const user: VmAgentMessage = { id: `vm_user_${Date.now()}`, role: "user", content: text, createdAt: new Date().toISOString() };
+    setVmAgentMessages((prev) => [...prev, user]);
+    setVmAgentInput("");
+    try {
+      const response = await sendVmAgentMessage(text);
+      if (response.status) setVmAgent(response.status);
+      setVmAgentMessages((prev) => [...prev, response.message]);
+    } catch (err) {
+      setVmAgentMessages((prev) => [...prev, { id: `vm_err_${Date.now()}`, role: "system", content: String(err), createdAt: new Date().toISOString() }]);
+    } finally {
+      setVmAgentBusy(false);
     }
   }
 
@@ -188,6 +235,25 @@ export default function App() {
           {vm && (
             <pre className={vm.ok ? "okbox" : "errbox"}>{JSON.stringify(vm, null, 2)}</pre>
           )}
+        </div>
+
+        <div className="card wide">
+          <h2>VM Agent</h2>
+          <div className="row wrap">
+            <button onClick={handleConnectVmAgent} disabled={vmAgentBusy}>{vmAgentBusy ? "Working..." : "Connect"}</button>
+            <button className="secondary" onClick={refreshVmAgent} disabled={vmAgentBusy}>Status</button>
+          </div>
+          {vmAgent && (
+            <pre className={vmAgent.ok ? "okbox" : "errbox"}>{JSON.stringify(vmAgent, null, 2)}</pre>
+          )}
+          <div className="messages compact">
+            {vmAgentMessages.map((m) => <div key={m.id} className={`msg ${m.role}`}><b>{m.role}</b><span>{m.content}</span></div>)}
+            {vmAgentMessages.length === 0 && <p className="muted">No VM agent messages yet.</p>}
+          </div>
+          <div className="row">
+            <input value={vmAgentInput} onChange={(event) => setVmAgentInput(event.target.value)} placeholder="Message to VM agent" />
+            <button onClick={handleVmAgentMessage} disabled={vmAgentBusy}>{vmAgentBusy ? "Sending..." : "Send"}</button>
+          </div>
         </div>
 
         <div className="card wide">

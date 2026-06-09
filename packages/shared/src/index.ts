@@ -10,6 +10,42 @@ export type VmStatus = {
   raw?: string;
 };
 
+export type VmAgentMessage = {
+  id: string;
+  role: "user" | "agent" | "system";
+  content: string;
+  createdAt: string;
+  meta?: Record<string, string | number | boolean | null>;
+};
+
+export type VmAgentStatus = {
+  ok: boolean;
+  checkedAt: string;
+  sshTarget: string;
+  connected: boolean;
+  agent?: string;
+  version?: string;
+  hostname?: string;
+  user?: string;
+  capabilities?: string[];
+  instanceCount?: number;
+  latestInstance?: string | null;
+  error?: string;
+  raw?: string;
+};
+
+export type VmAgentConnectResponse = {
+  ok: boolean;
+  status: VmAgentStatus;
+  message?: VmAgentMessage;
+};
+
+export type VmAgentMessageResponse = {
+  ok: boolean;
+  status?: VmAgentStatus;
+  message: VmAgentMessage;
+};
+
 export type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "system";

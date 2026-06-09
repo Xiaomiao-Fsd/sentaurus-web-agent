@@ -1,4 +1,13 @@
-import type { ChatResponse, VmStatus, RunDetail, RunFile, RunSummary } from "@sentaurus-agent/shared";
+import type {
+  ChatResponse,
+  VmAgentConnectResponse,
+  VmAgentMessageResponse,
+  VmAgentStatus,
+  VmStatus,
+  RunDetail,
+  RunFile,
+  RunSummary
+} from "@sentaurus-agent/shared";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5175";
 
@@ -49,6 +58,18 @@ export async function getHealth(): Promise<{ ok: boolean; service: string; time:
 
 export async function getVmStatus(): Promise<VmStatus> {
   return request("/api/vm/status");
+}
+
+export async function getVmAgentStatus(): Promise<VmAgentStatus> {
+  return request("/api/vm/agent/status");
+}
+
+export async function connectVmAgent(): Promise<VmAgentConnectResponse> {
+  return request("/api/vm/agent/connect", { method: "POST", body: JSON.stringify({}) });
+}
+
+export async function sendVmAgentMessage(message: string): Promise<VmAgentMessageResponse> {
+  return request("/api/vm/agent/messages", { method: "POST", body: JSON.stringify({ message }) });
 }
 
 export async function sendChat(message: string): Promise<ChatResponse> {

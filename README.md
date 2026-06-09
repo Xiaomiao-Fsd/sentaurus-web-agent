@@ -101,6 +101,7 @@ Implemented:
 - Web dashboard shell
 - Chat panel wired to `/api/chat`
 - VM status panel wired to `/api/vm/status`
+- VM Agent panel wired to an SSH-backed `/api/vm/agent/*` bridge
 - Run creation/listing API
 - Run detail view
 - Run input upload and input/artifact download APIs
@@ -127,10 +128,14 @@ POST /api/runs/:id/prepare-remote
 POST /api/runs/:id/jobs
 POST /api/runs/:id/cancel
 GET  /api/runs/:id/logs/stream
+GET  /api/vm/agent/status
+POST /api/vm/agent/connect
+POST /api/vm/agent/messages
 ```
 
 Current behavior:
 
+- The VM agent bridge performs a safe SSH-backed hello/echo handshake and can report VM-side agent instance artifacts.
 - Uploaded files are written only to the run's `input/` directory.
 - File names are validated; path traversal and hidden-path style names are rejected.
 - Browser-facing run summaries hide `localDir` to avoid exposing backend absolute paths.
