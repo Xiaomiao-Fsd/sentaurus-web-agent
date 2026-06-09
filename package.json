@@ -1,0 +1,24 @@
+{
+  "name": "sentaurus-web-agent",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "npm@11.6.2",
+  "description": "Browser dashboard/chat for a Sentaurus TCAD agent bridge.",
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"npm run dev -w @sentaurus-agent/server\" \"npm run dev -w @sentaurus-agent/web\"",
+    "dev:web": "npm run dev -w @sentaurus-agent/web",
+    "dev:server": "npm run dev -w @sentaurus-agent/server",
+    "build": "npm run prepare:shared && npm run build --workspaces --if-present",
+    "typecheck": "npm run prepare:shared && npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "prepare:shared": "npm run build -w @sentaurus-agent/shared"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "concurrently": "^9.1.2"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}
