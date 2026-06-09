@@ -4,6 +4,7 @@ import multipart from "@fastify/multipart";
 import { config } from "./config.js";
 import { healthRoutes } from "./routes/health.js";
 import { vmRoutes } from "./routes/vm.js";
+import { vmAgentRoutes } from "./routes/vmAgent.js";
 import { chatRoutes } from "./routes/chat.js";
 import { runRoutes } from "./routes/runs.js";
 
@@ -13,6 +14,7 @@ await app.register(multipart, { limits: { fileSize: config.MAX_UPLOAD_MB * 1024 
 
 await app.register(healthRoutes);
 await app.register(vmRoutes);
+await app.register(vmAgentRoutes);
 await app.register(chatRoutes);
 await app.register(runRoutes);
 
