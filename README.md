@@ -62,6 +62,7 @@ Then put the OpenAI-compatible values inside the CentOS VM, not in the web repo:
 LLM_API_BASE=https://your-openai-compatible-base/v1
 LLM_API_KEY=your-real-key
 LLM_MODEL=gpt-5.5
+LLM_API_STYLE=chat-completions # or openai-responses
 ```
 
 The agent also writes `config.example.json` and `.env.example` in that VM directory. Do not copy real keys back to the host repo.

@@ -136,6 +136,7 @@ def load_config():
         "api_base": env.get("LLM_API_BASE") or file_config.get("llmApiBase") or file_config.get("LLM_API_BASE") or "",
         "api_key": env.get("LLM_API_KEY") or file_config.get("llmApiKey") or file_config.get("LLM_API_KEY") or "",
         "model": env.get("LLM_MODEL") or file_config.get("llmModel") or file_config.get("LLM_MODEL") or "gpt-5.5",
+        "api_style": env.get("LLM_API_STYLE") or file_config.get("llmApiStyle") or file_config.get("LLM_API_STYLE") or "chat-completions",
     }
 
 def llm_configured(config):
@@ -215,6 +216,23 @@ def chat_completions_url(api_base):
         return base
     return base + "/chat/completions"
 
+def responses_url(api_base):
+    base = api_base.rstrip("/")
+    if base.endswith("/responses"):
+        return base
+    return base + "/responses"
+
+def parse_responses_text(data):
+    if data.get("output_text"):
+        return data.get("output_text")
+    parts = []
+    for item in data.get("output", []) or []:
+        for content in item.get("content", []) or []:
+            text = content.get("text")
+            if text:
+                parts.append(text)
+    return "\n".join(parts).strip() or "LLM returned no content."
+
 def call_llm(user_text, config):
     snapshot = skill_snapshot()
     system = (
@@ -224,6 +242,28 @@ def call_llm(user_text, config):
         "Do not claim to run real Sentaurus jobs unless an allowlisted job runner is explicitly implemented. "
         "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True)
     )
+    api_style = (config.get("api_style") or "chat-completions").lower()
+    if api_style in ["openai-responses", "responses"]:
+        payload = {
+            "model": config.get("model") or "gpt-5.5",
+            "input": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text},
+            ],
+        }
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib2.Request(responses_url(config.get("api_base")), body, {
+            "content-type": "application/json",
+            "authorization": "Bearer %s" % config.get("api_key"),
+            "user-agent": "sentaurus-vm-agent/0.3",
+        })
+        response = urllib2.urlopen(request, timeout=90).read()
+        try:
+            text = response.decode("utf-8", "replace")
+        except AttributeError:
+            text = response
+        return parse_responses_text(json.loads(text))
+
     payload = {
         "model": config.get("model") or "gpt-5.5",
         "messages": [
@@ -236,6 +276,7 @@ def call_llm(user_text, config):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
+        "user-agent": "sentaurus-vm-agent/0.3",
     })
     response = urllib2.urlopen(request, timeout=90).read()
     try:
@@ -256,7 +297,7 @@ def reply_for(text):
             "or config.json. Sentaurus safe skills are already available; ask for status/tools to test them."
         ), {"kind": "config_required", "llmConfigured": False}
     try:
-        return call_llm(text, config), {"kind": "llm", "llmConfigured": True, "model": config.get("model")}
+        return call_llm(text, config), {"kind": "llm", "llmConfigured": True, "model": config.get("model"), "apiStyle": config.get("api_style")}
     except Exception as exc:
         return "VM agent LLM call failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": True}
 
@@ -502,11 +543,12 @@ def write_worker_files():
             handle.write(json.dumps({
                 "llmApiBase": "https://your-openai-compatible-base/v1",
                 "llmApiKey": "put-real-key-here-inside-vm-only",
-                "llmModel": "gpt-5.5"
+                "llmModel": "gpt-5.5",
+                "llmApiStyle": "chat-completions"
             }, indent=2, sort_keys=True) + "\n")
     if not os.path.exists(ENV_EXAMPLE_PATH):
         with open(ENV_EXAMPLE_PATH, "w") as handle:
-            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\n")
+            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_API_STYLE=chat-completions\n")
 
 def start_worker():
     write_worker_files()
