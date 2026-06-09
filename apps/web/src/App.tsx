@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { ChatMessage, RunDetail, RunFile, RunSummary, VmAgentMessage, VmAgentStatus, VmStatus } from "@sentaurus-agent/shared";
+import type { ChatMessage, RunDetail, RunFile, RunSummary, VmAgentHistoryResponse, VmAgentMessage, VmAgentStatus, VmStatus } from "@sentaurus-agent/shared";
 import {
   cancelRun,
   connectVmAgent,
@@ -8,6 +8,7 @@ import {
   getAuthToken,
   getHealth,
   getRun,
+  getVmAgentMessages,
   getVmAgentStatus,
   getVmStatus,
   listRuns,
@@ -17,7 +18,8 @@ import {
   sendVmAgentMessage,
   setAuthToken,
   submitRunJob,
-  uploadRunFile
+  uploadRunFile,
+  vmAgentMessageStreamUrl
 } from "./lib/api.js";
 
 export default function App() {
@@ -27,8 +29,10 @@ export default function App() {
   const [vmLoading, setVmLoading] = useState(false);
   const [vmAgent, setVmAgent] = useState<VmAgentStatus | null>(null);
   const [vmAgentMessages, setVmAgentMessages] = useState<VmAgentMessage[]>([]);
+  const [vmAgentCursor, setVmAgentCursor] = useState(0);
   const [vmAgentInput, setVmAgentInput] = useState("hello from web");
   const [vmAgentBusy, setVmAgentBusy] = useState(false);
+  const [vmAgentStreamState, setVmAgentStreamState] = useState("idle");
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
@@ -48,6 +52,44 @@ export default function App() {
   useEffect(() => {
     getHealth().then((h) => setHealth(`${h.service} OK @ ${h.time}`)).catch((err) => setHealth(String(err)));
   }, []);
+
+  function mergeVmAgentMessages(next: VmAgentMessage[] | undefined) {
+    if (!next?.length) return;
+    setVmAgentMessages((prev) => {
+      const seen = new Set(prev.map((message) => message.id));
+      const merged = [...prev];
+      for (const message of next) {
+        if (!seen.has(message.id)) {
+          merged.push(message);
+          seen.add(message.id);
+        }
+      }
+      return merged;
+    });
+  }
+
+  useEffect(() => {
+    if (!auth) {
+      setVmAgentStreamState("auth required");
+      return;
+    }
+    setVmAgentStreamState("connecting");
+    const events = new EventSource(vmAgentMessageStreamUrl(vmAgentCursor));
+    events.addEventListener("messages", (event) => {
+      const data = JSON.parse((event as MessageEvent).data) as VmAgentHistoryResponse;
+      setVmAgent(data.status);
+      setVmAgentCursor(data.cursor);
+      mergeVmAgentMessages(data.messages);
+      setVmAgentStreamState("live");
+    });
+    events.addEventListener("ping", () => setVmAgentStreamState("live"));
+    events.addEventListener("error", () => {
+      setVmAgentStreamState("disconnected");
+      events.close();
+    });
+    return () => events.close();
+    // The stream keeps its own server-side cursor after it opens.
+  }, [auth]);
 
   async function saveToken() {
     setAuthToken(auth);
@@ -77,7 +119,22 @@ export default function App() {
     try {
       const response = await connectVmAgent();
       setVmAgent(response.status);
-      if (response.message) setVmAgentMessages((prev) => [...prev, response.message!]);
+      setVmAgentCursor(response.cursor || 0);
+      mergeVmAgentMessages(response.messages || (response.message ? [response.message] : []));
+    } catch (err) {
+      setVmAgentMessages((prev) => [...prev, { id: `vm_err_${Date.now()}`, role: "system", content: String(err), createdAt: new Date().toISOString() }]);
+    } finally {
+      setVmAgentBusy(false);
+    }
+  }
+
+  async function handleRefreshVmAgentMessages() {
+    setVmAgentBusy(true);
+    try {
+      const response = await getVmAgentMessages(0);
+      setVmAgent(response.status);
+      setVmAgentCursor(response.cursor);
+      mergeVmAgentMessages(response.messages);
     } catch (err) {
       setVmAgentMessages((prev) => [...prev, { id: `vm_err_${Date.now()}`, role: "system", content: String(err), createdAt: new Date().toISOString() }]);
     } finally {
@@ -89,13 +146,12 @@ export default function App() {
     const text = vmAgentInput.trim();
     if (!text) return;
     setVmAgentBusy(true);
-    const user: VmAgentMessage = { id: `vm_user_${Date.now()}`, role: "user", content: text, createdAt: new Date().toISOString() };
-    setVmAgentMessages((prev) => [...prev, user]);
     setVmAgentInput("");
     try {
       const response = await sendVmAgentMessage(text);
-      if (response.status) setVmAgent(response.status);
-      setVmAgentMessages((prev) => [...prev, response.message]);
+      setVmAgent(response.status);
+      setVmAgentCursor(response.cursor);
+      mergeVmAgentMessages(response.messages || [response.message]);
     } catch (err) {
       setVmAgentMessages((prev) => [...prev, { id: `vm_err_${Date.now()}`, role: "system", content: String(err), createdAt: new Date().toISOString() }]);
     } finally {
@@ -242,6 +298,8 @@ export default function App() {
           <div className="row wrap">
             <button onClick={handleConnectVmAgent} disabled={vmAgentBusy}>{vmAgentBusy ? "Working..." : "Connect"}</button>
             <button className="secondary" onClick={refreshVmAgent} disabled={vmAgentBusy}>Status</button>
+            <button className="secondary" onClick={handleRefreshVmAgentMessages} disabled={vmAgentBusy}>History</button>
+            <small className={vmAgentStreamState === "live" ? "oktext" : "muted"}>stream: {vmAgentStreamState}</small>
           </div>
           {vmAgent && (
             <pre className={vmAgent.ok ? "okbox" : "errbox"}>{JSON.stringify(vmAgent, null, 2)}</pre>

@@ -30,6 +30,8 @@ export type VmAgentStatus = {
   capabilities?: string[];
   instanceCount?: number;
   latestInstance?: string | null;
+  mailbox?: string;
+  messageCount?: number;
   error?: string;
   raw?: string;
 };
@@ -38,12 +40,23 @@ export type VmAgentConnectResponse = {
   ok: boolean;
   status: VmAgentStatus;
   message?: VmAgentMessage;
+  messages?: VmAgentMessage[];
+  cursor?: number;
 };
 
 export type VmAgentMessageResponse = {
   ok: boolean;
-  status?: VmAgentStatus;
+  status: VmAgentStatus;
   message: VmAgentMessage;
+  messages: VmAgentMessage[];
+  cursor: number;
+};
+
+export type VmAgentHistoryResponse = {
+  ok: boolean;
+  status: VmAgentStatus;
+  messages: VmAgentMessage[];
+  cursor: number;
 };
 
 export type ChatMessage = {

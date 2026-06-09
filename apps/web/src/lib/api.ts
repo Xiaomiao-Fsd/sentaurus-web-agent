@@ -1,6 +1,7 @@
 import type {
   ChatResponse,
   VmAgentConnectResponse,
+  VmAgentHistoryResponse,
   VmAgentMessageResponse,
   VmAgentStatus,
   VmStatus,
@@ -72,6 +73,10 @@ export async function sendVmAgentMessage(message: string): Promise<VmAgentMessag
   return request("/api/vm/agent/messages", { method: "POST", body: JSON.stringify({ message }) });
 }
 
+export async function getVmAgentMessages(after = 0): Promise<VmAgentHistoryResponse> {
+  return request(`/api/vm/agent/messages?after=${encodeURIComponent(String(after))}`);
+}
+
 export async function sendChat(message: string): Promise<ChatResponse> {
   return request("/api/chat", { method: "POST", body: JSON.stringify({ message }) });
 }
@@ -112,4 +117,8 @@ export function downloadUrl(id: string, area: "files" | "artifacts", name: strin
 
 export function logStreamUrl(id: string): string {
   return `${API_BASE}/api/runs/${encodeURIComponent(id)}/logs/stream?token=${encodeURIComponent(token())}`;
+}
+
+export function vmAgentMessageStreamUrl(after = 0): string {
+  return `${API_BASE}/api/vm/agent/messages/stream?after=${encodeURIComponent(String(after))}&token=${encodeURIComponent(token())}`;
 }

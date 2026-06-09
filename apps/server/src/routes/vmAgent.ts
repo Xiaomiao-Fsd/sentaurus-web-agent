@@ -1,6 +1,13 @@
 import type { FastifyInstance } from "fastify";
+import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
-import { connectVmAgent, getVmAgentStatus, sendVmAgentMessage } from "../services/vmAgent.js";
+import { connectVmAgent, getVmAgentMessages, getVmAgentStatus, sendVmAgentMessage } from "../services/vmAgent.js";
+
+function parseCursor(value: unknown): number {
+  if (typeof value !== "string") return 0;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
 
 export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/vm/agent/status", async (request) => {
@@ -11,6 +18,12 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/vm/agent/connect", async (request) => {
     requireAuth(request);
     const result = await connectVmAgent();
+    return { ok: result.status.ok, ...result };
+  });
+
+  app.get<{ Querystring: { after?: string } }>("/api/vm/agent/messages", async (request) => {
+    requireAuth(request);
+    const result = await getVmAgentMessages(parseCursor(request.query.after));
     return { ok: result.status.ok, ...result };
   });
 
@@ -29,5 +42,44 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     }
     const result = await sendVmAgentMessage(message);
     return { ok: result.status.ok, ...result };
+  });
+
+  app.get<{ Querystring: { after?: string; token?: string } }>("/api/vm/agent/messages/stream", async (request, reply) => {
+    requireAuth(request);
+    reply.raw.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "access-control-allow-origin": config.CORS_ORIGIN,
+      vary: "origin",
+      connection: "keep-alive"
+    });
+
+    let cursor = parseCursor(request.query.after);
+    let running = false;
+    const send = (event: string, data: unknown) => {
+      reply.raw.write(`event: ${event}\n`);
+      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+    const tick = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const result = await getVmAgentMessages(cursor);
+        cursor = result.cursor;
+        if (result.messages.length > 0) {
+          send("messages", result);
+        } else {
+          send("ping", { time: new Date().toISOString(), cursor });
+        }
+      } catch (err) {
+        send("error", { message: err instanceof Error ? err.message : String(err) });
+      } finally {
+        running = false;
+      }
+    };
+
+    await tick();
+    const interval = setInterval(() => void tick(), 2000);
+    request.raw.on("close", () => clearInterval(interval));
   });
 }

@@ -102,6 +102,7 @@ Implemented:
 - Chat panel wired to `/api/chat`
 - VM status panel wired to `/api/vm/status`
 - VM Agent panel wired to an SSH-backed `/api/vm/agent/*` bridge
+- VM-side mailbox shim at `~/.sentaurus-web-agent/vm-agent` for hello/status/message history
 - Run creation/listing API
 - Run detail view
 - Run input upload and input/artifact download APIs
@@ -130,12 +131,14 @@ POST /api/runs/:id/cancel
 GET  /api/runs/:id/logs/stream
 GET  /api/vm/agent/status
 POST /api/vm/agent/connect
+GET  /api/vm/agent/messages
 POST /api/vm/agent/messages
+GET  /api/vm/agent/messages/stream
 ```
 
 Current behavior:
 
-- The VM agent bridge performs a safe SSH-backed hello/echo handshake and can report VM-side agent instance artifacts.
+- The VM agent bridge invokes a controlled Python mailbox shim on the VM over SSH. It persists web/user and VM/agent messages under `~/.sentaurus-web-agent/vm-agent`, supports hello/status/history, and can report VM-side agent instance artifacts by basename.
 - Uploaded files are written only to the run's `input/` directory.
 - File names are validated; path traversal and hidden-path style names are rejected.
 - Browser-facing run summaries hide `localDir` to avoid exposing backend absolute paths.

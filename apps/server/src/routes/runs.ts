@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
 import { prepareRemoteRun } from "../services/sentaurusRunner.js";
 import {
@@ -114,6 +115,8 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
     reply.raw.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
+      "access-control-allow-origin": config.CORS_ORIGIN,
+      vary: "origin",
       connection: "keep-alive"
     });
     let offset = 0;
