@@ -29,12 +29,30 @@ export type ChatResponse = {
 
 export type RunStatus = "created" | "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
+export type RunFileKind = "input" | "logs" | "artifacts";
+
+export type RunFile = {
+  name: string;
+  kind: RunFileKind;
+  size: number;
+  modifiedAt: string;
+};
+
 export type RunSummary = {
   id: string;
   status: RunStatus;
   createdAt: string;
   updatedAt: string;
   title: string;
-  localDir: string;
+  localDir?: string;
   remoteDir?: string;
+  remotePreparedAt?: string;
+  lastError?: string;
+};
+
+export type RunDetail = {
+  run: RunSummary;
+  files: RunFile[];
+  logs: RunFile[];
+  artifacts: RunFile[];
 };

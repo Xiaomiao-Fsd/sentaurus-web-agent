@@ -102,14 +102,46 @@ Implemented:
 - Chat panel wired to `/api/chat`
 - VM status panel wired to `/api/vm/status`
 - Run creation/listing API
+- Run detail view
+- Run input upload and input/artifact download APIs
+- Basic SSE job-log stream
+- Remote run preparation endpoint, still gated by `ENABLE_REAL_JOBS`
 - Local run directories
 - LLM chat call through OpenAI-compatible `/chat/completions`
 - Documentation for Windows host and Sentaurus SSH setup
 
+## Run lifecycle APIs
+
+Protected by `AUTH_TOKEN`:
+
+```text
+GET  /api/runs
+POST /api/runs
+GET  /api/runs/:id
+POST /api/runs/:id/files
+GET  /api/runs/:id/files
+GET  /api/runs/:id/files/:name
+GET  /api/runs/:id/artifacts
+GET  /api/runs/:id/artifacts/:name
+POST /api/runs/:id/prepare-remote
+POST /api/runs/:id/jobs
+POST /api/runs/:id/cancel
+GET  /api/runs/:id/logs/stream
+```
+
+Current behavior:
+
+- Uploaded files are written only to the run's `input/` directory.
+- File names are validated; path traversal and hidden-path style names are rejected.
+- Browser-facing run summaries hide `localDir` to avoid exposing backend absolute paths.
+- `prepare-remote` writes diagnostic lines to `logs/prepare-remote.log` and `logs/job.log`.
+- Real Sentaurus job submission is still intentionally disabled/not implemented.
+- `ENABLE_REAL_JOBS=0` keeps true execution paths blocked.
+
 Next recommended steps:
 
-1. Add file upload/download per run.
-2. Implement SDE/SDevice job queue and SSE log streaming.
-3. Add result artifact parser for `.plt`/`.tdr` outputs.
+1. Add remote input sync from local run `input/` to `SENTAURUS_REMOTE_BASE/<run-id>/input/`.
+2. Implement an allowlisted SDE/SDevice job queue.
+3. Add result artifact pullback and parser for `.plt`/`.tdr` outputs.
 4. Connect a stricter tool-calling agent loop.
 5. Add authentication suitable for non-localhost deployment.

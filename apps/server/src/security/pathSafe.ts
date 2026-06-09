@@ -16,3 +16,14 @@ export function safeRunId(input: string): string {
   }
   return input;
 }
+
+export function safeFileName(input: string): string {
+  const name = path.basename(input).trim();
+  if (name !== input || !name || name.startsWith(".") || name.includes("..")) {
+    throw new Error("Invalid file name");
+  }
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._@()+, -]{0,159}$/.test(name)) {
+    throw new Error("File name contains unsupported characters");
+  }
+  return name;
+}

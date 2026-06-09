@@ -19,6 +19,14 @@ const schema = z.object({
 
 const parsed = schema.parse(process.env);
 
+if (parsed.HOST === "0.0.0.0" && parsed.AUTH_TOKEN === "change-me-local-only") {
+  throw new Error("Refusing to listen on 0.0.0.0 with the default AUTH_TOKEN. Set a strong token in .env first.");
+}
+
+if (parsed.HOST === "0.0.0.0" && parsed.AUTH_TOKEN.length < 24) {
+  throw new Error("AUTH_TOKEN must be at least 24 characters when HOST=0.0.0.0.");
+}
+
 export const config = {
   ...parsed,
   LOCAL_RUN_BASE_ABS: path.resolve(process.cwd(), parsed.LOCAL_RUN_BASE),

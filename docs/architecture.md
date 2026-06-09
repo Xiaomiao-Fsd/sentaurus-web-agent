@@ -4,12 +4,13 @@
 Browser UI
   ├─ Chat panel
   ├─ Sentaurus VM status card
-  └─ Run manager
-        ↓ HTTP + optional future SSE
+  └─ Run manager / detail panel
+        ↓ HTTP + SSE log stream
 Node/Fastify backend
   ├─ Auth middleware
   ├─ OpenAI-compatible LLM client
   ├─ Run store
+  ├─ Run file manager
   ├─ Sentaurus runner facade
   └─ SSH bridge
         ↓ ssh sentaurus-centos7
