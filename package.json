@@ -14,8 +14,8 @@
     "prepare:shared": "npm run build -w @sentaurus-agent/shared"
   },
   "devDependencies": {
-    "typescript": "^5.8.0",
-    "concurrently": "^9.1.2"
+    "concurrently": "^10.0.3",
+    "typescript": "^5.8.0"
   },
   "workspaces": [
     "apps/*",
