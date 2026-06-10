@@ -9,6 +9,18 @@ function parseCursor(value: unknown): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
+function parseSessionId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(trimmed)) {
+    const error = new Error("sessionId contains unsupported characters") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  return trimmed;
+}
+
 export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/vm/agent/status", async (request) => {
     requireAuth(request);
@@ -27,7 +39,7 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     return { ok: result.status.ok, ...result };
   });
 
-  app.post<{ Body: { message?: string } }>("/api/vm/agent/messages", async (request) => {
+  app.post<{ Body: { message?: string; sessionId?: string } }>("/api/vm/agent/messages", async (request) => {
     requireAuth(request);
     const message = request.body?.message?.trim();
     if (!message) {
@@ -40,7 +52,7 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
       error.statusCode = 400;
       throw error;
     }
-    const result = await sendVmAgentMessage(message);
+    const result = await sendVmAgentMessage(message, parseSessionId(request.body?.sessionId));
     return { ok: result.status.ok, ...result };
   });
 

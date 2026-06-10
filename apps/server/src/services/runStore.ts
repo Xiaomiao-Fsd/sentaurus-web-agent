@@ -100,6 +100,11 @@ export async function updateRun(id: string, patch: Partial<RunSummary>): Promise
   return publicRun(updated);
 }
 
+export async function deleteRun(id: string): Promise<void> {
+  await ensureBase();
+  await fs.rm(runDir(id), { recursive: true, force: true });
+}
+
 export async function setRunStatus(id: string, status: RunStatus, lastError?: string): Promise<RunSummary> {
   return updateRun(id, { status, lastError });
 }

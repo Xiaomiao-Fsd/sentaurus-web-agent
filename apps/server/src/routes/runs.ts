@@ -5,6 +5,7 @@ import { prepareRemoteRun } from "../services/sentaurusRunner.js";
 import {
   appendRunLog,
   createRun,
+  deleteRun,
   getPublicRun,
   getRun,
   getRunDetail,
@@ -43,6 +44,28 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
     return await getRunDetail(request.params.id);
   });
 
+  app.patch<{ Params: RunParams; Body: { title?: string } }>("/api/runs/:id", async (request) => {
+    requireAuth(request);
+    const title = request.body?.title?.trim();
+    if (!title) {
+      const error = new Error("title is required") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    if (title.length > 120) {
+      const error = new Error("title is too long") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    return { run: await updateRun(request.params.id, { title }) };
+  });
+
+  app.delete<{ Params: RunParams }>("/api/runs/:id", async (request) => {
+    requireAuth(request);
+    await deleteRun(request.params.id);
+    return { ok: true };
+  });
+
   app.get<{ Params: RunParams }>("/api/runs/:id/files", async (request) => {
     requireAuth(request);
     return { files: await listRunFiles(request.params.id, "input") };
@@ -70,6 +93,12 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: RunParams }>("/api/runs/:id/artifacts", async (request) => {
     requireAuth(request);
     return { artifacts: await listRunFiles(request.params.id, "artifacts") };
+  });
+
+  app.get<{ Params: FileParams }>("/api/runs/:id/logs/:name", async (request, reply) => {
+    requireAuth(request);
+    const filePath = await resolveRunFile(request.params.id, "logs", request.params.name);
+    return reply.send(streamRunFile(filePath));
   });
 
   app.get<{ Params: FileParams }>("/api/runs/:id/artifacts/:name", async (request, reply) => {

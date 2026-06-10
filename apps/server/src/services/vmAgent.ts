@@ -7,6 +7,7 @@ type VmAgentOperation = "status" | "start" | "send" | "history";
 type RemoteAgentRequest = {
   operation: VmAgentOperation;
   message?: string;
+  sessionId?: string;
   after?: number;
   limit?: number;
 };
@@ -306,7 +307,11 @@ def process_queue_file(path):
         with open(path, "r") as handle:
             item = json.load(handle)
         text = safe_text(item.get("content"), 4000)
+        incoming_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        session_id = safe_text(incoming_meta.get("sessionId"), 160).strip()
         reply, meta = reply_for(text)
+        if session_id:
+            meta["sessionId"] = session_id
         append_message("agent", reply, "vm-agent-worker", meta)
         shutil.move(path, os.path.join(DONE_DIR, os.path.basename(path)))
         audit("queue_processed", {"file": os.path.basename(path), "replyKind": meta.get("kind")})
@@ -341,6 +346,7 @@ import glob
 import getpass
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -550,11 +556,31 @@ def write_worker_files():
         with open(ENV_EXAMPLE_PATH, "w") as handle:
             handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_API_STYLE=chat-completions\n")
 
-def start_worker():
+def stop_worker(pid):
+    if not pid:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        return
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+
+def start_worker(force_restart=False):
     write_worker_files()
     if os.path.exists(STOP_PATH):
         os.unlink(STOP_PATH)
     running, pid = worker_running()
+    if running and force_restart:
+        stop_worker(pid)
+        running, pid = worker_running()
     if running:
         return pid
     log = open(LOG_PATH, "ab")
@@ -589,9 +615,13 @@ def build_status():
         "sentaurusTools": sentaurus_tools(),
     }
 
-def enqueue_message(content):
+def enqueue_message(content, session_id=None):
     ensure_dir(QUEUE_DIR)
-    message = append_message("user", content, "web", {"kind": "web_message", "queuedFor": "vm-agent-worker"}, "web")
+    meta = {"kind": "web_message", "queuedFor": "vm-agent-worker"}
+    session_id = safe_text(session_id, 160).strip()
+    if session_id:
+        meta["sessionId"] = session_id
+    message = append_message("user", content, "web", meta, "web")
     queue_path = os.path.join(QUEUE_DIR, message["id"] + ".json")
     with open(queue_path, "w") as handle:
         handle.write(json.dumps(message, ensure_ascii=True, sort_keys=True) + "\n")
@@ -603,17 +633,18 @@ def handle(request):
     operation = request.get("operation") or "status"
     after = int(request.get("after") or 0)
     limit = int(request.get("limit") or 50)
+    session_id = safe_text(request.get("sessionId"), 160).strip()
     messages = []
 
     if operation == "start":
-        pid = start_worker()
+        pid = start_worker(True)
         messages = [append_message("agent", "CentOS VM agent worker is running. Browser/host will only relay messages; LLM credentials are read inside the VM.", "vm-agent-control", {"kind": "worker_ready", "pid": pid})]
     elif operation == "send":
         incoming = safe_text(request.get("message"), 4000)
         if not incoming.strip():
             raise ValueError("message is required")
         start_worker()
-        messages = [enqueue_message(incoming)]
+        messages = [enqueue_message(incoming, session_id)]
     elif operation == "history":
         messages, _cursor = read_messages(after, limit)
     elif operation == "status":
@@ -755,8 +786,8 @@ export async function getVmAgentMessages(after = 0, limit = 50): Promise<{ statu
   return { status, messages: normalizeMessages(payload.messages), cursor: payload.cursor || after };
 }
 
-export async function sendVmAgentMessage(message: string): Promise<{ status: VmAgentStatus; message: VmAgentMessage; messages: VmAgentMessage[]; cursor: number }> {
-  const payload = await callVmAgent({ operation: "send", message });
+export async function sendVmAgentMessage(message: string, sessionId?: string): Promise<{ status: VmAgentStatus; message: VmAgentMessage; messages: VmAgentMessage[]; cursor: number }> {
+  const payload = await callVmAgent({ operation: "send", message, sessionId });
   const status = payload.ok === false ? errorStatus(payload.error || "VM agent message failed", payload.raw) : toStatus(payload);
   const messages = normalizeMessages(payload.messages);
   const representative = [...messages].reverse().find((item) => item.role === "agent") || messages[0] || fallbackAgentMessage("Message queued for the CentOS VM agent.");
