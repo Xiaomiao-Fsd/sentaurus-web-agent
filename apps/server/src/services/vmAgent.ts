@@ -225,30 +225,101 @@ def list_manuals():
             files.append(name)
     return files
 
-def read_manual_context(limit=24000):
+def manual_priority_file(name):
+    lowered = name.lower()
+    return lowered.startswith("00") or lowered.startswith("01") or lowered.startswith("readme") or "mission" in lowered or "index" in lowered or "quickstart" in lowered
+
+def manual_query_tokens(user_text):
+    raw = safe_text(user_text, 2000).lower()
+    separators = "\t\r\n ,.;:()[]{}<>/\\|+-=*\"'~!@#$%^&?"
+    for char in separators:
+        raw = raw.replace(char, " ")
+    tokens = []
+    for token in raw.split():
+        if len(token) >= 4 and token not in tokens:
+            tokens.append(token)
+    domain_tokens = [
+        "sde", "sdevice", "sprocess", "svisual", "inspect", "swb", "smesh", "tdx",
+        "mesh", "electrode", "contact", "doping", "physics", "solve", "plot", "current",
+        "extract", "threshold", "mobility", "recombination", "avalanche", "quantum", "deck",
+        "tdr", "plt", "cmd", "des", "parameter", "workbench", "simulation", "仿真", "网格", "电极", "掺杂",
+    ]
+    for token in domain_tokens:
+        if token in raw and token not in tokens:
+            tokens.append(token)
+    return tokens[:24]
+
+def read_manual_file_excerpt(name, max_chars):
+    path = os.path.join(MANUALS_DIR, name)
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(max_chars)
+    except Exception:
+        return ""
+    try:
+        text = raw.decode("utf-8", "replace")
+    except AttributeError:
+        text = raw
+    return safe_text(text, max_chars).strip()
+
+def read_manual_matches(name, tokens, max_matches=12):
+    if not tokens:
+        return []
+    path = os.path.join(MANUALS_DIR, name)
+    matches = []
+    try:
+        with open(path, "rb") as handle:
+            for line_number, raw in enumerate(handle, 1):
+                try:
+                    line = raw.decode("utf-8", "replace")
+                except AttributeError:
+                    line = raw
+                stripped = safe_text(line, 1000).strip()
+                if not stripped:
+                    continue
+                lowered = stripped.lower()
+                score = sum(1 for token in tokens if token in lowered)
+                if score > 0:
+                    matches.append((score, line_number, stripped))
+    except Exception:
+        return []
+    matches.sort(key=lambda item: (-item[0], item[1]))
+    return matches[:max_matches]
+
+def read_manual_context(user_text="", limit=24000):
     files = list_manuals()
     if not files:
         return "No VM-local Sentaurus manuals are installed yet. If the user provides manuals, place converted text/markdown files in ~/.sentaurus-web-agent/vm-agent/manuals/."
     remaining = limit
     sections = []
     for name in files:
+        if not manual_priority_file(name):
+            continue
         if remaining <= 0:
             break
-        path = os.path.join(MANUALS_DIR, name)
-        try:
-            with open(path, "rb") as handle:
-                raw = handle.read(min(remaining, 8000))
-        except Exception:
-            continue
-        try:
-            text = raw.decode("utf-8", "replace")
-        except AttributeError:
-            text = raw
+        text = read_manual_file_excerpt(name, min(remaining, 8000))
         text = safe_text(text, min(remaining, 8000)).strip()
         if not text:
             continue
         sections.append("[Manual: %s]\n%s" % (name, text))
         remaining -= len(text)
+    tokens = manual_query_tokens(user_text)
+    match_sections = []
+    for name in files:
+        if remaining <= 0:
+            break
+        if manual_priority_file(name):
+            continue
+        matches = read_manual_matches(name, tokens, 8)
+        if not matches:
+            continue
+        lines = ["[Manual matches: %s]" % name]
+        for score, line_number, text in matches:
+            lines.append("L%s: %s" % (line_number, text))
+        section = "\n".join(lines)
+        match_sections.append(section)
+        remaining -= len(section)
+    sections.extend(match_sections)
     return "\n\n".join(sections) or "Manual files exist, but no readable text was found."
 
 def skill_snapshot():
@@ -372,7 +443,7 @@ def call_llm_model(user_text, config, model, system):
 
 def call_llm(user_text, config):
     snapshot = skill_snapshot()
-    manual_context = read_manual_context()
+    manual_context = read_manual_context(user_text)
     system = (
         "You are the Sentaurus TCAD simulation agent running inside the CentOS VM. "
         "Your core mission is to help the user establish complete Sentaurus simulation tasks: clarify the device/process objective, "
