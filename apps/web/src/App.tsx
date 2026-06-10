@@ -63,6 +63,8 @@ type UploadedAttachment = {
 };
 
 const REFERENCE_CONTEXT_TOKENS = 272_000;
+const REPLY_RETRY_INTERVAL_MS = 30_000;
+const MAX_REPLY_RETRIES = 5;
 const SESSION_ORDER_KEY = "sentaurus_session_order";
 const QUICK_PROMPTS: QuickPrompt[] = [
   {
@@ -244,6 +246,7 @@ export default function App() {
   const [messageSending, setMessageSending] = useState(false);
   const [attachmentUploading, setAttachmentUploading] = useState(false);
   const [pendingReplySessionId, setPendingReplySessionId] = useState<string | null>(null);
+  const [pendingReplyRetryCount, setPendingReplyRetryCount] = useState(0);
   const [vmAgentStreamState, setVmAgentStreamState] = useState("idle");
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -260,6 +263,7 @@ export default function App() {
   const [messageDisplayOverrides, setMessageDisplayOverrides] = useState<Record<string, string>>({});
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const pendingReplySessionRef = useRef<string | null>(null);
+  const pendingReplyRetryRef = useRef(0);
 
   const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
@@ -285,13 +289,23 @@ export default function App() {
 
   function beginPendingAgentReply(sessionId: string) {
     pendingReplySessionRef.current = sessionId;
+    pendingReplyRetryRef.current = 0;
     setPendingReplySessionId(sessionId);
+    setPendingReplyRetryCount(0);
   }
 
   function clearPendingAgentReply(sessionId?: string) {
     if (sessionId && pendingReplySessionRef.current !== sessionId) return;
     pendingReplySessionRef.current = null;
+    pendingReplyRetryRef.current = 0;
     setPendingReplySessionId(null);
+    setPendingReplyRetryCount(0);
+  }
+
+  function forceStopPendingReply() {
+    if (!pendingReplySessionRef.current) return;
+    clearPendingAgentReply();
+    recordSystemNotice("Stopped waiting for the current agent reply. You can restart the agent if needed.", "error");
   }
 
   function mergeVmAgentMessages(next: VmAgentMessage[] | undefined) {
@@ -628,6 +642,52 @@ export default function App() {
   }, [authKey]);
 
   useEffect(() => {
+    if (!pendingReplySessionId || !authKey) return;
+    let closed = false;
+    let inFlight = false;
+    const interval = window.setInterval(() => {
+      if (closed || inFlight || !pendingReplySessionRef.current) return;
+      inFlight = true;
+      void getVmAgentMessages(0)
+        .then((response) => {
+          if (closed) return;
+          setVmAgent(response.status);
+          setVmAgentCursor(response.cursor);
+          mergeVmAgentMessages(response.messages);
+          const waitingSessionId = pendingReplySessionRef.current;
+          if (waitingSessionId && hasAgentReplyForSession(response.messages, waitingSessionId)) {
+            clearPendingAgentReply(waitingSessionId);
+            return;
+          }
+          const nextRetry = pendingReplyRetryRef.current + 1;
+          pendingReplyRetryRef.current = nextRetry;
+          setPendingReplyRetryCount(nextRetry);
+          if (nextRetry >= MAX_REPLY_RETRIES) {
+            clearPendingAgentReply(waitingSessionId || undefined);
+            recordSystemNotice("No agent reply after 5 retries. Stopped waiting so the agent can be restarted manually.", "error");
+          }
+        })
+        .catch((err) => {
+          if (closed) return;
+          const nextRetry = pendingReplyRetryRef.current + 1;
+          pendingReplyRetryRef.current = nextRetry;
+          setPendingReplyRetryCount(nextRetry);
+          if (nextRetry >= MAX_REPLY_RETRIES) {
+            clearPendingAgentReply();
+            recordError(err);
+          }
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    }, REPLY_RETRY_INTERVAL_MS);
+    return () => {
+      closed = true;
+      window.clearInterval(interval);
+    };
+  }, [pendingReplySessionId, authKey]);
+
+  useEffect(() => {
     if (!selectedRunId || !authKey) {
       setRunDetail(null);
       return;
@@ -750,8 +810,13 @@ export default function App() {
               disabled={startAgentDisabled}
               title={waitingForAgentReply ? "Disabled while waiting for the current agent reply to avoid interrupting a long task." : undefined}
             >
-              {waitingForAgentReply ? "Waiting reply" : vmAgentConnectLoading ? "Starting" : "Start agent"}
+              {waitingForAgentReply ? `Waiting reply ${pendingReplyRetryCount}/${MAX_REPLY_RETRIES}` : vmAgentConnectLoading ? "Starting" : "Start agent"}
             </button>
+            {waitingForAgentReply && (
+              <button className="secondary danger-button" onClick={forceStopPendingReply} type="button">
+                Force stop
+              </button>
+            )}
             <button className="secondary" onClick={() => void handleRefreshVmAgentMessages()} disabled={!authKey || vmAgentHistoryLoading}>{vmAgentHistoryLoading ? "Loading" : "History"}</button>
           </div>
         </header>
