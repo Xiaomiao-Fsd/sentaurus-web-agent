@@ -226,7 +226,13 @@ function mergeMessageList(prev: VmAgentMessage[], next: VmAgentMessage[] | undef
 }
 
 function hasAgentReplyForSession(messages: VmAgentMessage[] | undefined, sessionId: string): boolean {
-  return !!messages?.some((message) => message.role === "agent" && messageBelongsToSession(message, sessionId));
+  return !!messages?.some((message) => {
+    const isAgentReply = message.role === "agent";
+    const isSystemError = message.role === "system" && (message.meta?.kind === "llm_error" || message.meta?.kind === "worker_error");
+    if (!isAgentReply && !isSystemError) return false;
+    const scopedSession = messageSessionId(message);
+    return scopedSession === sessionId || scopedSession === null;
+  });
 }
 
 export default function App() {

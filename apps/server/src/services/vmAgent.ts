@@ -303,6 +303,7 @@ def reply_for(text):
         return "VM agent LLM call failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": True}
 
 def process_queue_file(path):
+    session_id = ""
     try:
         with open(path, "r") as handle:
             item = json.load(handle)
@@ -316,7 +317,10 @@ def process_queue_file(path):
         shutil.move(path, os.path.join(DONE_DIR, os.path.basename(path)))
         audit("queue_processed", {"file": os.path.basename(path), "replyKind": meta.get("kind")})
     except Exception as exc:
-        append_message("system", "VM agent worker failed to process a message: %s" % safe_text(str(exc), 1000), "vm-agent-worker", {"kind": "worker_error"})
+        error_meta = {"kind": "worker_error"}
+        if session_id:
+            error_meta["sessionId"] = session_id
+        append_message("system", "VM agent worker failed to process a message: %s" % safe_text(str(exc), 1000), "vm-agent-worker", error_meta)
         try:
             shutil.move(path, os.path.join(DONE_DIR, "failed_" + os.path.basename(path)))
         except Exception:
