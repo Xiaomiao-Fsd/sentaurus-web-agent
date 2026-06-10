@@ -940,6 +940,7 @@ export default function App() {
             <dt>Agent</dt><dd>{workerRunning ? "running" : vmAgent ? "stopped" : vmAgentStreamState}</dd>
             <dt>LLM</dt><dd>{vmAgent?.llmConfigured ? "configured" : "pending"}</dd>
             <dt>Models</dt><dd>{vmAgent?.llmModels?.join(" → ") || vmAgent?.llmModel || "not configured"}</dd>
+            <dt>Manuals</dt><dd>{vmAgent?.manualCount ? `${vmAgent.manualCount} installed` : "none installed"}</dd>
             <dt>Messages</dt><dd>{vmAgent?.messageCount ?? currentMessages.length}</dd>
             <dt>Queue</dt><dd>{vmAgent?.queueDepth ?? 0}</dd>
           </dl>

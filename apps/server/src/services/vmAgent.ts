@@ -29,6 +29,8 @@ type RemoteAgentPayload = {
   llmConfigured?: boolean;
   llmModel?: string;
   llmModels?: string[];
+  manualCount?: number;
+  manualFiles?: string[];
   queueDepth?: number;
   sentaurusTools?: Record<string, string | null>;
   messages?: unknown[];
@@ -68,6 +70,7 @@ AUDIT_PATH = os.path.join(ROOT, "audit.jsonl")
 HEARTBEAT_PATH = os.path.join(ROOT, "worker.heartbeat")
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 ENV_PATH = os.path.join(ROOT, ".env")
+MANUALS_DIR = os.path.join(ROOT, "manuals")
 STOP_PATH = os.path.join(ROOT, "stop")
 
 try:
@@ -207,16 +210,61 @@ def list_instances():
     instances = sorted([path for path in glob.glob(os.path.join(root, "*")) if os.path.isdir(path)])
     return [os.path.basename(path) for path in instances]
 
+def list_manuals():
+    if not os.path.isdir(MANUALS_DIR):
+        return []
+    allowed = [".txt", ".md", ".rst", ".cmd", ".des", ".par", ".scm", ".sde"]
+    files = []
+    for path in sorted(glob.glob(os.path.join(MANUALS_DIR, "*"))):
+        if not os.path.isfile(path):
+            continue
+        name = os.path.basename(path)
+        if name.startswith("."):
+            continue
+        if os.path.splitext(name)[1].lower() in allowed:
+            files.append(name)
+    return files
+
+def read_manual_context(limit=24000):
+    files = list_manuals()
+    if not files:
+        return "No VM-local Sentaurus manuals are installed yet. If the user provides manuals, place converted text/markdown files in ~/.sentaurus-web-agent/vm-agent/manuals/."
+    remaining = limit
+    sections = []
+    for name in files:
+        if remaining <= 0:
+            break
+        path = os.path.join(MANUALS_DIR, name)
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(min(remaining, 8000))
+        except Exception:
+            continue
+        try:
+            text = raw.decode("utf-8", "replace")
+        except AttributeError:
+            text = raw
+        text = safe_text(text, min(remaining, 8000)).strip()
+        if not text:
+            continue
+        sections.append("[Manual: %s]\n%s" % (name, text))
+        remaining -= len(text)
+    return "\n\n".join(sections) or "Manual files exist, but no readable text was found."
+
 def skill_snapshot():
     instances = list_instances()
+    manuals = list_manuals()
     return {
         "hostname": socket.gethostname(),
         "user": getpass.getuser(),
         "sentaurusTools": sentaurus_tools(),
         "instanceCount": len(instances),
         "latestInstance": instances[-1] if instances else None,
-        "safeSkills": ["vm_status", "sentaurus_tools", "list_agent_instances"],
-        "realJobExecution": "disabled until an allowlisted job runner is implemented",
+        "manualCount": len(manuals),
+        "manualFiles": manuals[:20],
+        "coreMission": "build Sentaurus simulation tasks, prepare decks/data, run allowlisted Sentaurus jobs, and export logs/artifacts/results",
+        "safeSkills": ["vm_status", "sentaurus_tools", "list_agent_instances", "sentaurus_manual_context"],
+        "realJobExecution": "core objective, but currently gated until an allowlisted job runner is implemented",
     }
 
 def wants_skill_reply(text):
@@ -228,9 +276,11 @@ def local_skill_reply(text):
     snapshot = skill_snapshot()
     lines = [
         "VM Sentaurus skill status:",
+        "- core mission: %s" % snapshot.get("coreMission"),
         "- host: %s as %s" % (snapshot.get("hostname"), snapshot.get("user")),
         "- latest instance: %s" % (snapshot.get("latestInstance") or "none"),
         "- instance count: %s" % snapshot.get("instanceCount"),
+        "- manual files: %s" % (", ".join(snapshot.get("manualFiles") or []) or "none installed"),
         "- safe skills: %s" % ", ".join(snapshot.get("safeSkills")),
         "- real job execution: %s" % snapshot.get("realJobExecution"),
         "- tools:",
@@ -322,12 +372,18 @@ def call_llm_model(user_text, config, model, system):
 
 def call_llm(user_text, config):
     snapshot = skill_snapshot()
+    manual_context = read_manual_context()
     system = (
-        "You are a Sentaurus TCAD agent running inside the CentOS VM. "
+        "You are the Sentaurus TCAD simulation agent running inside the CentOS VM. "
+        "Your core mission is to help the user establish complete Sentaurus simulation tasks: clarify the device/process objective, "
+        "create or revise SDE/SProcess/SDevice/SWB decks and parameter data, prepare run directories and extraction plans, "
+        "invoke Sentaurus only through allowlisted job-runner paths when they exist, monitor logs, and export results/artifacts/metrics back to the user. "
+        "If real execution is not currently enabled, say so clearly and still provide runnable decks, file layouts, commands, expected outputs, and extraction steps. "
+        "Never claim that a Sentaurus job has run unless an allowlisted runner actually ran it and produced logs/artifacts. "
+        "Use the installed tool paths and VM state in the snapshot. Ask for missing physics/process assumptions instead of inventing critical parameters. "
         "The browser and host backend only relay messages; API credentials stay inside this VM. "
-        "You have these safe Sentaurus skills available as context: vm_status, sentaurus_tools, list_agent_instances. "
-        "Do not claim to run real Sentaurus jobs unless an allowlisted job runner is explicitly implemented. "
-        "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True)
+        "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True) + "\n\n" +
+        "VM-local Sentaurus manual/context excerpts:\n" + manual_context
     )
     models = config.get("models") or [config.get("model") or "gpt-5.5"]
     errors = []
@@ -391,7 +447,7 @@ def process_queue_file(path):
             pass
 
 def main():
-    for path in [ROOT, QUEUE_DIR, DONE_DIR]:
+    for path in [ROOT, QUEUE_DIR, DONE_DIR, MANUALS_DIR]:
         ensure_dir(path)
     append_message("agent", "Sentaurus VM agent worker started. API credentials are read only from VM-local config.", "vm-agent-worker", {"kind": "worker_started"})
     while not os.path.exists(STOP_PATH):
@@ -444,6 +500,7 @@ CONFIG_EXAMPLE_PATH = os.path.join(ROOT, "config.example.json")
 ENV_EXAMPLE_PATH = os.path.join(ROOT, ".env.example")
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 ENV_PATH = os.path.join(ROOT, ".env")
+MANUALS_DIR = os.path.join(ROOT, "manuals")
 STOP_PATH = os.path.join(ROOT, "stop")
 
 def now_iso():
@@ -552,6 +609,21 @@ def list_instances():
     instances = sorted([path for path in glob.glob(os.path.join(root, "*")) if os.path.isdir(path)])
     return [os.path.basename(path) for path in instances]
 
+def list_manuals():
+    if not os.path.isdir(MANUALS_DIR):
+        return []
+    allowed = [".txt", ".md", ".rst", ".cmd", ".des", ".par", ".scm", ".sde"]
+    files = []
+    for path in sorted(glob.glob(os.path.join(MANUALS_DIR, "*"))):
+        if not os.path.isfile(path):
+            continue
+        name = os.path.basename(path)
+        if name.startswith("."):
+            continue
+        if os.path.splitext(name)[1].lower() in allowed:
+            files.append(name)
+    return files
+
 def queue_depth():
     ensure_dir(QUEUE_DIR)
     return len(glob.glob(os.path.join(QUEUE_DIR, "*.json")))
@@ -641,6 +713,7 @@ def write_worker_files():
     ensure_dir(ROOT)
     ensure_dir(QUEUE_DIR)
     ensure_dir(DONE_DIR)
+    ensure_dir(MANUALS_DIR)
     worker_source = base64.b64decode(WORKER_SOURCE_B64)
     with open(WORKER_PATH, "wb") as handle:
         handle.write(worker_source)
@@ -700,6 +773,7 @@ def build_status():
     instances = list_instances()
     running, pid = worker_running()
     llm_config = load_config()
+    manuals = list_manuals()
     return {
         "ok": True,
         "agent": AGENT_NAME,
@@ -716,6 +790,8 @@ def build_status():
         "llmConfigured": bool(llm_config.get("api_base") and llm_config.get("api_key")),
         "llmModel": llm_config.get("model"),
         "llmModels": llm_config.get("models"),
+        "manualCount": len(manuals),
+        "manualFiles": manuals[:20],
         "queueDepth": queue_depth(),
         "sentaurusTools": sentaurus_tools(),
     }
@@ -835,6 +911,8 @@ function toStatus(payload: RemoteAgentPayload): VmAgentStatus {
     llmConfigured: payload.llmConfigured,
     llmModel: payload.llmModel,
     llmModels: payload.llmModels,
+    manualCount: payload.manualCount,
+    manualFiles: payload.manualFiles,
     queueDepth: payload.queueDepth,
     sentaurusTools: payload.sentaurusTools,
     error: payload.error,

@@ -70,6 +70,14 @@ LLM_API_STYLE=chat-completions # or openai-responses
 
 The agent also writes `config.example.json` and `.env.example` in that VM directory. Do not copy real keys back to the host repo.
 
+Optional Sentaurus manuals or converted reference notes can be placed in VM-local text formats under:
+
+```text
+~/.sentaurus-web-agent/vm-agent/manuals
+```
+
+Supported extensions include `.txt`, `.md`, `.rst`, `.cmd`, `.des`, `.par`, `.scm`, and `.sde`. The VM worker reads excerpts from this directory into its system context so it can better understand Sentaurus deck syntax, job setup, and result extraction without depending on host-side files.
+
 ## Configure Sentaurus VM SSH from Windows host
 
 The backend calls `ssh` using `SENTAURUS_SSH_TARGET`.
@@ -119,7 +127,7 @@ Implemented:
 - VM Agent panel wired to an SSH-backed `/api/vm/agent/*` bridge
 - VM-side agent worker at `~/.sentaurus-web-agent/vm-agent/agent_worker.py`
 - VM-local LLM config via `~/.sentaurus-web-agent/vm-agent/.env` or `config.json`
-- Safe read-only Sentaurus skills: VM status, tool discovery, agent instance listing
+- Safe read-only Sentaurus skills: VM status, tool discovery, agent instance listing, VM-local manual excerpts
 - Run creation/listing API
 - Run detail view
 - Run input upload and input/artifact download APIs

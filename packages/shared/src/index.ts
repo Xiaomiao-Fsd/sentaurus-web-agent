@@ -37,6 +37,8 @@ export type VmAgentStatus = {
   llmConfigured?: boolean;
   llmModel?: string;
   llmModels?: string[];
+  manualCount?: number;
+  manualFiles?: string[];
   queueDepth?: number;
   sentaurusTools?: Record<string, string | null>;
   error?: string;
