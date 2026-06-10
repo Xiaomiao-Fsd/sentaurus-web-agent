@@ -223,6 +223,10 @@ function mergeMessageList(prev: VmAgentMessage[], next: VmAgentMessage[] | undef
   return merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 }
 
+function hasAgentReplyForSession(messages: VmAgentMessage[] | undefined, sessionId: string): boolean {
+  return !!messages?.some((message) => message.role === "agent" && messageBelongsToSession(message, sessionId));
+}
+
 export default function App() {
   const savedToken = getAuthToken();
   const [authInput, setAuthInput] = useState(savedToken);
@@ -239,6 +243,7 @@ export default function App() {
   const [vmAgentHistoryLoading, setVmAgentHistoryLoading] = useState(false);
   const [messageSending, setMessageSending] = useState(false);
   const [attachmentUploading, setAttachmentUploading] = useState(false);
+  const [pendingReplySessionId, setPendingReplySessionId] = useState<string | null>(null);
   const [vmAgentStreamState, setVmAgentStreamState] = useState("idle");
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -254,6 +259,7 @@ export default function App() {
   const [messageAttachments, setMessageAttachments] = useState<Record<string, UploadedAttachment[]>>({});
   const [messageDisplayOverrides, setMessageDisplayOverrides] = useState<Record<string, string>>({});
   const messageEndRef = useRef<HTMLDivElement | null>(null);
+  const pendingReplySessionRef = useRef<string | null>(null);
 
   const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
@@ -274,6 +280,19 @@ export default function App() {
   const workerRunning = vmAgent?.workerRunning ?? null;
   const llmConfigured = vmAgent?.llmConfigured ?? null;
   const canSendMessage = !!authKey && !!selectedRunId && !messageSending && !attachmentUploading;
+  const waitingForAgentReply = !!pendingReplySessionId;
+  const startAgentDisabled = !authKey || vmAgentConnectLoading || messageSending || waitingForAgentReply;
+
+  function beginPendingAgentReply(sessionId: string) {
+    pendingReplySessionRef.current = sessionId;
+    setPendingReplySessionId(sessionId);
+  }
+
+  function clearPendingAgentReply(sessionId?: string) {
+    if (sessionId && pendingReplySessionRef.current !== sessionId) return;
+    pendingReplySessionRef.current = null;
+    setPendingReplySessionId(null);
+  }
 
   function mergeVmAgentMessages(next: VmAgentMessage[] | undefined) {
     setVmAgentMessages((prev) => mergeMessageList(prev, next));
@@ -391,6 +410,7 @@ export default function App() {
       const response = await sendVmAgentMessage(`${visibleText}${attachmentLine}`, selectedRunId);
       setVmAgent(response.status);
       setVmAgentCursor(response.cursor);
+      beginPendingAgentReply(selectedRunId);
       const userMessage = [...(response.messages || [response.message])]
         .reverse()
         .find((message) => message.role === "user" && messageBelongsToSession(message, selectedRunId));
@@ -399,8 +419,10 @@ export default function App() {
         setMessageDisplayOverrides((prev) => ({ ...prev, [userMessage.id]: visibleText }));
       }
       mergeVmAgentMessages(response.messages || [response.message]);
+      if (hasAgentReplyForSession(response.messages || [response.message], selectedRunId)) clearPendingAgentReply(selectedRunId);
     } catch (err) {
       recordError(err);
+      clearPendingAgentReply(selectedRunId);
       if (!textOverride) setComposer(text);
       setPendingAttachments((prev) => [...attachments, ...prev]);
     } finally {
@@ -592,11 +614,14 @@ export default function App() {
       setVmAgent(data.status);
       setVmAgentCursor(data.cursor);
       mergeVmAgentMessages(data.messages);
+      const pendingSessionId = pendingReplySessionRef.current;
+      if (pendingSessionId && hasAgentReplyForSession(data.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
       setVmAgentStreamState("live");
     });
     events.addEventListener("ping", () => setVmAgentStreamState("live"));
     events.addEventListener("error", () => {
       setVmAgentStreamState("disconnected");
+      clearPendingAgentReply();
       events.close();
     });
     return () => events.close();
@@ -720,7 +745,13 @@ export default function App() {
             </div>
           </div>
           <div className="chat-actions">
-            <button onClick={() => void handleConnectVmAgent()} disabled={!authKey || vmAgentConnectLoading}>{vmAgentConnectLoading ? "Starting" : "Start agent"}</button>
+            <button
+              onClick={() => void handleConnectVmAgent()}
+              disabled={startAgentDisabled}
+              title={waitingForAgentReply ? "Disabled while waiting for the current agent reply to avoid interrupting a long task." : undefined}
+            >
+              {waitingForAgentReply ? "Waiting reply" : vmAgentConnectLoading ? "Starting" : "Start agent"}
+            </button>
             <button className="secondary" onClick={() => void handleRefreshVmAgentMessages()} disabled={!authKey || vmAgentHistoryLoading}>{vmAgentHistoryLoading ? "Loading" : "History"}</button>
           </div>
         </header>
