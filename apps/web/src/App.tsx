@@ -939,6 +939,7 @@ export default function App() {
             <dt>VM</dt><dd>{vmOnline === true ? "online" : vmOnline === false ? "offline" : "unchecked"}</dd>
             <dt>Agent</dt><dd>{workerRunning ? "running" : vmAgent ? "stopped" : vmAgentStreamState}</dd>
             <dt>LLM</dt><dd>{vmAgent?.llmConfigured ? "configured" : "pending"}</dd>
+            <dt>Models</dt><dd>{vmAgent?.llmModels?.join(" → ") || vmAgent?.llmModel || "not configured"}</dd>
             <dt>Messages</dt><dd>{vmAgent?.messageCount ?? currentMessages.length}</dd>
             <dt>Queue</dt><dd>{vmAgent?.queueDepth ?? 0}</dd>
           </dl>

@@ -27,6 +27,8 @@ type RemoteAgentPayload = {
   workerRunning?: boolean;
   workerPid?: number | null;
   llmConfigured?: boolean;
+  llmModel?: string;
+  llmModels?: string[];
   queueDepth?: number;
   sentaurusTools?: Record<string, string | null>;
   messages?: unknown[];
@@ -124,6 +126,29 @@ def read_env_file(path):
             data[key.strip()] = value.strip().strip('"').strip("'")
     return data
 
+def config_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = safe_text(value, 2000).replace("\n", ",").split(",")
+    items = []
+    for item in raw_items:
+        item = safe_text(item, 160).strip()
+        if item and item not in items:
+            items.append(item)
+    return items
+
+def model_candidates(primary_model, configured_models):
+    models = config_list(configured_models)
+    primary = safe_text(primary_model, 160).strip()
+    if primary and primary not in models:
+        models.insert(0, primary)
+    if not models:
+        models = ["gpt-5.5"]
+    return models
+
 def load_config():
     env = read_env_file(ENV_PATH)
     file_config = {}
@@ -133,10 +158,13 @@ def load_config():
                 file_config = json.load(handle)
         except Exception:
             file_config = {}
+    primary_model = env.get("LLM_MODEL") or file_config.get("llmModel") or file_config.get("LLM_MODEL") or "gpt-5.5"
+    raw_models = env.get("LLM_MODELS") or file_config.get("llmModels") or file_config.get("LLM_MODELS")
     return {
         "api_base": env.get("LLM_API_BASE") or file_config.get("llmApiBase") or file_config.get("LLM_API_BASE") or "",
         "api_key": env.get("LLM_API_KEY") or file_config.get("llmApiKey") or file_config.get("LLM_API_KEY") or "",
-        "model": env.get("LLM_MODEL") or file_config.get("llmModel") or file_config.get("LLM_MODEL") or "gpt-5.5",
+        "model": primary_model,
+        "models": model_candidates(primary_model, raw_models),
         "api_style": env.get("LLM_API_STYLE") or file_config.get("llmApiStyle") or file_config.get("LLM_API_STYLE") or "chat-completions",
     }
 
@@ -228,25 +256,24 @@ def parse_responses_text(data):
         return data.get("output_text")
     parts = []
     for item in data.get("output", []) or []:
+        if item.get("text"):
+            parts.append(item.get("text"))
         for content in item.get("content", []) or []:
-            text = content.get("text")
+            text = content.get("text") or content.get("content")
             if text:
                 parts.append(text)
-    return "\n".join(parts).strip() or "LLM returned no content."
+    for choice in data.get("choices", []) or []:
+        message = choice.get("message") or {}
+        text = message.get("content") or choice.get("text")
+        if text:
+            parts.append(text)
+    return "\n".join(parts).strip()
 
-def call_llm(user_text, config):
-    snapshot = skill_snapshot()
-    system = (
-        "You are a Sentaurus TCAD agent running inside the CentOS VM. "
-        "The browser and host backend only relay messages; API credentials stay inside this VM. "
-        "You have these safe Sentaurus skills available as context: vm_status, sentaurus_tools, list_agent_instances. "
-        "Do not claim to run real Sentaurus jobs unless an allowlisted job runner is explicitly implemented. "
-        "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True)
-    )
+def call_llm_model(user_text, config, model, system):
     api_style = (config.get("api_style") or "chat-completions").lower()
     if api_style in ["openai-responses", "responses"]:
         payload = {
-            "model": config.get("model") or "gpt-5.5",
+            "model": model,
             "input": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_text},
@@ -263,10 +290,13 @@ def call_llm(user_text, config):
             text = response.decode("utf-8", "replace")
         except AttributeError:
             text = response
-        return parse_responses_text(json.loads(text))
+        parsed = parse_responses_text(json.loads(text))
+        if not parsed:
+            raise Exception("LLM returned no content")
+        return parsed
 
     payload = {
-        "model": config.get("model") or "gpt-5.5",
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
@@ -285,7 +315,41 @@ def call_llm(user_text, config):
     except AttributeError:
         text = response
     data = json.loads(text)
-    return data.get("choices", [{}])[0].get("message", {}).get("content") or "LLM returned no content."
+    parsed = data.get("choices", [{}])[0].get("message", {}).get("content") or data.get("choices", [{}])[0].get("text")
+    if not parsed:
+        raise Exception("LLM returned no content")
+    return parsed
+
+def call_llm(user_text, config):
+    snapshot = skill_snapshot()
+    system = (
+        "You are a Sentaurus TCAD agent running inside the CentOS VM. "
+        "The browser and host backend only relay messages; API credentials stay inside this VM. "
+        "You have these safe Sentaurus skills available as context: vm_status, sentaurus_tools, list_agent_instances. "
+        "Do not claim to run real Sentaurus jobs unless an allowlisted job runner is explicitly implemented. "
+        "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True)
+    )
+    models = config.get("models") or [config.get("model") or "gpt-5.5"]
+    errors = []
+    for index, model in enumerate(models):
+        try:
+            reply = call_llm_model(user_text, config, model, system)
+            meta = {
+                "kind": "llm",
+                "llmConfigured": True,
+                "model": model,
+                "apiStyle": config.get("api_style"),
+                "modelCandidates": ",".join(models),
+            }
+            if index > 0:
+                meta["fallbackFrom"] = ",".join(models[:index])
+                meta["fallbackCount"] = index
+            return reply, meta
+        except Exception as exc:
+            error_text = safe_text(str(exc), 500)
+            errors.append("%s: %s" % (model, error_text))
+            audit("llm_model_failed", {"model": model, "error": error_text})
+    raise Exception("; ".join(errors) or "no LLM model candidates configured")
 
 def reply_for(text):
     config = load_config()
@@ -298,9 +362,9 @@ def reply_for(text):
             "or config.json. Sentaurus safe skills are already available; ask for status/tools to test them."
         ), {"kind": "config_required", "llmConfigured": False}
     try:
-        return call_llm(text, config), {"kind": "llm", "llmConfigured": True, "model": config.get("model"), "apiStyle": config.get("api_style")}
+        return call_llm(text, config)
     except Exception as exc:
-        return "VM agent LLM call failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": True}
+        return "VM agent LLM call failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": True, "modelCandidates": ",".join(config.get("models") or [])}
 
 def process_queue_file(path):
     session_id = ""
@@ -505,7 +569,30 @@ def read_env_file(path):
             data[key.strip()] = value.strip().strip('"').strip("'")
     return data
 
-def llm_configured():
+def config_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = safe_text(value, 2000).replace("\n", ",").split(",")
+    items = []
+    for item in raw_items:
+        item = safe_text(item, 160).strip()
+        if item and item not in items:
+            items.append(item)
+    return items
+
+def model_candidates(primary_model, configured_models):
+    models = config_list(configured_models)
+    primary = safe_text(primary_model, 160).strip()
+    if primary and primary not in models:
+        models.insert(0, primary)
+    if not models:
+        models = ["gpt-5.5"]
+    return models
+
+def load_config():
     env = read_env_file(ENV_PATH)
     file_config = {}
     if os.path.exists(CONFIG_PATH):
@@ -514,9 +601,19 @@ def llm_configured():
                 file_config = json.load(handle)
         except Exception:
             file_config = {}
-    api_base = env.get("LLM_API_BASE") or file_config.get("llmApiBase") or file_config.get("LLM_API_BASE")
-    api_key = env.get("LLM_API_KEY") or file_config.get("llmApiKey") or file_config.get("LLM_API_KEY")
-    return bool(api_base and api_key)
+    primary_model = env.get("LLM_MODEL") or file_config.get("llmModel") or file_config.get("LLM_MODEL") or "gpt-5.5"
+    raw_models = env.get("LLM_MODELS") or file_config.get("llmModels") or file_config.get("LLM_MODELS")
+    return {
+        "api_base": env.get("LLM_API_BASE") or file_config.get("llmApiBase") or file_config.get("LLM_API_BASE") or "",
+        "api_key": env.get("LLM_API_KEY") or file_config.get("llmApiKey") or file_config.get("LLM_API_KEY") or "",
+        "model": primary_model,
+        "models": model_candidates(primary_model, raw_models),
+        "api_style": env.get("LLM_API_STYLE") or file_config.get("llmApiStyle") or file_config.get("LLM_API_STYLE") or "chat-completions",
+    }
+
+def llm_configured():
+    config = load_config()
+    return bool(config.get("api_base") and config.get("api_key"))
 
 def read_pid():
     if not os.path.exists(PID_PATH):
@@ -554,11 +651,12 @@ def write_worker_files():
                 "llmApiBase": "https://your-openai-compatible-base/v1",
                 "llmApiKey": "put-real-key-here-inside-vm-only",
                 "llmModel": "gpt-5.5",
+                "llmModels": ["gpt-5.5", "gpt-5.4"],
                 "llmApiStyle": "chat-completions"
             }, indent=2, sort_keys=True) + "\n")
     if not os.path.exists(ENV_EXAMPLE_PATH):
         with open(ENV_EXAMPLE_PATH, "w") as handle:
-            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_API_STYLE=chat-completions\n")
+            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_MODELS=gpt-5.5,gpt-5.4\nLLM_API_STYLE=chat-completions\n")
 
 def stop_worker(pid):
     if not pid:
@@ -601,6 +699,7 @@ def start_worker(force_restart=False):
 def build_status():
     instances = list_instances()
     running, pid = worker_running()
+    llm_config = load_config()
     return {
         "ok": True,
         "agent": AGENT_NAME,
@@ -614,7 +713,9 @@ def build_status():
         "messageCount": message_count(),
         "workerRunning": running,
         "workerPid": pid if running else None,
-        "llmConfigured": llm_configured(),
+        "llmConfigured": bool(llm_config.get("api_base") and llm_config.get("api_key")),
+        "llmModel": llm_config.get("model"),
+        "llmModels": llm_config.get("models"),
         "queueDepth": queue_depth(),
         "sentaurusTools": sentaurus_tools(),
     }
@@ -732,6 +833,8 @@ function toStatus(payload: RemoteAgentPayload): VmAgentStatus {
     workerRunning: payload.workerRunning,
     workerPid: payload.workerPid,
     llmConfigured: payload.llmConfigured,
+    llmModel: payload.llmModel,
+    llmModels: payload.llmModels,
     queueDepth: payload.queueDepth,
     sentaurusTools: payload.sentaurusTools,
     error: payload.error,
