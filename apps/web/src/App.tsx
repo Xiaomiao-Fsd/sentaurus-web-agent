@@ -1,9 +1,19 @@
-import { useEffect, useState } from "react";
-import type { RunDetail, RunFile, RunSummary, VmAgentHistoryResponse, VmAgentMessage, VmAgentStatus, VmStatus } from "@sentaurus-agent/shared";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, MouseEvent } from "react";
+import type {
+  RunDetail,
+  RunFile,
+  RunStatus,
+  RunSummary,
+  VmAgentHistoryResponse,
+  VmAgentMessage,
+  VmAgentStatus,
+  VmStatus
+} from "@sentaurus-agent/shared";
 import {
-  cancelRun,
   connectVmAgent,
   createRun,
+  deleteRun as deleteRunApi,
   downloadUrl,
   getAuthToken,
   getHealth,
@@ -12,56 +22,569 @@ import {
   getVmAgentStatus,
   getVmStatus,
   listRuns,
-  logStreamUrl,
-  prepareRemoteRun,
+  renameRun,
   sendVmAgentMessage,
   setAuthToken,
-  submitRunJob,
   uploadRunFile,
   vmAgentMessageStreamUrl
 } from "./lib/api.js";
+import { errorMessage, formatBytes, formatCompactNumber, formatDate, formatFullDate, normalizeAuthToken, shortId } from "./utils/format.js";
+
+type PanelNotice = {
+  kind: "info" | "success" | "error";
+  text: string;
+};
+
+type QuickPrompt = {
+  label: string;
+  prompt: string;
+};
+
+type ContextStats = {
+  characters: number;
+  estimatedTokens: number;
+  messageCount: number;
+  percent: number;
+  maxTokens: number;
+};
+
+type SessionMenuState = {
+  runId: string;
+  x: number;
+  y: number;
+  mode: "menu" | "rename" | "delete";
+};
+
+type UploadedAttachment = {
+  id: string;
+  name: string;
+  size: number;
+  uploadedAt: string;
+};
+
+const REFERENCE_CONTEXT_TOKENS = 272_000;
+const SESSION_ORDER_KEY = "sentaurus_session_order";
+const QUICK_PROMPTS: QuickPrompt[] = [
+  {
+    label: "Set bias",
+    prompt: "For this TCAD session, help me define the gate/drain/source bias conditions and explain what sweep should be used."
+  },
+  {
+    label: "Analyze curve",
+    prompt: "Analyze the intended electrical curves for this device and tell me what transfer/output characteristics should be generated."
+  },
+  {
+    label: "Plan implant",
+    prompt: "Help me reason about ion implantation dose, concentration, and junction targets for this TCAD setup."
+  },
+  {
+    label: "Simulation goal",
+    prompt: "Summarize the simulation objective, required input files, expected curve outputs, and extraction metrics for this session."
+  }
+];
+
+const SIMULATION_SETUP = [
+  { label: "Gate bias", value: "Vg sweep, defined by prompt or uploaded deck" },
+  { label: "Drain bias", value: "Vd / Id target, extracted from experiment goal" },
+  { label: "Source / bulk", value: "Reference terminal conditions" },
+  { label: "Ion implantation", value: "Dose and concentration from SProcess inputs" },
+  { label: "Device geometry", value: "Channel, oxide and contact setup from structure files" },
+  { label: "Simulation goals", value: "Transfer curve, output curve, threshold and leakage extraction" }
+];
+
+const EXPECTED_OUTPUTS = [
+  "Electrical curve image: IV / transfer characteristic",
+  "Electrical curve image: output characteristic",
+  "Curve data file: .csv / .plt",
+  "Device result file: .tdr",
+  "Visualization image: structure, mesh or contour plot"
+];
+
+function messageSessionId(message: VmAgentMessage): string | null {
+  const value = message.meta?.sessionId;
+  return typeof value === "string" ? value : null;
+}
+
+function messageBelongsToSession(message: VmAgentMessage, sessionId: string): boolean {
+  return messageSessionId(message) === sessionId;
+}
+
+function messagesForSession(messages: VmAgentMessage[], sessionId: string | null): VmAgentMessage[] {
+  if (!sessionId) return [];
+  const filtered: VmAgentMessage[] = [];
+  let waitingForLegacyReply = false;
+
+  for (const message of messages) {
+    const scopedSession = messageSessionId(message);
+    if (scopedSession === sessionId) {
+      filtered.push(message);
+      waitingForLegacyReply = message.role === "user";
+      continue;
+    }
+
+    if (!scopedSession && waitingForLegacyReply && message.role !== "user") {
+      filtered.push(message);
+      waitingForLegacyReply = false;
+      continue;
+    }
+
+    if (scopedSession && scopedSession !== sessionId) {
+      waitingForLegacyReply = false;
+    }
+  }
+
+  return filtered;
+}
+
+function globalAgentMessages(messages: VmAgentMessage[]): VmAgentMessage[] {
+  return messages.filter((message) => !messageSessionId(message));
+}
+
+function loadSessionOrder(): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SESSION_ORDER_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveSessionOrder(order: string[]): void {
+  localStorage.setItem(SESSION_ORDER_KEY, JSON.stringify(order));
+}
+
+function sameStringArray(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+function orderRuns(runs: RunSummary[], order: string[]): RunSummary[] {
+  const byId = new Map(runs.map((run) => [run.id, run]));
+  const ordered = order.flatMap((id) => {
+    const run = byId.get(id);
+    return run ? [run] : [];
+  });
+  const known = new Set(order);
+  return [...ordered, ...runs.filter((run) => !known.has(run.id))];
+}
+
+function statusTone(status?: RunStatus): "neutral" | "good" | "warn" | "bad" {
+  if (status === "succeeded") return "good";
+  if (status === "running" || status === "queued") return "warn";
+  if (status === "failed" || status === "cancelled") return "bad";
+  return "neutral";
+}
+
+function latestMessagePreview(messages: VmAgentMessage[], runId: string): string {
+  const scoped = messages.filter((message) => messageBelongsToSession(message, runId));
+  const latest = scoped.at(-1);
+  if (!latest) return "No scoped VM messages yet";
+  const compact = latest.content.replace(/\s+/g, " ").trim();
+  return compact.length > 86 ? `${compact.slice(0, 86)}…` : compact;
+}
+
+function estimateContextUsage(messages: VmAgentMessage[]): ContextStats {
+  const characters = messages.reduce((total, message) => total + message.content.length, 0);
+  const estimatedTokens = Math.ceil(characters / 4);
+  return {
+    characters,
+    estimatedTokens,
+    messageCount: messages.length,
+    percent: Math.min(100, Math.round((estimatedTokens / REFERENCE_CONTEXT_TOKENS) * 100)),
+    maxTokens: REFERENCE_CONTEXT_TOKENS
+  };
+}
+
+function newSystemMessage(content: string, sessionId: string | null): VmAgentMessage {
+  return {
+    id: `ui_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    role: "system",
+    content,
+    createdAt: new Date().toISOString(),
+    meta: sessionId ? { sessionId } : undefined
+  };
+}
+
+function statusPillClass(ok: boolean | null | undefined, warning = false): string {
+  if (ok === true) return "status-pill good";
+  if (warning || ok === false) return "status-pill warn";
+  return "status-pill idle";
+}
+
+function mergeMessageList(prev: VmAgentMessage[], next: VmAgentMessage[] | undefined): VmAgentMessage[] {
+  if (!next?.length) return prev;
+  const seen = new Set(prev.map((message) => message.id));
+  const merged = [...prev];
+  for (const message of next) {
+    if (!seen.has(message.id)) {
+      merged.push(message);
+      seen.add(message.id);
+    }
+  }
+  return merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+}
 
 export default function App() {
-  const [auth, setAuth] = useState(getAuthToken());
-  const [health, setHealth] = useState<string>("checking...");
+  const savedToken = getAuthToken();
+  const [authInput, setAuthInput] = useState(savedToken);
+  const [authKey, setAuthKey] = useState(savedToken);
+  const [health, setHealth] = useState<string>("checking");
   const [vm, setVm] = useState<VmStatus | null>(null);
   const [vmLoading, setVmLoading] = useState(false);
   const [vmAgent, setVmAgent] = useState<VmAgentStatus | null>(null);
   const [vmAgentMessages, setVmAgentMessages] = useState<VmAgentMessage[]>([]);
   const [vmAgentCursor, setVmAgentCursor] = useState(0);
-  const [vmAgentInput, setVmAgentInput] = useState("请检查 Sentaurus 工具和最新 agent instance 状态");
-  const [vmAgentBusy, setVmAgentBusy] = useState(false);
+  const [composer, setComposer] = useState("");
+  const [vmAgentStatusLoading, setVmAgentStatusLoading] = useState(false);
+  const [vmAgentConnectLoading, setVmAgentConnectLoading] = useState(false);
+  const [vmAgentHistoryLoading, setVmAgentHistoryLoading] = useState(false);
+  const [messageSending, setMessageSending] = useState(false);
+  const [attachmentUploading, setAttachmentUploading] = useState(false);
   const [vmAgentStreamState, setVmAgentStreamState] = useState("idle");
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
-  const [runLog, setRunLog] = useState("");
-  const [runAction, setRunAction] = useState<string | null>(null);
+  const [panelNotice, setPanelNotice] = useState<PanelNotice | null>(null);
+  const [sessionOrder, setSessionOrder] = useState<string[]>(() => loadSessionOrder());
+  const [sessionSearch, setSessionSearch] = useState("");
+  const [draggedRunId, setDraggedRunId] = useState<string | null>(null);
+  const [dragOverRunId, setDragOverRunId] = useState<string | null>(null);
+  const [sessionMenu, setSessionMenu] = useState<SessionMenuState | null>(null);
+  const [renameTitle, setRenameTitle] = useState("");
+  const [pendingAttachments, setPendingAttachments] = useState<File[]>([]);
+  const [messageAttachments, setMessageAttachments] = useState<Record<string, UploadedAttachment[]>>({});
+  const [messageDisplayOverrides, setMessageDisplayOverrides] = useState<Record<string, string>>({});
+  const messageEndRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
-    getHealth().then((h) => setHealth(`${h.service} OK @ ${h.time}`)).catch((err) => setHealth(String(err)));
-  }, []);
+  const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
+  const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
+  const menuRun = useMemo(() => runs.find((run) => run.id === sessionMenu?.runId) || null, [runs, sessionMenu]);
+  const currentMessages = useMemo(() => messagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
+  const globalMessages = useMemo(() => globalAgentMessages(vmAgentMessages).slice(-6), [vmAgentMessages]);
+  const contextStats = useMemo(() => estimateContextUsage(currentMessages), [currentMessages]);
+  const query = sessionSearch.trim().toLowerCase();
+  const visibleRuns = useMemo(() => {
+    if (!query) return orderedRuns;
+    return orderedRuns.filter((run) => {
+      const preview = latestMessagePreview(vmAgentMessages, run.id).toLowerCase();
+      return run.title.toLowerCase().includes(query) || run.id.toLowerCase().includes(query) || preview.includes(query);
+    });
+  }, [orderedRuns, query, vmAgentMessages]);
+  const currentTitle = selectedRun?.title || "No session selected";
+  const vmOnline = vm?.ok ?? null;
+  const workerRunning = vmAgent?.workerRunning ?? null;
+  const llmConfigured = vmAgent?.llmConfigured ?? null;
+  const canSendMessage = !!authKey && !!selectedRunId && !messageSending && !attachmentUploading;
 
   function mergeVmAgentMessages(next: VmAgentMessage[] | undefined) {
-    if (!next?.length) return;
-    setVmAgentMessages((prev) => {
-      const seen = new Set(prev.map((message) => message.id));
-      const merged = [...prev];
-      for (const message of next) {
-        if (!seen.has(message.id)) {
-          merged.push(message);
-          seen.add(message.id);
-        }
+    setVmAgentMessages((prev) => mergeMessageList(prev, next));
+  }
+
+  function recordSystemNotice(text: string, kind: PanelNotice["kind"] = "info") {
+    setPanelNotice({ kind, text });
+    setVmAgentMessages((prev) => [...prev, newSystemMessage(text, selectedRunId)]);
+  }
+
+  function recordError(err: unknown) {
+    recordSystemNotice(errorMessage(err), "error");
+  }
+
+  async function saveToken() {
+    const next = normalizeAuthToken(authInput);
+    setAuthInput(next);
+    setAuthToken(next);
+    setAuthKey(next);
+    if (!next) {
+      setPanelNotice({ kind: "error", text: "AUTH_TOKEN is required." });
+      return;
+    }
+    setPanelNotice({ kind: "info", text: "Checking AUTH_TOKEN..." });
+    try {
+      const result = await listRuns();
+      setRuns(result.runs);
+      if (!selectedRunId && result.runs[0]) setSelectedRunId(result.runs[0].id);
+      setPanelNotice({ kind: "success", text: "AUTH_TOKEN saved." });
+    } catch (err) {
+      recordError(err);
+    }
+  }
+
+  async function refreshVm() {
+    setVmLoading(true);
+    try {
+      setVm(await getVmStatus());
+    } catch (err) {
+      recordError(err);
+    } finally {
+      setVmLoading(false);
+    }
+  }
+
+  async function refreshVmAgent() {
+    setVmAgentStatusLoading(true);
+    try {
+      setVmAgent(await getVmAgentStatus());
+    } catch (err) {
+      recordError(err);
+    } finally {
+      setVmAgentStatusLoading(false);
+    }
+  }
+
+  async function handleConnectVmAgent() {
+    setVmAgentConnectLoading(true);
+    try {
+      const response = await connectVmAgent();
+      setVmAgent(response.status);
+      setVmAgentCursor(response.cursor || 0);
+      mergeVmAgentMessages(response.messages || (response.message ? [response.message] : []));
+      setPanelNotice({ kind: "success", text: "VM agent connection refreshed." });
+    } catch (err) {
+      recordError(err);
+    } finally {
+      setVmAgentConnectLoading(false);
+    }
+  }
+
+  async function handleRefreshVmAgentMessages(showBusy = true) {
+    if (showBusy) setVmAgentHistoryLoading(true);
+    try {
+      const response = await getVmAgentMessages(0);
+      setVmAgent(response.status);
+      setVmAgentCursor(response.cursor);
+      mergeVmAgentMessages(response.messages);
+    } catch (err) {
+      recordError(err);
+    } finally {
+      if (showBusy) setVmAgentHistoryLoading(false);
+    }
+  }
+
+  async function handleVmAgentMessage(textOverride?: string) {
+    const text = (textOverride ?? composer).trim();
+    const attachments = textOverride ? [] : pendingAttachments;
+    if (!text && attachments.length === 0) return;
+    if (!selectedRunId) {
+      setPanelNotice({ kind: "error", text: "Create or select a session before sending a message." });
+      return;
+    }
+    setMessageSending(true);
+    if (attachments.length > 0) setAttachmentUploading(true);
+    setComposer("");
+    setPendingAttachments([]);
+    const uploadedAttachments: UploadedAttachment[] = [];
+    try {
+      for (const file of attachments) {
+        await uploadRunFile(selectedRunId, file);
+        uploadedAttachments.push({
+          id: `${file.name}_${file.size}_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+          name: file.name,
+          size: file.size,
+          uploadedAt: new Date().toISOString()
+        });
       }
-      return merged;
-    });
+      if (uploadedAttachments.length > 0) await refreshRunDetail(selectedRunId);
+
+      const attachmentLine = uploadedAttachments.length > 0
+        ? `\n\nAttachments uploaded to this session: ${uploadedAttachments.map((file) => file.name).join(", ")}.`
+        : "";
+      const visibleText = text || `Attached ${uploadedAttachments.length} file${uploadedAttachments.length === 1 ? "" : "s"}.`;
+      const response = await sendVmAgentMessage(`${visibleText}${attachmentLine}`, selectedRunId);
+      setVmAgent(response.status);
+      setVmAgentCursor(response.cursor);
+      const userMessage = [...(response.messages || [response.message])]
+        .reverse()
+        .find((message) => message.role === "user" && messageBelongsToSession(message, selectedRunId));
+      if (userMessage && uploadedAttachments.length > 0) {
+        setMessageAttachments((prev) => ({ ...prev, [userMessage.id]: uploadedAttachments }));
+        setMessageDisplayOverrides((prev) => ({ ...prev, [userMessage.id]: visibleText }));
+      }
+      mergeVmAgentMessages(response.messages || [response.message]);
+    } catch (err) {
+      recordError(err);
+      if (!textOverride) setComposer(text);
+      setPendingAttachments((prev) => [...attachments, ...prev]);
+    } finally {
+      setAttachmentUploading(false);
+      setMessageSending(false);
+    }
+  }
+
+  async function refreshRuns(selectFirst = false) {
+    try {
+      const result = await listRuns();
+      setRuns(result.runs);
+      if (selectFirst && !selectedRunId && result.runs[0]) setSelectedRunId(result.runs[0].id);
+    } catch (err) {
+      recordError(err);
+    }
+  }
+
+  async function refreshRunDetail(id = selectedRunId) {
+    if (!id) return;
+    try {
+      const detail = await getRun(id);
+      setRunDetail(detail);
+      setSelectedRunId(detail.run.id);
+    } catch (err) {
+      recordError(err);
+    }
+  }
+
+  async function handleCreateRun() {
+    setPanelNotice({ kind: "info", text: "Creating session..." });
+    try {
+      const result = await createRun(`Session ${new Date().toLocaleString()}`);
+      setRuns((prev) => [result.run, ...prev.filter((run) => run.id !== result.run.id)]);
+      setSessionOrder((prev) => [result.run.id, ...prev.filter((id) => id !== result.run.id)]);
+      setSelectedRunId(result.run.id);
+      await refreshRunDetail(result.run.id);
+      setPanelNotice({ kind: "success", text: "Session created." });
+    } catch (err) {
+      recordError(err);
+    }
+  }
+
+  function openSessionMenu(event: MouseEvent, runId: string) {
+    event.preventDefault();
+    setRenameTitle("");
+    setSessionMenu({ runId, x: event.clientX, y: event.clientY, mode: "menu" });
+  }
+
+  function handleDropRun(targetRunId: string) {
+    if (!draggedRunId || draggedRunId === targetRunId) {
+      setDraggedRunId(null);
+      setDragOverRunId(null);
+      return;
+    }
+    const ids = orderedRuns.map((run) => run.id);
+    const withoutDragged = ids.filter((id) => id !== draggedRunId);
+    const targetIndex = withoutDragged.indexOf(targetRunId);
+    const nextOrder = [...withoutDragged];
+    nextOrder.splice(targetIndex >= 0 ? targetIndex : nextOrder.length, 0, draggedRunId);
+    setSessionOrder(nextOrder);
+    setDraggedRunId(null);
+    setDragOverRunId(null);
+  }
+
+  function showRenameSession(run: RunSummary) {
+    setRenameTitle(run.title);
+    setSessionMenu((prev) => prev ? { ...prev, runId: run.id, mode: "rename" } : prev);
+  }
+
+  async function handleRenameSession(event: FormEvent, run: RunSummary) {
+    event.preventDefault();
+    const title = renameTitle.trim();
+    if (!title || title === run.title) {
+      setSessionMenu(null);
+      setRenameTitle("");
+      return;
+    }
+    setSessionMenu(null);
+    setPanelNotice({ kind: "info", text: "Renaming session..." });
+    try {
+      const result = await renameRun(run.id, title);
+      setRuns((prev) => prev.map((item) => item.id === run.id ? result.run : item));
+      setRunDetail((prev) => prev && prev.run.id === run.id ? { ...prev, run: result.run } : prev);
+      setPanelNotice({ kind: "success", text: "Session renamed." });
+    } catch (err) {
+      recordError(err);
+    } finally {
+      setRenameTitle("");
+    }
+  }
+
+  function showDeleteSession(run: RunSummary) {
+    setSessionMenu((prev) => prev ? { ...prev, runId: run.id, mode: "delete" } : prev);
+  }
+
+  async function handleDeleteSession(run: RunSummary) {
+    setSessionMenu(null);
+    setPanelNotice({ kind: "info", text: "Deleting session..." });
+    try {
+      const nextSelectedRun = orderedRuns.find((item) => item.id !== run.id) || null;
+      await deleteRunApi(run.id);
+      setRuns((prev) => prev.filter((item) => item.id !== run.id));
+      setSessionOrder((prev) => prev.filter((id) => id !== run.id));
+      if (selectedRunId === run.id) {
+        setSelectedRunId(nextSelectedRun?.id ?? null);
+        setRunDetail(null);
+      }
+      setPanelNotice({ kind: "success", text: "Session deleted." });
+    } catch (err) {
+      recordError(err);
+    }
+  }
+
+  function handleSelectAttachments(fileList: FileList | null) {
+    if (!fileList?.length) return;
+    setPendingAttachments((prev) => [...prev, ...Array.from(fileList)]);
+  }
+
+  function removePendingAttachment(index: number) {
+    setPendingAttachments((prev) => prev.filter((_, itemIndex) => itemIndex !== index));
+  }
+
+  function renderArtifactList(files: RunFile[]) {
+    if (!runDetail) return null;
+    if (files.length === 0) return <p className="empty-line">No generated outputs yet.</p>;
+    return (
+      <div className="file-list">
+        {files.map((file) => (
+          <a className="file-row" key={`${file.kind}:${file.name}`} href={downloadUrl(runDetail.run.id, "artifacts", file.name)} target="_blank" rel="noreferrer">
+            <span>{file.name}</span>
+            <small>{formatBytes(file.size)} · {formatDate(file.modifiedAt)}</small>
+          </a>
+        ))}
+      </div>
+    );
   }
 
   useEffect(() => {
-    if (!auth) {
+    getHealth().then((h) => setHealth(`${h.service} OK`)).catch((err) => setHealth(errorMessage(err)));
+  }, []);
+
+  useEffect(() => {
+    saveSessionOrder(sessionOrder);
+  }, [sessionOrder]);
+
+  useEffect(() => {
+    if (!sessionMenu) return;
+    const close = () => setSessionMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [sessionMenu]);
+
+  useEffect(() => {
+    const runIds = runs.map((run) => run.id);
+    setSessionOrder((prev) => {
+      const known = new Set(runIds);
+      const next = [...prev.filter((id) => known.has(id)), ...runIds.filter((id) => !prev.includes(id))];
+      return sameStringArray(prev, next) ? prev : next;
+    });
+  }, [runs]);
+
+  useEffect(() => {
+    if (selectedRunId && runs.some((run) => run.id === selectedRunId)) return;
+    setSelectedRunId(orderedRuns[0]?.id ?? null);
+  }, [orderedRuns, runs, selectedRunId]);
+
+  useEffect(() => {
+    if (!authKey) {
       setVmAgentStreamState("auth required");
       return;
     }
+    void refreshRuns(true);
+    void refreshVm();
+    void handleRefreshVmAgentMessages(false);
     setVmAgentStreamState("connecting");
     const events = new EventSource(vmAgentMessageStreamUrl(vmAgentCursor));
     events.addEventListener("messages", (event) => {
@@ -77,274 +600,323 @@ export default function App() {
       events.close();
     });
     return () => events.close();
-    // The stream keeps its own server-side cursor after it opens.
-  }, [auth]);
-
-  async function saveToken() {
-    setAuthToken(auth);
-    await refreshRuns();
-  }
-
-  async function refreshVm() {
-    setVmLoading(true);
-    try {
-      setVm(await getVmStatus());
-    } finally {
-      setVmLoading(false);
-    }
-  }
-
-  async function refreshVmAgent() {
-    setVmAgentBusy(true);
-    try {
-      setVmAgent(await getVmAgentStatus());
-    } finally {
-      setVmAgentBusy(false);
-    }
-  }
-
-  async function handleConnectVmAgent() {
-    setVmAgentBusy(true);
-    try {
-      const response = await connectVmAgent();
-      setVmAgent(response.status);
-      setVmAgentCursor(response.cursor || 0);
-      mergeVmAgentMessages(response.messages || (response.message ? [response.message] : []));
-    } catch (err) {
-      setVmAgentMessages((prev) => [...prev, { id: `vm_err_${Date.now()}`, role: "system", content: String(err), createdAt: new Date().toISOString() }]);
-    } finally {
-      setVmAgentBusy(false);
-    }
-  }
-
-  async function handleRefreshVmAgentMessages() {
-    setVmAgentBusy(true);
-    try {
-      const response = await getVmAgentMessages(0);
-      setVmAgent(response.status);
-      setVmAgentCursor(response.cursor);
-      mergeVmAgentMessages(response.messages);
-    } catch (err) {
-      setVmAgentMessages((prev) => [...prev, { id: `vm_err_${Date.now()}`, role: "system", content: String(err), createdAt: new Date().toISOString() }]);
-    } finally {
-      setVmAgentBusy(false);
-    }
-  }
-
-  async function handleVmAgentMessage() {
-    const text = vmAgentInput.trim();
-    if (!text) return;
-    setVmAgentBusy(true);
-    setVmAgentInput("");
-    try {
-      const response = await sendVmAgentMessage(text);
-      setVmAgent(response.status);
-      setVmAgentCursor(response.cursor);
-      mergeVmAgentMessages(response.messages || [response.message]);
-    } catch (err) {
-      setVmAgentMessages((prev) => [...prev, { id: `vm_err_${Date.now()}`, role: "system", content: String(err), createdAt: new Date().toISOString() }]);
-    } finally {
-      setVmAgentBusy(false);
-    }
-  }
-
-  async function refreshRuns() {
-    const result = await listRuns();
-    setRuns(result.runs);
-    if (!selectedRunId && result.runs[0]) setSelectedRunId(result.runs[0].id);
-  }
-
-  async function refreshRunDetail(id = selectedRunId) {
-    if (!id) return;
-    const detail = await getRun(id);
-    setRunDetail(detail);
-    setSelectedRunId(detail.run.id);
-  }
+  }, [authKey]);
 
   useEffect(() => {
-    if (!selectedRunId || !auth) return;
-    void refreshRunDetail(selectedRunId).catch((err) => setRunLog((prev) => `${prev}\n[detail error] ${String(err)}`));
-    const events = new EventSource(logStreamUrl(selectedRunId));
-    events.addEventListener("log", (event) => {
-      const data = JSON.parse((event as MessageEvent).data) as { chunk: string };
-      setRunLog((prev) => prev + data.chunk);
-    });
-    events.addEventListener("error", () => events.close());
-    return () => events.close();
-    // auth intentionally reconnects the stream after token save.
-  }, [selectedRunId, auth]);
-
-  async function handleCreateRun() {
-    const title = window.prompt("Run title", "Manual TCAD run") || "Manual TCAD run";
-    const result = await createRun(title);
-    setRuns((prev) => [result.run, ...prev]);
-    setSelectedRunId(result.run.id);
-    await refreshRunDetail(result.run.id);
-  }
-
-  async function handleUpload(fileList: FileList | null) {
-    if (!selectedRunId || !fileList?.[0]) return;
-    setRunAction("upload");
-    try {
-      await uploadRunFile(selectedRunId, fileList[0]);
-      await refreshRunDetail(selectedRunId);
-    } finally {
-      setRunAction(null);
+    if (!selectedRunId || !authKey) {
+      setRunDetail(null);
+      return;
     }
-  }
+    let closed = false;
+    void getRun(selectedRunId)
+      .then((detail) => {
+        if (!closed) setRunDetail(detail);
+      })
+      .catch((err) => {
+        if (!closed) recordError(err);
+      });
+    return () => {
+      closed = true;
+    };
+  }, [selectedRunId, authKey]);
 
-  async function handlePrepareRemote() {
-    if (!selectedRunId) return;
-    setRunAction("prepare");
-    try {
-      const result = await prepareRemoteRun(selectedRunId);
-      window.alert(result.message);
-      await refreshRuns();
-      await refreshRunDetail(selectedRunId);
-    } finally {
-      setRunAction(null);
-    }
-  }
-
-  async function handleSubmitJob() {
-    if (!selectedRunId) return;
-    setRunAction("submit");
-    try {
-      const result = await submitRunJob(selectedRunId);
-      window.alert(result.message);
-    } catch (err) {
-      window.alert(String(err));
-    } finally {
-      setRunAction(null);
-    }
-  }
-
-  async function handleCancelRun() {
-    if (!selectedRunId || !window.confirm("Cancel this run?")) return;
-    await cancelRun(selectedRunId);
-    await refreshRuns();
-    await refreshRunDetail(selectedRunId);
-  }
-
-  function renderFileList(files: RunFile[], area: "files" | "artifacts") {
-    if (files.length === 0) return <p className="muted">None yet.</p>;
-    return files.map((file) => (
-      <a className="file-row" key={`${file.kind}:${file.name}`} href={downloadUrl(runDetail!.run.id, area, file.name)} target="_blank" rel="noreferrer">
-        <span>{file.name}</span>
-        <small>{(file.size / 1024).toFixed(1)} KiB · {new Date(file.modifiedAt).toLocaleString()}</small>
-      </a>
-    ));
-  }
+  useEffect(() => {
+    messageEndRef.current?.scrollIntoView({ block: "end" });
+  }, [currentMessages.length, selectedRunId]);
 
   return (
-    <main className="shell">
-      <section className="hero">
-        <div>
-          <p className="eyebrow">Sentaurus TCAD · Web Agent</p>
-          <h1>VM Agent Console</h1>
-          <p className="muted">Browser message panel and host-side SSH relay for the CentOS Sentaurus agent.</p>
-        </div>
-        <div className="health">{health}</div>
-      </section>
-
-      <section className="grid">
-        <div className="card">
-          <h2>Auth</h2>
-          <p className="muted">Paste the AUTH_TOKEN from your local .env. It is stored only in browser localStorage.</p>
-          <div className="row">
-            <input value={auth} onChange={(e) => setAuth(e.target.value)} placeholder="AUTH_TOKEN" type="password" />
-            <button onClick={saveToken}>Save</button>
+    <main className="app-shell">
+      <header className="top-status-bar">
+        <div className="brand-lockup">
+          <span className="brand-mark">S</span>
+          <div>
+            <strong>Sentaurus VM Agent</strong>
+            <small>VM-local LLM · SSH relay · Safe TCAD workspace</small>
           </div>
         </div>
+        <div className="top-status-actions">
+          <span className={statusPillClass(health.endsWith("OK"))}><i />API {health}</span>
+          <span className={statusPillClass(vmOnline, vmLoading)}><i />VM {vmLoading ? "Checking" : vm?.ok ? "Online" : vm ? "Offline" : "Unchecked"}</span>
+          <span className={statusPillClass(workerRunning)}><i />Agent {vmAgent?.workerRunning ? "Running" : vmAgent ? "Stopped" : vmAgentStreamState}</span>
+          <span className={statusPillClass(llmConfigured, vmAgent && !vmAgent.llmConfigured ? true : false)}><i />LLM {vmAgent?.llmConfigured ? "Configured" : "Pending"}</span>
+        </div>
+      </header>
 
-        <div className="card">
-          <h2>Sentaurus VM</h2>
-          <button onClick={refreshVm} disabled={vmLoading}>{vmLoading ? "Checking..." : "Check VM status"}</button>
-          {vm && (
-            <pre className={vm.ok ? "okbox" : "errbox"}>{JSON.stringify(vm, null, 2)}</pre>
-          )}
+      <aside className="session-sidebar">
+        <section className="auth-card">
+          <label htmlFor="auth-token-input">AUTH_TOKEN</label>
+          <div className="auth-input-row">
+            <input id="auth-token-input" value={authInput} onChange={(event) => setAuthInput(event.target.value)} placeholder="Paste AUTH_TOKEN" type="password" />
+            <button onClick={() => void saveToken()}>Save</button>
+          </div>
+          {panelNotice && <p className={`panel-notice ${panelNotice.kind}`}>{panelNotice.text}</p>}
+          <div className="mini-actions">
+            <button className="secondary" onClick={() => void refreshVm()} disabled={!authKey || vmLoading}>{vmLoading ? "Checking" : "VM status"}</button>
+            <button className="secondary" onClick={() => void refreshVmAgent()} disabled={!authKey || vmAgentStatusLoading}>{vmAgentStatusLoading ? "Checking" : "Agent status"}</button>
+          </div>
+        </section>
+
+        <section className="session-toolbar">
+          <div>
+            <h2>Sessions</h2>
+            <small>{visibleRuns.length} shown · {runs.length} total</small>
+          </div>
+          <button onClick={() => void handleCreateRun()} disabled={!authKey}>New</button>
+        </section>
+
+        <div className="session-search">
+          <input value={sessionSearch} onChange={(event) => setSessionSearch(event.target.value)} placeholder="Search title, run id, latest message" />
+          <button className="secondary" onClick={() => void refreshRuns()} disabled={!authKey}>Refresh</button>
         </div>
 
-        <div className="card wide">
-          <h2>VM Agent</h2>
-          <div className="row wrap">
-            <button onClick={handleConnectVmAgent} disabled={vmAgentBusy}>{vmAgentBusy ? "Working..." : "Start VM agent"}</button>
-            <button className="secondary" onClick={refreshVmAgent} disabled={vmAgentBusy}>Status</button>
-            <button className="secondary" onClick={handleRefreshVmAgentMessages} disabled={vmAgentBusy}>History</button>
-            <small className={vmAgentStreamState === "live" ? "oktext" : "muted"}>stream: {vmAgentStreamState}</small>
-          </div>
-          {vmAgent && (
-            <pre className={vmAgent.ok ? "okbox" : "errbox"}>{JSON.stringify(vmAgent, null, 2)}</pre>
-          )}
-          <div className="messages compact">
-            {vmAgentMessages.map((m) => <div key={m.id} className={`msg ${m.role}`}><b>{m.role}</b><span>{m.content}</span></div>)}
-            {vmAgentMessages.length === 0 && <p className="muted">No VM agent messages yet.</p>}
-          </div>
-          <div className="row">
-            <input value={vmAgentInput} onChange={(event) => setVmAgentInput(event.target.value)} placeholder="Message to CentOS VM agent" />
-            <button onClick={handleVmAgentMessage} disabled={vmAgentBusy}>{vmAgentBusy ? "Sending..." : "Send"}</button>
-          </div>
+        <div className="session-list" aria-label="Sessions">
+          {visibleRuns.map((run) => (
+            <button
+              className={`session-card ${selectedRunId === run.id ? "selected" : ""} ${draggedRunId === run.id ? "dragging" : ""} ${dragOverRunId === run.id ? "drag-over" : ""}`}
+              draggable
+              key={run.id}
+              onClick={() => setSelectedRunId(run.id)}
+              onContextMenu={(event) => openSessionMenu(event, run.id)}
+              onDragStart={() => setDraggedRunId(run.id)}
+              onDragOver={(event) => {
+                event.preventDefault();
+                setDragOverRunId(run.id);
+              }}
+              onDragLeave={() => setDragOverRunId((current) => current === run.id ? null : current)}
+              onDrop={(event) => {
+                event.preventDefault();
+                handleDropRun(run.id);
+              }}
+              onDragEnd={() => {
+                setDraggedRunId(null);
+                setDragOverRunId(null);
+              }}
+            >
+              <span className="session-title-row">
+                <strong>{run.title}</strong>
+                <em className={`run-state ${statusTone(run.status)} ${run.status}`}>{run.status}</em>
+              </span>
+              <span className="session-preview">{latestMessagePreview(vmAgentMessages, run.id)}</span>
+              <span className="session-meta-row">
+                <small>{shortId(run.id)}</small>
+                <small>{formatDate(run.updatedAt || run.createdAt)}</small>
+              </span>
+            </button>
+          ))}
+          {visibleRuns.length === 0 && <p className="empty-line">No matching sessions</p>}
         </div>
+      </aside>
 
-        <div className="card wide">
-          <h2>Runs</h2>
-          <div className="row">
-            <button onClick={handleCreateRun}>Create run directory</button>
-            <button onClick={refreshRuns}>Refresh</button>
+      <section className="chat-workspace">
+        <header className="chat-header">
+          <div>
+            <p className="eyebrow">Current session</p>
+            <h1>{currentTitle}</h1>
+            <div className="meta-row">
+              <span>{selectedRunId ? shortId(selectedRunId) : "select or create a session"}</span>
+              <span>stream: {vmAgentStreamState}</span>
+              {selectedRun && <span>{selectedRun.status}</span>}
+              <span>context: {formatCompactNumber(contextStats.estimatedTokens)} / {formatCompactNumber(contextStats.maxTokens)} est. tokens</span>
+            </div>
           </div>
-          <div className="runs">
-            {runs.map((run) => (
-              <button className={`run ${selectedRunId === run.id ? "selected" : ""}`} key={run.id} onClick={() => setSelectedRunId(run.id)}>
-                <b>{run.title}</b>
-                <code>{run.id}</code>
-                <span>{run.status}</span>
-                {run.remotePreparedAt && <small>remote prepared: {new Date(run.remotePreparedAt).toLocaleString()}</small>}
-                {run.lastError && <small className="danger">{run.lastError}</small>}
-              </button>
-            ))}
-            {runs.length === 0 && <p className="muted">No runs yet.</p>}
+          <div className="chat-actions">
+            <button onClick={() => void handleConnectVmAgent()} disabled={!authKey || vmAgentConnectLoading}>{vmAgentConnectLoading ? "Starting" : "Start agent"}</button>
+            <button className="secondary" onClick={() => void handleRefreshVmAgentMessages()} disabled={!authKey || vmAgentHistoryLoading}>{vmAgentHistoryLoading ? "Loading" : "History"}</button>
           </div>
-        </div>
+        </header>
 
-        <div className="card wide">
-          <h2>Run detail</h2>
-          {!runDetail && <p className="muted">Select or create a run.</p>}
-          {runDetail && (
-            <div className="detail">
-              <div className="detail-head">
-                <div>
-                  <b>{runDetail.run.title}</b>
-                  <code>{runDetail.run.id}</code>
-                  <span className={`status ${runDetail.run.status}`}>{runDetail.run.status}</span>
-                  {runDetail.run.remoteDir && <small>Remote: {runDetail.run.remoteDir}</small>}
-                </div>
-                <div className="row wrap">
-                  <label className="upload-button">
-                    Upload input
-                    <input type="file" onChange={(event) => void handleUpload(event.target.files)} />
-                  </label>
-                  <button onClick={handlePrepareRemote} disabled={!!runAction}>Prepare remote</button>
-                  <button onClick={handleSubmitJob} disabled={!!runAction}>Submit job</button>
-                  <button className="secondary" onClick={handleCancelRun}>Cancel</button>
-                  <button className="secondary" onClick={() => refreshRunDetail()}>Refresh</button>
-                </div>
-              </div>
-              <div className="detail-grid">
-                <section>
-                  <h3>Input files</h3>
-                  {renderFileList(runDetail.files, "files")}
-                </section>
-                <section>
-                  <h3>Artifacts</h3>
-                  {renderFileList(runDetail.artifacts, "artifacts")}
-                </section>
-              </div>
-              <h3>Live job log</h3>
-              <pre className="logbox">{runLog || "No log lines yet."}</pre>
+        <div className="message-list">
+          {currentMessages.length === 0 && (
+            <div className="empty-chat">
+              <strong>{selectedRun ? "No messages in this session." : "No session selected."}</strong>
+              <span>{selectedRun ? "Send a prompt or use a quick action to talk with the VM agent." : "Create or select a session from the left panel."}</span>
             </div>
           )}
+          {currentMessages.map((message) => {
+            const attachments = messageAttachments[message.id] || [];
+            const content = messageDisplayOverrides[message.id] ?? message.content;
+            return (
+              <article className={`message-row ${message.role}`} key={message.id}>
+                <div className="avatar">{message.role === "agent" ? "VM" : message.role === "user" ? "You" : "Sys"}</div>
+                <div className="message-bubble">
+                  <div className="message-content">{content}</div>
+                  {attachments.length > 0 && (
+                    <div className="message-attachments">
+                      {attachments.map((file) => (
+                        <span className="attachment-chip" key={file.id}>
+                          {file.name}
+                          <small>{formatBytes(file.size)}</small>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+          <div ref={messageEndRef} />
         </div>
+
+        <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void handleVmAgentMessage(); }}>
+          <div className="quick-prompts">
+            {QUICK_PROMPTS.map((prompt) => (
+              <button
+                className="quick-chip"
+                disabled={!canSendMessage}
+                key={prompt.label}
+                onClick={() => setComposer(prompt.prompt)}
+                type="button"
+              >
+                {prompt.label}
+              </button>
+            ))}
+          </div>
+          {pendingAttachments.length > 0 && (
+            <div className="pending-attachments">
+              {pendingAttachments.map((file, index) => (
+                <span className="attachment-chip" key={`${file.name}-${file.size}-${index}`}>
+                  {file.name}
+                  <small>{formatBytes(file.size)}</small>
+                  <button type="button" onClick={() => removePendingAttachment(index)} disabled={messageSending || attachmentUploading}>×</button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="composer-box">
+            <textarea
+              value={composer}
+              onChange={(event) => setComposer(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void handleVmAgentMessage();
+                }
+              }}
+              placeholder="Message the VM agent…"
+              rows={3}
+            />
+            <div className="composer-actions">
+              <label className="attach-button">
+                Attach
+                <input type="file" multiple disabled={!authKey || !selectedRunId || messageSending || attachmentUploading} onChange={(event) => {
+                  handleSelectAttachments(event.target.files);
+                  event.currentTarget.value = "";
+                }} />
+              </label>
+              <button disabled={!canSendMessage || (!composer.trim() && pendingAttachments.length === 0)}>
+                {attachmentUploading ? "Uploading" : messageSending ? "Sending" : "Send"}
+              </button>
+            </div>
+          </div>
+        </form>
       </section>
+
+      <aside className="inspector-panel">
+        <section className="inspector-card context-card">
+          <div className="section-head">
+            <h2>Context Usage</h2>
+            <span>estimated</span>
+          </div>
+          <div className="usage-meter" aria-label="Estimated context usage">
+            <span style={{ width: `${contextStats.estimatedTokens > 0 ? Math.max(2, contextStats.percent) : 0}%` }} />
+          </div>
+          <div className="metric-grid">
+            <div><strong>{formatCompactNumber(contextStats.estimatedTokens)}</strong><span>est. tokens</span></div>
+            <div><strong>{contextStats.percent}%</strong><span>of 272k</span></div>
+            <div><strong>{contextStats.messageCount}</strong><span>messages</span></div>
+            <div><strong>{formatCompactNumber(contextStats.characters)}</strong><span>characters</span></div>
+          </div>
+        </section>
+
+        <section className="inspector-card">
+          <div className="section-head">
+            <h2>Agent Context</h2>
+            <button className="link-button" onClick={() => void refreshVmAgent()} disabled={!authKey || vmAgentStatusLoading}>{vmAgentStatusLoading ? "Checking" : "Refresh"}</button>
+          </div>
+          <dl className="kv">
+            <dt>VM</dt><dd>{vmOnline === true ? "online" : vmOnline === false ? "offline" : "unchecked"}</dd>
+            <dt>Agent</dt><dd>{workerRunning ? "running" : vmAgent ? "stopped" : vmAgentStreamState}</dd>
+            <dt>LLM</dt><dd>{vmAgent?.llmConfigured ? "configured" : "pending"}</dd>
+            <dt>Messages</dt><dd>{vmAgent?.messageCount ?? currentMessages.length}</dd>
+            <dt>Queue</dt><dd>{vmAgent?.queueDepth ?? 0}</dd>
+          </dl>
+        </section>
+
+        <section className="inspector-card">
+          <div className="section-head">
+            <h2>Simulation Setup</h2>
+            {selectedRun && <em className={`run-state ${statusTone(selectedRun.status)} ${selectedRun.status}`}>{selectedRun.status}</em>}
+          </div>
+          <div className="simulation-list">
+            {SIMULATION_SETUP.map((item) => (
+              <div className="simulation-row" key={item.label}>
+                <span>{item.label}</span>
+                <small>{item.value}</small>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="inspector-card">
+          <div className="section-head">
+            <h2>Expected Outputs</h2>
+            {runDetail && <button className="link-button" onClick={() => void refreshRunDetail()}>Refresh</button>}
+          </div>
+          <div className="output-targets">
+            {EXPECTED_OUTPUTS.map((item) => <span key={item}>{item}</span>)}
+          </div>
+          <h3>Generated artifacts</h3>
+          {runDetail ? renderArtifactList(runDetail.artifacts) : <p className="empty-line">Select a session to view generated outputs.</p>}
+        </section>
+
+        {globalMessages.length > 0 && (
+          <section className="inspector-card">
+            <h2>Global Agent Events</h2>
+            <div className="global-events">
+              {globalMessages.map((message) => <p key={message.id}>{formatDate(message.createdAt)} · {message.content}</p>)}
+            </div>
+          </section>
+        )}
+      </aside>
+
+      {sessionMenu && menuRun && (
+        <div className="session-menu" style={{ left: sessionMenu.x, top: sessionMenu.y }} onClick={(event) => event.stopPropagation()}>
+          <strong>{menuRun.title}</strong>
+          {sessionMenu.mode === "menu" && (
+            <>
+              <button onClick={() => showRenameSession(menuRun)}>Rename</button>
+              <button className="danger-button" onClick={() => showDeleteSession(menuRun)}>Delete</button>
+            </>
+          )}
+          {sessionMenu.mode === "rename" && (
+            <form className="menu-form" onSubmit={(event) => void handleRenameSession(event, menuRun)}>
+              <label>
+                Session name
+                <input autoFocus value={renameTitle} onChange={(event) => setRenameTitle(event.target.value)} />
+              </label>
+              <div className="confirm-actions">
+                <button type="button" className="secondary" onClick={() => setSessionMenu((prev) => prev ? { ...prev, mode: "menu" } : prev)}>Cancel</button>
+                <button type="submit" disabled={!renameTitle.trim() || renameTitle.trim() === menuRun.title}>Save</button>
+              </div>
+            </form>
+          )}
+          {sessionMenu.mode === "delete" && (
+            <div className="menu-confirm danger">
+              <p>Delete this session and its local files?</p>
+              <span>This cannot be undone.</span>
+              <div className="confirm-actions">
+                <button className="secondary" onClick={() => setSessionMenu((prev) => prev ? { ...prev, mode: "menu" } : prev)}>Cancel</button>
+                <button className="danger-button" onClick={() => void handleDeleteSession(menuRun)}>Delete session</button>
+              </div>
+            </div>
+          )}
+          <dl>
+            <dt>Created</dt><dd>{formatFullDate(menuRun.createdAt)}</dd>
+            <dt>Updated</dt><dd>{formatFullDate(menuRun.updatedAt)}</dd>
+            <dt>Run id</dt><dd>{menuRun.id}</dd>
+          </dl>
+        </div>
+      )}
     </main>
   );
 }
