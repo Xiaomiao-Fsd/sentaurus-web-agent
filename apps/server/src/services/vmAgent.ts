@@ -567,15 +567,8 @@ def skill_snapshot():
 
 def wants_skill_reply(text):
     lowered = text.lower().strip()
-    compact = "".join(lowered.split())
-    exact = ["/skill", "skill", "/status", "status", u"状态", u"工具", u"实例", u"查看状态", u"查看工具", u"仿真状态"]
-    if compact in exact:
-        return True
-    if lowered.startswith("/skill") or lowered.startswith("/status"):
-        return True
-    if len(lowered) <= 120 and (("status" in lowered or u"状态" in lowered or u"工具" in lowered or "tools" in lowered or "instance" in lowered or u"实例" in lowered) and ("sentaurus" in lowered or "vm" in lowered or "agent" in lowered or "sde" in lowered or "sdevice" in lowered)):
-        return True
-    return False
+    match = re.match(r"^/(skill|status|tools|instances?|sentaurus-status)(?:\s|$)", lowered)
+    return bool(match)
 
 def local_skill_reply(text):
     snapshot = skill_snapshot()

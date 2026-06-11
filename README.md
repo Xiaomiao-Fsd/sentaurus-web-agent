@@ -197,6 +197,7 @@ GET  /api/vm/agent/messages/stream
 Current behavior:
 
 - The host backend only relays messages over SSH. `POST /api/vm/agent/messages` writes to a VM-local queue; the CentOS worker reads that queue, calls the VM-local LLM config when present, uses safe Sentaurus skills, and writes responses back to `messages.jsonl`.
+- VM-local status/tool skills are intentionally slash-command only (`/status`, `/skill`, `/tools`, `/instance`, `/instances`, `/sentaurus-status`) so ordinary Chinese prompts containing words such as “状态” or “仿真” still go through the LLM/runner path.
 - If VM-local LLM config is missing, the worker still runs and can answer safe Sentaurus status/tool/instance requests without exposing secrets.
 - The legacy host-side `/api/chat` route is disabled so the host backend does not call an LLM directly.
 - Uploaded files are written only to the run's `input/` directory.
