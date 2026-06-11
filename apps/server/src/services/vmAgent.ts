@@ -39,7 +39,7 @@ type RemoteAgentPayload = {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.4.0";
+const agentVersion = "0.4.1";
 
 const remoteWorkerScript = String.raw`# -*- coding: utf-8 -*-
 import datetime
@@ -48,6 +48,7 @@ import getpass
 import json
 import os
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -61,7 +62,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.0"
+AGENT_VERSION = "0.4.1"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -72,6 +73,10 @@ HEARTBEAT_PATH = os.path.join(ROOT, "worker.heartbeat")
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 ENV_PATH = os.path.join(ROOT, ".env")
 MANUALS_DIR = os.path.join(ROOT, "manuals")
+LLM_HARD_TIMEOUT_SECONDS = 120
+
+class HardTimeout(Exception):
+    pass
 RUNS_DIR = os.path.join(HOME, "STDB", "web-agent-runs")
 STOP_PATH = os.path.join(ROOT, "stop")
 
@@ -104,6 +109,19 @@ def append_jsonl(path, payload):
 
 def audit(event, detail):
     append_jsonl(AUDIT_PATH, {"at": now_iso(), "agent": AGENT_NAME, "event": event, "detail": detail})
+
+def run_with_timeout(seconds, label, fn, *args):
+    if not hasattr(signal, "SIGALRM") or seconds <= 0:
+        return fn(*args)
+    def timeout_handler(signum, frame):
+        raise HardTimeout("%s timed out after %ss" % (label, seconds))
+    previous_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(seconds)
+    try:
+        return fn(*args)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 def append_message(role, content, source, meta=None, id_prefix=None):
     message = {
@@ -720,7 +738,7 @@ def reply_for(text):
             "or config.json. Sentaurus safe skills are already available; ask for status/tools to test them."
         ), {"kind": "config_required", "llmConfigured": False}
     try:
-        return call_llm(text, config)
+        return run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent LLM call", call_llm, text, config)
     except Exception as exc:
         return "VM agent LLM call failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": True, "modelCandidates": ",".join(config.get("models") or [])}
 
@@ -732,6 +750,7 @@ def process_queue_file(path):
         text = safe_text(item.get("content"), 4000)
         incoming_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         session_id = safe_text(incoming_meta.get("sessionId"), 160).strip()
+        audit("queue_processing_started", {"file": os.path.basename(path), "sessionId": session_id})
         reply, meta = reply_for(text)
         run_request, visible_reply = extract_run_request(reply)
         if run_request:
@@ -787,7 +806,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.0"
+AGENT_VERSION = "0.4.1"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 
