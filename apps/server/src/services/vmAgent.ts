@@ -1,6 +1,6 @@
 import type { VmAgentMessage, VmAgentStatus } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
-import { runSshCommand } from "./sshClient.js";
+import { runSshCommandWithInput } from "./sshClient.js";
 
 type VmAgentOperation = "status" | "start" | "send" | "history";
 
@@ -1164,17 +1164,12 @@ except Exception as exc:
     sys.exit(0)
 `;
 
-function remotePython(script: string): string {
-  return `python - <<'PY'\n${script}\nPY`;
-}
-
-function remoteAgentCommand(request: RemoteAgentRequest): string {
+function remoteAgentScript(request: RemoteAgentRequest): string {
   const encodedRequest = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
   const encodedWorker = Buffer.from(remoteWorkerScript, "utf8").toString("base64");
-  const script = remoteControlScript
+  return remoteControlScript
     .replace("__REQUEST_B64__", encodedRequest)
     .replace("__WORKER_SOURCE_B64__", encodedWorker);
-  return remotePython(script);
 }
 
 function parseRemoteJson(raw: string): RemoteAgentPayload {
@@ -1250,7 +1245,7 @@ function fallbackAgentMessage(content: string): VmAgentMessage {
 }
 
 async function callVmAgent(request: RemoteAgentRequest): Promise<RemoteAgentPayload> {
-  const result = await runSshCommand(remoteAgentCommand(request), 20_000);
+  const result = await runSshCommandWithInput("python -", remoteAgentScript(request), 20_000);
   const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
   if (!result.ok) {
     return { ok: false, error: result.error || result.stderr || "VM agent SSH call failed", raw: raw.slice(0, 500), messages: [], cursor: 0 };
