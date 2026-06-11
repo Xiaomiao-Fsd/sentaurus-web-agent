@@ -39,7 +39,7 @@ type RemoteAgentPayload = {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.3.0";
+const agentVersion = "0.4.0";
 
 const remoteWorkerScript = String.raw`# -*- coding: utf-8 -*-
 import datetime
@@ -47,6 +47,7 @@ import glob
 import getpass
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -60,7 +61,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.3.0"
+AGENT_VERSION = "0.4.0"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -71,6 +72,7 @@ HEARTBEAT_PATH = os.path.join(ROOT, "worker.heartbeat")
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 ENV_PATH = os.path.join(ROOT, ".env")
 MANUALS_DIR = os.path.join(ROOT, "manuals")
+RUNS_DIR = os.path.join(HOME, "STDB", "web-agent-runs")
 STOP_PATH = os.path.join(ROOT, "stop")
 
 try:
@@ -205,6 +207,231 @@ def sentaurus_tools():
         "svisual": which("svisual"),
     }
 
+def safe_file_name(name):
+    name = safe_text(name, 180).strip()
+    if not name or os.path.basename(name) != name or name.startswith(".") or ".." in name:
+        raise ValueError("invalid file name: %s" % name)
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._@()+,-]{0,159}$", name):
+        raise ValueError("file name contains unsupported characters: %s" % name)
+    return name
+
+def safe_run_slug(text):
+    text = safe_text(text, 80).lower()
+    text = re.sub(r"[^a-z0-9_-]+", "-", text).strip("-")
+    return text[:48] or "sentaurus-job"
+
+def write_utf8(path, text):
+    ensure_dir(os.path.dirname(path))
+    if isinstance(text, unicode) if sys.version_info[0] < 3 else False:
+        raw = text.encode("utf-8")
+    else:
+        try:
+            raw = text.encode("utf-8")
+        except AttributeError:
+            raw = text
+    with open(path, "wb") as handle:
+        handle.write(raw)
+
+def read_file_tail(path, limit=1800):
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            raw = handle.read(limit)
+    except Exception:
+        return ""
+    try:
+        return raw.decode("utf-8", "replace")
+    except AttributeError:
+        return raw
+
+def sentaurus_command_for_step(tool, entry):
+    tools = sentaurus_tools()
+    path = tools.get(tool)
+    if not path:
+        raise ValueError("Sentaurus tool not found in PATH: %s" % tool)
+    if tool == "sde":
+        return [path, "-e", "-l", entry]
+    if tool == "sprocess":
+        return [path, "-b", entry]
+    if tool == "sdevice":
+        return [path, entry]
+    if tool == "inspect":
+        return [path, "-batch", "-f", entry]
+    raise ValueError("unsupported Sentaurus runner tool: %s" % tool)
+
+def run_step(run_dir, step, index, timeout_seconds=1800):
+    tool = safe_text(step.get("tool"), 40).strip().lower()
+    entry = safe_file_name(step.get("input") or step.get("entry") or step.get("entryFile"))
+    if tool not in ["sde", "sprocess", "sdevice", "inspect"]:
+        raise ValueError("unsupported runner tool: %s" % tool)
+    entry_path = os.path.join(run_dir, entry)
+    if not os.path.exists(entry_path):
+        raise ValueError("runner entry file does not exist: %s" % entry)
+    log_base = "%02d_%s_%s" % (index, tool, os.path.splitext(entry)[0])
+    stdout_path = os.path.join(run_dir, "logs", log_base + ".out")
+    stderr_path = os.path.join(run_dir, "logs", log_base + ".err")
+    args = sentaurus_command_for_step(tool, entry)
+    started = time.time()
+    out = open(stdout_path, "wb")
+    err = open(stderr_path, "wb")
+    try:
+        proc = subprocess.Popen(args, cwd=run_dir, stdout=out, stderr=err)
+        while proc.poll() is None:
+            if time.time() - started > timeout_seconds:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return {
+                    "tool": tool,
+                    "input": entry,
+                    "exitCode": -1,
+                    "timedOut": True,
+                    "seconds": int(time.time() - started),
+                    "stdout": os.path.relpath(stdout_path, run_dir),
+                    "stderr": os.path.relpath(stderr_path, run_dir),
+                    "stderrTail": read_file_tail(stderr_path),
+                }
+            time.sleep(0.5)
+        exit_code = proc.returncode
+    finally:
+        out.close()
+        err.close()
+    return {
+        "tool": tool,
+        "input": entry,
+        "exitCode": exit_code,
+        "timedOut": False,
+        "seconds": int(time.time() - started),
+        "stdout": os.path.relpath(stdout_path, run_dir),
+        "stderr": os.path.relpath(stderr_path, run_dir),
+        "stderrTail": read_file_tail(stderr_path),
+    }
+
+def collect_run_artifacts(run_dir, limit=80):
+    allowed = set([".log", ".out", ".err", ".plt", ".tdr", ".grd", ".dat", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".json", ".cmd", ".par", ".scm", ".tcl", ".bnd", ".sat"])
+    artifacts = []
+    for root, _dirs, files in os.walk(run_dir):
+        for name in files:
+            if name.startswith("."):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in allowed:
+                continue
+            path = os.path.join(root, name)
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                size = 0
+            artifacts.append({"path": os.path.relpath(path, run_dir), "size": size})
+    artifacts.sort(key=lambda item: item.get("path"))
+    return artifacts[:limit]
+
+def extract_run_request(reply):
+    start_tag = "<SENTAURUS_RUN_REQUEST>"
+    end_tag = "</SENTAURUS_RUN_REQUEST>"
+    start = reply.find(start_tag)
+    end = reply.find(end_tag, start + len(start_tag)) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return None, reply
+    body = reply[start + len(start_tag):end].strip()
+    visible = (reply[:start] + reply[end + len(end_tag):]).strip()
+    request = json.loads(body)
+    if not isinstance(request, dict):
+        raise ValueError("run request must be a JSON object")
+    return request, visible
+
+def execute_run_request(request, session_id=""):
+    ensure_dir(RUNS_DIR)
+    title = safe_text(request.get("title") or session_id or "sentaurus-job", 120)
+    run_id = "run_%s_%s_%s" % (datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"), safe_run_slug(title), uuid.uuid4().hex[:6])
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    if not os.path.abspath(run_dir).startswith(os.path.abspath(RUNS_DIR) + os.sep):
+        raise ValueError("refusing unsafe run directory")
+    ensure_dir(run_dir)
+    ensure_dir(os.path.join(run_dir, "logs"))
+    ensure_dir(os.path.join(run_dir, "artifacts"))
+    files = request.get("files") or []
+    if not isinstance(files, list) or not files:
+        raise ValueError("run request requires a non-empty files array")
+    if len(files) > 30:
+        raise ValueError("run request has too many files")
+    total_chars = 0
+    allowed_ext = set([".cmd", ".des", ".par", ".scm", ".tcl", ".txt", ".dat"])
+    written = []
+    for file_item in files:
+        if not isinstance(file_item, dict):
+            raise ValueError("each run file must be an object")
+        name = safe_file_name(file_item.get("name"))
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in allowed_ext:
+            raise ValueError("unsupported run file extension: %s" % name)
+        content = safe_text(file_item.get("content"), 240000)
+        total_chars += len(content)
+        if total_chars > 600000:
+            raise ValueError("run request files are too large")
+        write_utf8(os.path.join(run_dir, name), content)
+        written.append(name)
+    steps = request.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        tool = safe_text(request.get("tool"), 40).strip().lower()
+        entry = request.get("entryFile") or request.get("input")
+        if tool and entry:
+            steps = [{"tool": tool, "input": entry}]
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("run request requires steps or tool+entryFile")
+    if len(steps) > 8:
+        raise ValueError("run request has too many steps")
+    manifest = {
+        "id": run_id,
+        "title": title,
+        "createdAt": now_iso(),
+        "sessionId": session_id,
+        "files": written,
+        "steps": steps,
+        "status": "running",
+    }
+    write_utf8(os.path.join(run_dir, "run_request.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+    audit("sentaurus_run_started", {"runId": run_id, "title": title, "sessionId": session_id})
+    step_results = []
+    ok = True
+    for index, step in enumerate(steps, 1):
+        result = run_step(run_dir, step, index)
+        step_results.append(result)
+        if result.get("exitCode") != 0:
+            ok = False
+            break
+    artifacts = collect_run_artifacts(run_dir)
+    manifest["status"] = "succeeded" if ok else "failed"
+    manifest["finishedAt"] = now_iso()
+    manifest["stepResults"] = step_results
+    manifest["artifacts"] = artifacts
+    write_utf8(os.path.join(run_dir, "run_result.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+    audit("sentaurus_run_finished", {"runId": run_id, "ok": ok, "steps": step_results})
+    return manifest
+
+def format_run_result(result):
+    lines = []
+    ok = result.get("status") == "succeeded"
+    lines.append("Sentaurus allowlisted runner %s." % ("completed successfully" if ok else "finished with errors"))
+    lines.append("- run id: %s" % result.get("id"))
+    lines.append("- status: %s" % result.get("status"))
+    lines.append("- VM directory: %s" % os.path.join(RUNS_DIR, result.get("id")))
+    lines.append("- steps:")
+    for step in result.get("stepResults") or []:
+        lines.append("  - %s %s -> exit %s in %ss" % (step.get("tool"), step.get("input"), step.get("exitCode"), step.get("seconds")))
+        if step.get("stderrTail") and step.get("exitCode") != 0:
+            lines.append("    stderr tail: %s" % safe_text(step.get("stderrTail").replace("\n", " | "), 500))
+    artifacts = result.get("artifacts") or []
+    lines.append("- artifacts/logs: %s file(s)" % len(artifacts))
+    for item in artifacts[:18]:
+        lines.append("  - %s (%s bytes)" % (item.get("path"), item.get("size")))
+    if len(artifacts) > 18:
+        lines.append("  - ... %s more" % (len(artifacts) - 18))
+    return "\n".join(lines)
+
 def list_instances():
     root = os.path.join(HOME, "STDB", "agent_instances")
     instances = sorted([path for path in glob.glob(os.path.join(root, "*")) if os.path.isdir(path)])
@@ -334,14 +561,21 @@ def skill_snapshot():
         "manualCount": len(manuals),
         "manualFiles": manuals[:20],
         "coreMission": "build Sentaurus simulation tasks, prepare decks/data, run allowlisted Sentaurus jobs, and export logs/artifacts/results",
-        "safeSkills": ["vm_status", "sentaurus_tools", "list_agent_instances", "sentaurus_manual_context"],
-        "realJobExecution": "core objective, but currently gated until an allowlisted job runner is implemented",
+        "safeSkills": ["vm_status", "sentaurus_tools", "list_agent_instances", "sentaurus_manual_context", "sentaurus_run_request"],
+        "realJobExecution": "available through a VM-local allowlisted runner when the assistant emits a valid <SENTAURUS_RUN_REQUEST> JSON block; arbitrary shell is not allowed",
     }
 
 def wants_skill_reply(text):
-    lowered = text.lower()
-    tokens = ["/skill", "status", "sentaurus", "sdevice", "sde", "swb", "tools", "instance", u"状态", u"工具", u"实例", u"仿真"]
-    return any(token in lowered for token in tokens)
+    lowered = text.lower().strip()
+    compact = "".join(lowered.split())
+    exact = ["/skill", "skill", "/status", "status", u"状态", u"工具", u"实例", u"查看状态", u"查看工具", u"仿真状态"]
+    if compact in exact:
+        return True
+    if lowered.startswith("/skill") or lowered.startswith("/status"):
+        return True
+    if len(lowered) <= 120 and (("status" in lowered or u"状态" in lowered or u"工具" in lowered or "tools" in lowered or "instance" in lowered or u"实例" in lowered) and ("sentaurus" in lowered or "vm" in lowered or "agent" in lowered or "sde" in lowered or "sdevice" in lowered)):
+        return True
+    return False
 
 def local_skill_reply(text):
     snapshot = skill_snapshot()
@@ -448,9 +682,13 @@ def call_llm(user_text, config):
         "You are the Sentaurus TCAD simulation agent running inside the CentOS VM. "
         "Your core mission is to help the user establish complete Sentaurus simulation tasks: clarify the device/process objective, "
         "create or revise SDE/SProcess/SDevice/SWB decks and parameter data, prepare run directories and extraction plans, "
-        "invoke Sentaurus only through allowlisted job-runner paths when they exist, monitor logs, and export results/artifacts/metrics back to the user. "
-        "If real execution is not currently enabled, say so clearly and still provide runnable decks, file layouts, commands, expected outputs, and extraction steps. "
+        "invoke Sentaurus only through the VM-local allowlisted runner, monitor logs, and export results/artifacts/metrics back to the user. "
+        "Real execution is available only by emitting a valid <SENTAURUS_RUN_REQUEST> JSON block; arbitrary shell commands are forbidden. "
         "Never claim that a Sentaurus job has run unless an allowlisted runner actually ran it and produced logs/artifacts. "
+        "When the user explicitly asks you to run/simulate and you can create a self-contained minimal Sentaurus deck, include a concise human explanation followed by exactly one run request block. "
+        "The block schema is: <SENTAURUS_RUN_REQUEST>{\"title\":\"short-title\",\"files\":[{\"name\":\"main.cmd\",\"content\":\"...\"}],\"steps\":[{\"tool\":\"sde|sprocess|sdevice|inspect\",\"input\":\"main.cmd\"}]}</SENTAURUS_RUN_REQUEST>. "
+        "Use only safe ASCII file names without spaces, and only .cmd, .des, .par, .scm, .tcl, .txt, or .dat files. "
+        "If the required deck cannot be made self-contained, ask for the missing files/assumptions instead of emitting a run request. "
         "Use the installed tool paths and VM state in the snapshot. Ask for missing physics/process assumptions instead of inventing critical parameters. "
         "The browser and host backend only relay messages; API credentials stay inside this VM. "
         "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True) + "\n\n" +
@@ -502,6 +740,13 @@ def process_queue_file(path):
         incoming_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         session_id = safe_text(incoming_meta.get("sessionId"), 160).strip()
         reply, meta = reply_for(text)
+        run_request, visible_reply = extract_run_request(reply)
+        if run_request:
+            result = execute_run_request(run_request, session_id)
+            reply = (visible_reply + "\n\n" if visible_reply else "") + format_run_result(result)
+            meta["kind"] = "sentaurus_run"
+            meta["runId"] = result.get("id")
+            meta["runStatus"] = result.get("status")
         if session_id:
             meta["sessionId"] = session_id
         append_message("agent", reply, "vm-agent-worker", meta)
@@ -549,7 +794,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.3.0"
+AGENT_VERSION = "0.4.0"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 
@@ -851,7 +1096,7 @@ def build_status():
         "version": AGENT_VERSION,
         "hostname": socket.gethostname(),
         "user": getpass.getuser(),
-        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "sentaurus_skills"],
+        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "sentaurus_skills", "sentaurus_run_request"],
         "instanceCount": len(instances),
         "latestInstance": instances[-1] if instances else None,
         "mailbox": "~/.sentaurus-web-agent/vm-agent",

@@ -8,9 +8,9 @@ The first version focuses on the essentials:
 - Node/Fastify backend
 - Browser-only message send/receive UI; LLM credentials stay inside the VM
 - SSH health check to the Sentaurus VM (`sentaurus-centos7`)
-- VM-local Python agent worker with safe Sentaurus status/tool skills
+- VM-local Python agent worker with safe Sentaurus status/tool skills and an allowlisted Sentaurus runner
 - Safe per-run directory scaffolding
-- Placeholder run API with real SDE/SDevice execution gated behind `ENABLE_REAL_JOBS=1`
+- Placeholder host-side run API with real SDE/SDevice execution still gated behind `ENABLE_REAL_JOBS=1`
 - No secrets committed to the repository
 
 ## Repository access from the Windows host
@@ -100,6 +100,39 @@ ssh sentaurus-centos7 "hostname; whoami; command -v sde; command -v sdevice"
 
 If that works, the web backend `/api/vm/status` should work too.
 
+## VM-local allowlisted Sentaurus runner
+
+The CentOS worker can run real Sentaurus jobs without exposing arbitrary shell access. When the VM-local LLM decides a request is ready to execute, it emits one structured block:
+
+```xml
+<SENTAURUS_RUN_REQUEST>
+{
+  "title": "sde-smoke-test",
+  "files": [
+    { "name": "smoke.cmd", "content": "(sde:clear)\n" }
+  ],
+  "steps": [
+    { "tool": "sde", "input": "smoke.cmd" }
+  ]
+}
+</SENTAURUS_RUN_REQUEST>
+```
+
+The worker strips that private control block from the chat reply, writes files under:
+
+```text
+~/STDB/web-agent-runs/run_<timestamp>_<slug>_<id>/
+```
+
+and executes only these allowlisted tool forms:
+
+- `sde -e -l <file>`
+- `sprocess -b <file>`
+- `sdevice <file>`
+- `inspect -batch -f <file>`
+
+Run files must use safe ASCII basenames and one of `.cmd`, `.des`, `.par`, `.scm`, `.tcl`, `.txt`, or `.dat`. Arbitrary shell commands, hidden files, path traversal, and unsupported extensions are rejected. The final chat message includes the VM run directory, each step's exit code, and generated log/artifact file names. A smoke test on CentOS has verified `sde` execution through this path.
+
 ## Development commands
 
 ```bash
@@ -112,7 +145,7 @@ npm run build
 ## Safety model
 
 - `.env` and key files are ignored.
-- Real SDE/SDevice execution is disabled by default.
+- Host-side `/api/runs/:id/jobs` execution is disabled by default. VM-chat execution is available only through the VM-local `<SENTAURUS_RUN_REQUEST>` allowlist.
 - The backend generates run IDs and directories; users cannot submit arbitrary paths.
 - The SSH bridge is centralized in `apps/server/src/services/sshClient.ts`.
 - Long-running/destructive actions should require UI confirmation before being enabled.
@@ -127,12 +160,13 @@ Implemented:
 - VM Agent panel wired to an SSH-backed `/api/vm/agent/*` bridge
 - VM-side agent worker at `~/.sentaurus-web-agent/vm-agent/agent_worker.py`
 - VM-local LLM config via `~/.sentaurus-web-agent/vm-agent/.env` or `config.json`
-- Safe read-only Sentaurus skills: VM status, tool discovery, agent instance listing, VM-local manual excerpts
+- Safe Sentaurus skills: VM status, tool discovery, agent instance listing, VM-local manual excerpts, and `<SENTAURUS_RUN_REQUEST>` allowlisted execution
 - Run creation/listing API
 - Run detail view
 - Run input upload and input/artifact download APIs
 - Basic SSE job-log stream
 - Remote run preparation endpoint, still gated by `ENABLE_REAL_JOBS`
+- VM-local Sentaurus runner for LLM-generated run requests: `sde`, `sprocess`, `sdevice`, and `inspect` allowlisted steps
 - Local run directories
 - Documentation for Windows host and Sentaurus SSH setup
 
@@ -169,13 +203,14 @@ Current behavior:
 - File names are validated; path traversal and hidden-path style names are rejected.
 - Browser-facing run summaries hide `localDir` to avoid exposing backend absolute paths.
 - `prepare-remote` writes diagnostic lines to `logs/prepare-remote.log` and `logs/job.log`.
-- Real Sentaurus job submission is still intentionally disabled/not implemented.
-- `ENABLE_REAL_JOBS=0` keeps true execution paths blocked.
+- Host-side `POST /api/runs/:id/jobs` is still intentionally disabled/not implemented.
+- `ENABLE_REAL_JOBS=0` keeps host-side execution paths blocked.
+- VM Agent chat can execute only through `<SENTAURUS_RUN_REQUEST>`; no raw shell is accepted.
 
 Next recommended steps:
 
-1. Add remote input sync from local run `input/` to `SENTAURUS_REMOTE_BASE/<run-id>/input/`.
-2. Implement an allowlisted SDE/SDevice job queue.
-3. Add result artifact pullback and parser for `.plt`/`.tdr` outputs.
-4. Extend the VM worker from read-only Sentaurus skills to an allowlisted job runner.
+1. Add remote input sync from local run `input/` to `SENTAURUS_REMOTE_BASE/<run-id>/input/` for the legacy host run API.
+2. Implement host-side `/api/runs/:id/jobs` as a wrapper around the same allowlist, or remove the unused endpoint.
+3. Add result artifact pullback/download helpers for VM-local run directories.
+4. Add parsers/plotters for `.plt`/`.tdr` outputs and extracted metrics.
 5. Add authentication suitable for non-localhost deployment.
