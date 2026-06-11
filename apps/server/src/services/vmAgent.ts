@@ -39,7 +39,7 @@ type RemoteAgentPayload = {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.4.2";
+const agentVersion = "0.4.3";
 
 const remoteWorkerScript = String.raw`# -*- coding: utf-8 -*-
 import datetime
@@ -62,7 +62,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.2"
+AGENT_VERSION = "0.4.3"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -135,6 +135,24 @@ def append_message(role, content, source, meta=None, id_prefix=None):
     append_jsonl(MESSAGES_PATH, message)
     audit("message", {"id": message.get("id"), "role": role, "source": source, "kind": (meta or {}).get("kind")})
     return message
+
+def append_progress(session_id, stage, status, detail, progress=None, run_id=""):
+    meta = {
+        "kind": "progress",
+        "sessionId": safe_text(session_id, 160),
+        "progressStage": safe_text(stage, 80),
+        "progressStatus": safe_text(status, 40),
+        "progressDetail": safe_text(detail, 500),
+    }
+    if progress is not None:
+        try:
+            meta["progress"] = max(0, min(100, int(progress)))
+        except Exception:
+            pass
+    if run_id:
+        meta["runId"] = safe_text(run_id, 180)
+    content = "Progress: %s %s - %s" % (stage, status, detail)
+    return append_message("system", content, "vm-agent-progress", meta, "progress")
 
 def read_all_messages():
     messages = []
@@ -455,14 +473,22 @@ def execute_run_request(request, session_id=""):
     }
     write_utf8(os.path.join(run_dir, "run_request.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
     audit("sentaurus_run_started", {"runId": run_id, "title": title, "sessionId": session_id})
+    append_progress(session_id, "runner_prepare", "completed", "Prepared run directory %s with %s file(s)" % (run_id, len(written)), 50, run_id)
     step_results = []
     ok = True
+    step_count = max(1, len(steps))
     for index, step in enumerate(steps, 1):
+        tool = safe_text(step.get("tool"), 40).strip().lower()
+        entry = safe_file_name(step.get("input") or step.get("entry") or step.get("entryFile"))
+        step_start_progress = 55 + int(((index - 1) / float(step_count)) * 35)
+        append_progress(session_id, "sentaurus_step", "running", "Step %s/%s: %s %s" % (index, step_count, tool, entry), step_start_progress, run_id)
         result = run_step(run_dir, step, index)
         step_results.append(result)
         if result.get("exitCode") != 0:
             ok = False
+            append_progress(session_id, "sentaurus_step", "failed", "Step %s/%s: %s %s exit %s" % (index, step_count, result.get("tool"), result.get("input"), result.get("exitCode")), step_start_progress, run_id)
             break
+        append_progress(session_id, "sentaurus_step", "completed", "Step %s/%s: %s %s exit 0 in %ss" % (index, step_count, result.get("tool"), result.get("input"), result.get("seconds")), min(95, step_start_progress + max(1, int(35 / float(step_count)))), run_id)
     artifacts = collect_run_artifacts(run_dir)
     manifest["status"] = "succeeded" if ok else "failed"
     manifest["finishedAt"] = now_iso()
@@ -470,6 +496,7 @@ def execute_run_request(request, session_id=""):
     manifest["artifacts"] = artifacts
     write_utf8(os.path.join(run_dir, "run_result.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
     audit("sentaurus_run_finished", {"runId": run_id, "ok": ok, "steps": step_results})
+    append_progress(session_id, "artifacts", "completed" if ok else "failed", "Collected %s artifact/log file(s)" % len(artifacts), 100 if ok else 95, run_id)
     return manifest
 
 def format_run_result(result):
@@ -797,14 +824,28 @@ def process_queue_file(path):
         incoming_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         session_id = safe_text(incoming_meta.get("sessionId"), 160).strip()
         audit("queue_processing_started", {"file": os.path.basename(path), "sessionId": session_id})
+        append_progress(session_id, "received", "running", "Worker picked up queued request", 5)
+        if wants_skill_reply(text):
+            append_progress(session_id, "skill", "running", "Handling local slash-command skill", 20)
+        else:
+            append_progress(session_id, "llm_context", "running", "Building session history and manual context", 12)
         reply, meta = reply_for(text, session_id, item.get("id") or "")
         run_request, visible_reply = extract_run_request(reply)
+        if meta.get("kind") == "sentaurus_skill":
+            append_progress(session_id, "skill", "completed", "Local skill reply is ready", 100)
+        elif meta.get("kind") == "llm_error":
+            append_progress(session_id, "llm", "failed", "LLM call failed; see agent message", 100)
+        else:
+            append_progress(session_id, "llm", "completed", "LLM produced %s" % ("a Sentaurus run request" if run_request else "a chat reply"), 35)
         if run_request:
+            append_progress(session_id, "runner", "running", "Executing allowlisted Sentaurus run request", 45)
             result = execute_run_request(run_request, session_id)
             reply = (visible_reply + "\n\n" if visible_reply else "") + format_run_result(result)
             meta["kind"] = "sentaurus_run"
             meta["runId"] = result.get("id")
             meta["runStatus"] = result.get("status")
+        elif meta.get("kind") != "llm_error":
+            append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
         if session_id:
             meta["sessionId"] = session_id
         append_message("agent", reply, "vm-agent-worker", meta)
@@ -814,6 +855,7 @@ def process_queue_file(path):
         error_meta = {"kind": "worker_error"}
         if session_id:
             error_meta["sessionId"] = session_id
+            append_progress(session_id, "worker", "failed", "Worker failed to process queued message", 100)
         append_message("system", "VM agent worker failed to process a message: %s" % safe_text(str(exc), 1000), "vm-agent-worker", error_meta)
         try:
             shutil.move(path, os.path.join(DONE_DIR, "failed_" + os.path.basename(path)))
@@ -852,7 +894,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.2"
+AGENT_VERSION = "0.4.3"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 

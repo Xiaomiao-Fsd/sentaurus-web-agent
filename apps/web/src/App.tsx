@@ -48,6 +48,18 @@ type ContextStats = {
   maxTokens: number;
 };
 
+type ProgressStatus = "running" | "completed" | "failed" | "queued" | "info";
+
+type ProgressRow = {
+  id: string;
+  createdAt: string;
+  stage: string;
+  status: ProgressStatus;
+  detail: string;
+  progress: number | null;
+  runId: string | null;
+};
+
 type SessionMenuState = {
   runId: string;
   x: number;
@@ -177,11 +189,51 @@ function statusTone(status?: RunStatus): "neutral" | "good" | "warn" | "bad" {
 }
 
 function latestMessagePreview(messages: VmAgentMessage[], runId: string): string {
-  const scoped = messages.filter((message) => messageBelongsToSession(message, runId));
+  const scoped = messages.filter((message) => messageBelongsToSession(message, runId) && message.meta?.kind !== "progress");
   const latest = scoped.at(-1);
   if (!latest) return "No scoped VM messages yet";
   const compact = latest.content.replace(/\s+/g, " ").trim();
   return compact.length > 86 ? `${compact.slice(0, 86)}…` : compact;
+}
+
+function progressStatus(value: unknown): ProgressStatus {
+  return value === "completed" || value === "failed" || value === "queued" || value === "info" ? value : "running";
+}
+
+function progressLabel(stage: string): string {
+  const labels: Record<string, string> = {
+    received: "Received",
+    skill: "Skill",
+    llm_context: "Context",
+    llm: "LLM",
+    reply: "Reply",
+    runner: "Runner",
+    runner_prepare: "Prepare",
+    sentaurus_step: "Sentaurus",
+    artifacts: "Artifacts",
+    worker: "Worker"
+  };
+  return labels[stage] || stage.replace(/_/g, " ");
+}
+
+function progressRowsForSession(messages: VmAgentMessage[], sessionId: string | null): ProgressRow[] {
+  if (!sessionId) return [];
+  return messages.flatMap((message) => {
+    if (!messageBelongsToSession(message, sessionId) || message.meta?.kind !== "progress") return [];
+    const stage = typeof message.meta.progressStage === "string" ? message.meta.progressStage : "progress";
+    const detail = typeof message.meta.progressDetail === "string" ? message.meta.progressDetail : message.content;
+    const rawProgress = typeof message.meta.progress === "number" ? message.meta.progress : null;
+    const runId = typeof message.meta.runId === "string" ? message.meta.runId : null;
+    return [{
+      id: message.id,
+      createdAt: message.createdAt,
+      stage,
+      status: progressStatus(message.meta.progressStatus),
+      detail,
+      progress: rawProgress === null ? null : Math.max(0, Math.min(100, rawProgress)),
+      runId
+    }];
+  });
 }
 
 function estimateContextUsage(messages: VmAgentMessage[]): ContextStats {
@@ -275,8 +327,11 @@ export default function App() {
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
   const menuRun = useMemo(() => runs.find((run) => run.id === sessionMenu?.runId) || null, [runs, sessionMenu]);
   const currentMessages = useMemo(() => messagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
+  const visibleMessages = useMemo(() => currentMessages.filter((message) => message.meta?.kind !== "progress"), [currentMessages]);
+  const progressRows = useMemo(() => progressRowsForSession(vmAgentMessages, selectedRunId).slice(-12), [selectedRunId, vmAgentMessages]);
+  const latestProgress = progressRows.at(-1);
   const globalMessages = useMemo(() => globalAgentMessages(vmAgentMessages).slice(-6), [vmAgentMessages]);
-  const contextStats = useMemo(() => estimateContextUsage(currentMessages), [currentMessages]);
+  const contextStats = useMemo(() => estimateContextUsage(visibleMessages), [visibleMessages]);
   const query = sessionSearch.trim().toLowerCase();
   const visibleRuns = useMemo(() => {
     if (!query) return orderedRuns;
@@ -807,6 +862,7 @@ export default function App() {
               <span>{selectedRunId ? shortId(selectedRunId) : "select or create a session"}</span>
               <span>stream: {vmAgentStreamState}</span>
               {selectedRun && <span>{selectedRun.status}</span>}
+              {latestProgress && <span>{progressLabel(latestProgress.stage)}: {latestProgress.status}</span>}
               <span>context: {formatCompactNumber(contextStats.estimatedTokens)} / {formatCompactNumber(contextStats.maxTokens)} est. tokens</span>
             </div>
           </div>
@@ -827,14 +883,50 @@ export default function App() {
           </div>
         </header>
 
+        <section className="progress-panel" aria-label="Agent progress">
+          <div className="progress-panel-header">
+            <div>
+              <p className="eyebrow">Progress</p>
+              <h2>{latestProgress ? `${progressLabel(latestProgress.stage)} · ${latestProgress.status}` : "Idle"}</h2>
+            </div>
+            <span>{progressRows.length} event{progressRows.length === 1 ? "" : "s"}</span>
+          </div>
+          <div className="progress-table-wrap">
+            <table className="progress-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Stage</th>
+                  <th>Status</th>
+                  <th>Progress</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {progressRows.length === 0 ? (
+                  <tr><td colSpan={5}>No progress events yet.</td></tr>
+                ) : progressRows.map((row) => (
+                  <tr className={`progress-${row.status}`} key={row.id}>
+                    <td>{formatDate(row.createdAt)}</td>
+                    <td>{progressLabel(row.stage)}</td>
+                    <td><span>{row.status}</span></td>
+                    <td>{row.progress === null ? "-" : `${row.progress}%`}</td>
+                    <td title={row.runId || undefined}>{row.detail}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
         <div className="message-list">
-          {currentMessages.length === 0 && (
+          {visibleMessages.length === 0 && (
             <div className="empty-chat">
               <strong>{selectedRun ? "No messages in this session." : "No session selected."}</strong>
               <span>{selectedRun ? "Send a prompt or use a quick action to talk with the VM agent." : "Create or select a session from the left panel."}</span>
             </div>
           )}
-          {currentMessages.map((message) => {
+          {visibleMessages.map((message) => {
             const attachments = messageAttachments[message.id] || [];
             const content = messageDisplayOverrides[message.id] ?? message.content;
             return (
