@@ -39,7 +39,7 @@ type RemoteAgentPayload = {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.4.1";
+const agentVersion = "0.4.2";
 
 const remoteWorkerScript = String.raw`# -*- coding: utf-8 -*-
 import datetime
@@ -62,7 +62,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.1"
+AGENT_VERSION = "0.4.2"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -135,6 +135,48 @@ def append_message(role, content, source, meta=None, id_prefix=None):
     append_jsonl(MESSAGES_PATH, message)
     audit("message", {"id": message.get("id"), "role": role, "source": source, "kind": (meta or {}).get("kind")})
     return message
+
+def read_all_messages():
+    messages = []
+    if not os.path.exists(MESSAGES_PATH):
+        return messages
+    with open(MESSAGES_PATH, "r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                messages.append(json.loads(line))
+            except Exception:
+                pass
+    return messages
+
+def session_context(session_id, current_id="", limit=12, content_limit=900):
+    session_id = safe_text(session_id, 160).strip()
+    current_id = safe_text(current_id, 200).strip()
+    if not session_id:
+        return "(no browser session id provided)"
+    messages = []
+    for item in read_all_messages():
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        if safe_text(meta.get("sessionId"), 160).strip() != session_id:
+            continue
+        if current_id and item.get("id") == current_id:
+            continue
+        messages.append(item)
+    if not messages:
+        return "(no earlier messages in this browser session)"
+    lines = []
+    for item in messages[-limit:]:
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        content = safe_text(item.get("content"), content_limit).replace("\n", " | ")
+        header = "[%s] %s kind=%s" % (item.get("createdAt") or "unknown-time", item.get("role") or "unknown-role", meta.get("kind") or "unknown")
+        if meta.get("runId"):
+            header += " runId=%s" % meta.get("runId")
+        if meta.get("runStatus"):
+            header += " runStatus=%s" % meta.get("runStatus")
+        lines.append(header + ": " + content)
+    return "\n".join(lines)
 
 def read_env_file(path):
     data = {}
@@ -686,9 +728,10 @@ def call_llm_model(user_text, config, model, system):
         raise Exception("LLM returned no content")
     return parsed
 
-def call_llm(user_text, config):
+def call_llm(user_text, config, session_id="", current_message_id=""):
     snapshot = skill_snapshot()
     manual_context = read_manual_context(user_text)
+    recent_session_context = session_context(session_id, current_message_id)
     system = (
         "You are the Sentaurus TCAD simulation agent running inside the CentOS VM. "
         "Your core mission is to help the user establish complete Sentaurus simulation tasks: clarify the device/process objective, "
@@ -701,8 +744,11 @@ def call_llm(user_text, config):
         "Use only safe ASCII file names without spaces, and only .cmd, .des, .par, .scm, .tcl, .txt, or .dat files. "
         "If the required deck cannot be made self-contained, ask for the missing files/assumptions instead of emitting a run request. "
         "Use the installed tool paths and VM state in the snapshot. Ask for missing physics/process assumptions instead of inventing critical parameters. "
+        "Before saying previous files, run directories, decks, or results are unavailable, inspect the recent browser-session context below. "
+        "If the user says 'continue', 'that project', or similar, resolve it from the same-session context whenever possible. "
         "The browser and host backend only relay messages; API credentials stay inside this VM. "
         "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True) + "\n\n" +
+        "Recent browser-session context, newest last:\n" + recent_session_context + "\n\n" +
         "VM-local Sentaurus manual/context excerpts:\n" + manual_context
     )
     models = config.get("models") or [config.get("model") or "gpt-5.5"]
@@ -727,7 +773,7 @@ def call_llm(user_text, config):
             audit("llm_model_failed", {"model": model, "error": error_text})
     raise Exception("; ".join(errors) or "no LLM model candidates configured")
 
-def reply_for(text):
+def reply_for(text, session_id="", current_message_id=""):
     config = load_config()
     if wants_skill_reply(text):
         return local_skill_reply(text), {"kind": "sentaurus_skill", "llmConfigured": llm_configured(config)}
@@ -738,7 +784,7 @@ def reply_for(text):
             "or config.json. Sentaurus safe skills are already available; ask for status/tools to test them."
         ), {"kind": "config_required", "llmConfigured": False}
     try:
-        return run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent LLM call", call_llm, text, config)
+        return run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent LLM call", call_llm, text, config, session_id, current_message_id)
     except Exception as exc:
         return "VM agent LLM call failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": True, "modelCandidates": ",".join(config.get("models") or [])}
 
@@ -751,7 +797,7 @@ def process_queue_file(path):
         incoming_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         session_id = safe_text(incoming_meta.get("sessionId"), 160).strip()
         audit("queue_processing_started", {"file": os.path.basename(path), "sessionId": session_id})
-        reply, meta = reply_for(text)
+        reply, meta = reply_for(text, session_id, item.get("id") or "")
         run_request, visible_reply = extract_run_request(reply)
         if run_request:
             result = execute_run_request(run_request, session_id)
@@ -806,7 +852,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.1"
+AGENT_VERSION = "0.4.2"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 
