@@ -242,7 +242,7 @@ def manual_query_tokens(user_text):
         "sde", "sdevice", "sprocess", "svisual", "inspect", "swb", "smesh", "tdx",
         "mesh", "electrode", "contact", "doping", "physics", "solve", "plot", "current",
         "extract", "threshold", "mobility", "recombination", "avalanche", "quantum", "deck",
-        "tdr", "plt", "cmd", "des", "parameter", "workbench", "simulation", "仿真", "网格", "电极", "掺杂",
+        "tdr", "plt", "cmd", "des", "parameter", "workbench", "simulation", u"仿真", u"网格", u"电极", u"掺杂",
     ]
     for token in domain_tokens:
         if token in raw and token not in tokens:
