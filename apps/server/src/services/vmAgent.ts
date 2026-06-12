@@ -39,7 +39,7 @@ type RemoteAgentPayload = {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.4.3";
+const agentVersion = "0.4.4";
 
 const remoteWorkerScript = String.raw`# -*- coding: utf-8 -*-
 import datetime
@@ -62,7 +62,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.3"
+AGENT_VERSION = "0.4.4"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -502,7 +502,8 @@ def execute_run_request(request, session_id=""):
 def format_run_result(result):
     lines = []
     ok = result.get("status") == "succeeded"
-    lines.append("Sentaurus allowlisted runner %s." % ("completed successfully" if ok else "finished with errors"))
+    lines.append("✅ Sentaurus simulation completed." if ok else "⚠️ Sentaurus simulation finished with errors.")
+    lines.append("The VM agent has finished the allowlisted run and this is the final result notification.")
     lines.append("- run id: %s" % result.get("id"))
     lines.append("- status: %s" % result.get("status"))
     lines.append("- VM directory: %s" % os.path.join(RUNS_DIR, result.get("id")))
@@ -844,6 +845,7 @@ def process_queue_file(path):
             meta["kind"] = "sentaurus_run"
             meta["runId"] = result.get("id")
             meta["runStatus"] = result.get("status")
+            append_progress(session_id, "final", "completed" if result.get("status") == "succeeded" else "failed", "Final simulation result appended to chat", 100, result.get("id") or "")
         elif meta.get("kind") != "llm_error":
             append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
         if session_id:
@@ -894,7 +896,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.3"
+AGENT_VERSION = "0.4.4"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 

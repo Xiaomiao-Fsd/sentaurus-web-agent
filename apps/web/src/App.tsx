@@ -208,6 +208,7 @@ function progressLabel(stage: string): string {
     llm_context: "Context",
     llm: "LLM",
     reply: "Reply",
+    final: "Final",
     runner: "Runner",
     runner_prepare: "Prepare",
     sentaurus_step: "Sentaurus",
@@ -288,6 +289,15 @@ function hasAgentReplyForSession(messages: VmAgentMessage[] | undefined, session
   });
 }
 
+function isSentaurusRunCompletion(message: VmAgentMessage): boolean {
+  return message.role === "agent" && message.meta?.kind === "sentaurus_run";
+}
+
+function sentaurusRunStatus(message: VmAgentMessage): string | null {
+  const value = message.meta?.runStatus;
+  return typeof value === "string" ? value : null;
+}
+
 export default function App() {
   const savedToken = getAuthToken();
   const [authInput, setAuthInput] = useState(savedToken);
@@ -322,8 +332,10 @@ export default function App() {
   const [messageDisplayOverrides, setMessageDisplayOverrides] = useState<Record<string, string>>({});
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const vmAgentCursorRef = useRef(0);
+  const selectedRunIdRef = useRef<string | null>(null);
   const pendingReplySessionRef = useRef<string | null>(null);
   const pendingReplyRetryRef = useRef(0);
+  const notifiedCompletionIdsRef = useRef<Set<string>>(new Set());
 
   const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
@@ -332,6 +344,7 @@ export default function App() {
   const visibleMessages = useMemo(() => currentMessages.filter((message) => message.meta?.kind !== "progress"), [currentMessages]);
   const progressRows = useMemo(() => progressRowsForSession(vmAgentMessages, selectedRunId).slice(-12), [selectedRunId, vmAgentMessages]);
   const latestProgress = progressRows.at(-1);
+  const progressTraceAutoOpen = latestProgress?.status === "running" || latestProgress?.status === "queued";
   const globalMessages = useMemo(() => globalAgentMessages(vmAgentMessages).slice(-6), [vmAgentMessages]);
   const contextStats = useMemo(() => estimateContextUsage(visibleMessages), [visibleMessages]);
   const query = sessionSearch.trim().toLowerCase();
@@ -390,6 +403,31 @@ export default function App() {
     recordSystemNotice(errorMessage(err), "error");
   }
 
+  function handleVmAgentMessageBatch(batch: VmAgentMessage[] | undefined) {
+    if (!batch?.length) return;
+    for (const message of batch) {
+      if (!isSentaurusRunCompletion(message)) continue;
+      if (notifiedCompletionIdsRef.current.has(message.id)) continue;
+      notifiedCompletionIdsRef.current.add(message.id);
+      const sessionId = messageSessionId(message);
+      const runStatus = sentaurusRunStatus(message);
+      const ok = runStatus === "succeeded";
+      setPanelNotice({
+        kind: ok ? "success" : "error",
+        text: ok
+          ? "Sentaurus simulation completed. Final result has been appended to the chat."
+          : "Sentaurus simulation finished with errors. Check the final result message and logs."
+      });
+      if (sessionId && sessionId === selectedRunIdRef.current) void refreshRunDetail(sessionId);
+      void refreshRuns();
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification(ok ? "Sentaurus simulation completed" : "Sentaurus simulation finished with errors", {
+          body: sessionId ? `Session ${shortId(sessionId)} · ${runStatus || "finished"}` : runStatus || "finished"
+        });
+      }
+    }
+  }
+
   async function saveToken() {
     const next = normalizeAuthToken(authInput);
     setAuthInput(next);
@@ -439,6 +477,7 @@ export default function App() {
       setVmAgent(response.status);
       updateVmAgentCursor(response.cursor);
       mergeVmAgentMessages(response.messages || (response.message ? [response.message] : []));
+      handleVmAgentMessageBatch(response.messages || (response.message ? [response.message] : []));
       setPanelNotice({ kind: "success", text: "VM agent connection refreshed." });
     } catch (err) {
       recordError(err);
@@ -454,6 +493,7 @@ export default function App() {
       setVmAgent(response.status);
       updateVmAgentCursor(response.cursor);
       mergeVmAgentMessages(response.messages);
+      handleVmAgentMessageBatch(response.messages);
     } catch (err) {
       recordError(err);
     } finally {
@@ -502,6 +542,7 @@ export default function App() {
         setMessageDisplayOverrides((prev) => ({ ...prev, [userMessage.id]: visibleText }));
       }
       mergeVmAgentMessages(response.messages || [response.message]);
+      handleVmAgentMessageBatch(response.messages || [response.message]);
       if (hasAgentReplyForSession(response.messages || [response.message], selectedRunId)) clearPendingAgentReply(selectedRunId);
     } catch (err) {
       recordError(err);
@@ -653,6 +694,10 @@ export default function App() {
   }, [sessionOrder]);
 
   useEffect(() => {
+    selectedRunIdRef.current = selectedRunId;
+  }, [selectedRunId]);
+
+  useEffect(() => {
     if (!sessionMenu) return;
     const close = () => setSessionMenu(null);
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -710,6 +755,7 @@ export default function App() {
         setVmAgent(data.status);
         updateVmAgentCursor(data.cursor);
         mergeVmAgentMessages(data.messages);
+        handleVmAgentMessageBatch(data.messages);
         const pendingSessionId = pendingReplySessionRef.current;
         if (pendingSessionId && hasAgentReplyForSession(data.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
         setVmAgentStreamState("live");
@@ -745,6 +791,7 @@ export default function App() {
           setVmAgent(response.status);
           updateVmAgentCursor(response.cursor);
           mergeVmAgentMessages(response.messages);
+          handleVmAgentMessageBatch(response.messages);
           const waitingSessionId = pendingReplySessionRef.current;
           if (waitingSessionId && hasAgentReplyForSession(response.messages, waitingSessionId)) {
             clearPendingAgentReply(waitingSessionId);
@@ -919,34 +966,40 @@ export default function App() {
               <p className="eyebrow">Progress</p>
               <h2>{latestProgress ? `${progressLabel(latestProgress.stage)} · ${latestProgress.status}` : "Idle"}</h2>
             </div>
-            <span>{progressRows.length} event{progressRows.length === 1 ? "" : "s"}</span>
+            <span>{progressRows.length} event{progressRows.length === 1 ? "" : "s"} · {progressTraceAutoOpen ? "expanded" : "folded"}</span>
           </div>
-          <div className="progress-table-wrap">
-            <table className="progress-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Stage</th>
-                  <th>Status</th>
-                  <th>Progress</th>
-                  <th>Detail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {progressRows.length === 0 ? (
-                  <tr><td colSpan={5}>No progress events yet.</td></tr>
-                ) : progressRows.map((row) => (
-                  <tr className={`progress-${row.status}`} key={row.id}>
-                    <td>{formatDate(row.createdAt)}</td>
-                    <td>{progressLabel(row.stage)}</td>
-                    <td><span>{row.status}</span></td>
-                    <td>{row.progress === null ? "-" : `${row.progress}%`}</td>
-                    <td title={row.runId || undefined}>{row.detail}</td>
+          <details className="progress-details" open={progressTraceAutoOpen}>
+            <summary>
+              <span>Execution trace</span>
+              <small>Visible progress events, not hidden model chain-of-thought</small>
+            </summary>
+            <div className="progress-table-wrap">
+              <table className="progress-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Stage</th>
+                    <th>Status</th>
+                    <th>Progress</th>
+                    <th>Detail</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {progressRows.length === 0 ? (
+                    <tr><td colSpan={5}>No progress events yet.</td></tr>
+                  ) : progressRows.map((row) => (
+                    <tr className={`progress-${row.status}`} key={row.id}>
+                      <td>{formatDate(row.createdAt)}</td>
+                      <td>{progressLabel(row.stage)}</td>
+                      <td><span>{row.status}</span></td>
+                      <td>{row.progress === null ? "-" : `${row.progress}%`}</td>
+                      <td title={row.runId || undefined}>{row.detail}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
         </section>
 
         <div className="message-list">

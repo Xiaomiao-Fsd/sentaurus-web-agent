@@ -588,11 +588,55 @@ code {
   font-weight: 800;
 }
 
+.progress-details {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: #fbfdff;
+  overflow: hidden;
+}
+
+.progress-details summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding: 0.58rem 0.7rem;
+  cursor: pointer;
+  list-style: none;
+}
+
+.progress-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.progress-details summary::before {
+  content: "▸";
+  color: var(--color-primary);
+  font-size: 0.78rem;
+  font-weight: 900;
+  transition: transform 0.15s ease;
+}
+
+.progress-details[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.progress-details summary span {
+  flex: 1 1 auto;
+  color: var(--color-text);
+  font-size: 0.82rem;
+  font-weight: 900;
+}
+
+.progress-details summary small {
+  color: var(--color-muted);
+  font-size: 0.74rem;
+}
+
 .progress-table-wrap {
   max-height: 178px;
   overflow: auto;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  border-top: 1px solid var(--color-border);
 }
 
 .progress-table {
