@@ -306,6 +306,7 @@ export default function App() {
   const [pendingReplySessionId, setPendingReplySessionId] = useState<string | null>(null);
   const [pendingReplyRetryCount, setPendingReplyRetryCount] = useState(0);
   const [vmAgentStreamState, setVmAgentStreamState] = useState("idle");
+  const [progressCollapsed, setProgressCollapsed] = useState(true);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
@@ -883,40 +884,53 @@ export default function App() {
           </div>
         </header>
 
-        <section className="progress-panel" aria-label="Agent progress">
+        <section className={`progress-panel ${progressCollapsed ? "collapsed" : ""}`} aria-label="Agent progress">
           <div className="progress-panel-header">
             <div>
               <p className="eyebrow">Progress</p>
               <h2>{latestProgress ? `${progressLabel(latestProgress.stage)} · ${latestProgress.status}` : "Idle"}</h2>
             </div>
-            <span>{progressRows.length} event{progressRows.length === 1 ? "" : "s"}</span>
+            <div className="progress-panel-controls">
+              <span>{progressRows.length} event{progressRows.length === 1 ? "" : "s"}</span>
+              <button
+                aria-controls="agent-progress-table"
+                aria-expanded={!progressCollapsed}
+                className="secondary progress-toggle"
+                onClick={() => setProgressCollapsed((collapsed) => !collapsed)}
+                type="button"
+              >
+                {progressCollapsed ? "Show" : "Hide"}
+              </button>
+            </div>
           </div>
-          <div className="progress-table-wrap">
-            <table className="progress-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Stage</th>
-                  <th>Status</th>
-                  <th>Progress</th>
-                  <th>Detail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {progressRows.length === 0 ? (
-                  <tr><td colSpan={5}>No progress events yet.</td></tr>
-                ) : progressRows.map((row) => (
-                  <tr className={`progress-${row.status}`} key={row.id}>
-                    <td>{formatDate(row.createdAt)}</td>
-                    <td>{progressLabel(row.stage)}</td>
-                    <td><span>{row.status}</span></td>
-                    <td>{row.progress === null ? "-" : `${row.progress}%`}</td>
-                    <td title={row.runId || undefined}>{row.detail}</td>
+          {!progressCollapsed && (
+            <div className="progress-table-wrap" id="agent-progress-table">
+              <table className="progress-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Stage</th>
+                    <th>Status</th>
+                    <th>Progress</th>
+                    <th>Detail</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {progressRows.length === 0 ? (
+                    <tr><td colSpan={5}>No progress events yet.</td></tr>
+                  ) : progressRows.map((row) => (
+                    <tr className={`progress-${row.status}`} key={row.id}>
+                      <td>{formatDate(row.createdAt)}</td>
+                      <td>{progressLabel(row.stage)}</td>
+                      <td><span>{row.status}</span></td>
+                      <td>{row.progress === null ? "-" : `${row.progress}%`}</td>
+                      <td title={row.runId || undefined}>{row.detail}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </section>
 
         <div className="message-list">
