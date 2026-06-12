@@ -27,3 +27,26 @@ export function safeFileName(input: string): string {
   }
   return name;
 }
+
+export function safeRelativePath(input: string): string {
+  const raw = input.trim().replace(/\\/g, "/");
+  if (!raw || raw.startsWith("/") || /^[a-zA-Z]:\//.test(raw)) {
+    throw new Error("Invalid relative path");
+  }
+
+  const normalized = path.posix.normalize(raw);
+  if (normalized === "." || normalized.startsWith("../") || normalized.includes("/../")) {
+    throw new Error("Invalid relative path");
+  }
+
+  const segments = normalized.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment.startsWith("."))) {
+    throw new Error("Invalid relative path segment");
+  }
+  for (const segment of segments) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._@()+, -]{0,159}$/.test(segment)) {
+      throw new Error("Relative path contains unsupported characters");
+    }
+  }
+  return segments.join("/");
+}

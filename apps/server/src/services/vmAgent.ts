@@ -1,5 +1,6 @@
 import type { VmAgentMessage, VmAgentStatus } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
+import { safeRelativePath, safeRunId } from "../security/pathSafe.js";
 import { runSshCommandWithInput } from "./sshClient.js";
 
 type VmAgentOperation = "status" | "start" | "send" | "history";
@@ -46,7 +47,37 @@ type RemoteAgentPayload = {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.4.3";
+const agentVersion = "0.4.4";
+const maxVmArtifactBytes = 50 * 1024 * 1024;
+const vmArtifactExtensions = new Set([
+  ".log",
+  ".out",
+  ".err",
+  ".plt",
+  ".tdr",
+  ".grd",
+  ".dat",
+  ".csv",
+  ".txt",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".json",
+  ".cmd",
+  ".des",
+  ".par",
+  ".scm",
+  ".tcl",
+  ".bnd",
+  ".sat"
+]);
+
+type VmRunArtifactDownload = {
+  path: string;
+  fileName: string;
+  size: number;
+  data: Buffer;
+};
 
 const remoteWorkerScript = String.raw`# -*- coding: utf-8 -*-
 import datetime
@@ -69,7 +100,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.3"
+AGENT_VERSION = "0.4.4"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -396,7 +427,7 @@ def run_step(run_dir, step, index, timeout_seconds=1800):
     }
 
 def collect_run_artifacts(run_dir, limit=80):
-    allowed = set([".log", ".out", ".err", ".plt", ".tdr", ".grd", ".dat", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".json", ".cmd", ".par", ".scm", ".tcl", ".bnd", ".sat"])
+    allowed = set([".log", ".out", ".err", ".plt", ".tdr", ".grd", ".dat", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".bnd", ".sat"])
     artifacts = []
     for root, _dirs, files in os.walk(run_dir):
         for name in files:
@@ -427,6 +458,82 @@ def extract_run_request(reply):
     if not isinstance(request, dict):
         raise ValueError("run request must be a JSON object")
     return request, visible
+
+def extract_json_tag(reply, tag_name):
+    start_tag = "<%s>" % tag_name
+    end_tag = "</%s>" % tag_name
+    start = reply.find(start_tag)
+    end = reply.find(end_tag, start + len(start_tag)) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return None, reply
+    body = reply[start + len(start_tag):end].strip()
+    visible = (reply[:start] + reply[end + len(end_tag):]).strip()
+    value = json.loads(body)
+    if not isinstance(value, dict):
+        raise ValueError("%s must be a JSON object" % tag_name)
+    return value, visible
+
+def setup_text(value, limit=500):
+    text = safe_text(value, limit).strip()
+    return text or None
+
+def normalize_simulation_setup(value):
+    setup = {}
+    for key in ["deviceType", "gateBias", "drainBias", "sourceBulk", "geometry", "dopingOrImplant", "physicsModels", "mesh", "temperature", "notes"]:
+        item = setup_text(value.get(key), 500)
+        if item:
+            setup[key] = item
+    goals = setup_text(value.get("simulationGoals"), 800)
+    if goals:
+        setup["simulationGoals"] = goals
+    outputs = value.get("expectedOutputs")
+    if isinstance(outputs, list):
+        clean_outputs = []
+        for item in outputs[:24]:
+            text = setup_text(item, 220)
+            if text:
+                clean_outputs.append(text)
+        if clean_outputs:
+            setup["expectedOutputs"] = clean_outputs
+    setup["updatedAt"] = setup_text(value.get("updatedAt"), 80) or now_iso()
+    setup["updatedBy"] = "vm-agent"
+    return setup
+
+def setup_from_run_request(request):
+    files = request.get("files") or []
+    steps = request.get("steps") or []
+    file_names = []
+    for item in files[:12]:
+        if isinstance(item, dict):
+            name = setup_text(item.get("name"), 120)
+            if name:
+                file_names.append(name)
+    step_names = []
+    for item in steps[:8]:
+        if isinstance(item, dict):
+            tool = setup_text(item.get("tool"), 40) or "sentaurus"
+            entry = setup_text(item.get("input") or item.get("entry") or item.get("entryFile"), 120) or "input"
+            step_names.append("%s %s" % (tool, entry))
+    setup = {
+        "deviceType": setup_text(request.get("deviceType") or request.get("title"), 180) or "Sentaurus TCAD task",
+        "simulationGoals": setup_text(request.get("goal") or request.get("objective") or request.get("title"), 800) or "Run the allowlisted Sentaurus deck and collect generated outputs.",
+        "expectedOutputs": [
+            "Sentaurus stdout/stderr logs",
+            "run_result.json manifest",
+            "Generated .plt/.tdr/.csv/.png artifacts when produced by the deck",
+        ],
+        "notes": "Derived from the VM run request%s%s." % (
+            " with files: " + ", ".join(file_names) if file_names else "",
+            " and steps: " + "; ".join(step_names) if step_names else "",
+        ),
+        "updatedAt": now_iso(),
+        "updatedBy": "vm-agent",
+    }
+    for key in ["gateBias", "drainBias", "sourceBulk", "geometry", "dopingOrImplant", "physicsModels", "mesh", "temperature"]:
+        value = setup_text(request.get(key), 500)
+        if value:
+            setup[key] = value
+    return setup
 
 def execute_run_request(request, session_id=""):
     ensure_dir(RUNS_DIR)
@@ -655,7 +762,7 @@ def skill_snapshot():
         "manualCount": len(manuals),
         "manualFiles": manuals[:20],
         "coreMission": "build Sentaurus simulation tasks, prepare decks/data, run allowlisted Sentaurus jobs, and export logs/artifacts/results",
-        "safeSkills": ["vm_status", "sentaurus_tools", "list_agent_instances", "sentaurus_manual_context", "sentaurus_run_request"],
+        "safeSkills": ["vm_status", "sentaurus_tools", "list_agent_instances", "sentaurus_manual_context", "simulation_setup", "sentaurus_run_request"],
         "realJobExecution": "available through a VM-local allowlisted runner when the assistant emits a valid <SENTAURUS_RUN_REQUEST> JSON block; arbitrary shell is not allowed",
     }
 
@@ -725,7 +832,7 @@ def call_llm_model(user_text, config, model, system):
         request = urllib2.Request(responses_url(config.get("api_base")), body, {
             "content-type": "application/json",
             "authorization": "Bearer %s" % config.get("api_key"),
-            "user-agent": "sentaurus-vm-agent/0.3",
+            "user-agent": "sentaurus-vm-agent/0.4.4",
         })
         response = urllib2.urlopen(request, timeout=90).read()
         try:
@@ -749,7 +856,7 @@ def call_llm_model(user_text, config, model, system):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.3",
+        "user-agent": "sentaurus-vm-agent/0.4.4",
     })
     response = urllib2.urlopen(request, timeout=90).read()
     try:
@@ -773,7 +880,9 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
         "invoke Sentaurus only through the VM-local allowlisted runner, monitor logs, and export results/artifacts/metrics back to the user. "
         "Real execution is available only by emitting a valid <SENTAURUS_RUN_REQUEST> JSON block; arbitrary shell commands are forbidden. "
         "Never claim that a Sentaurus job has run unless an allowlisted runner actually ran it and produced logs/artifacts. "
-        "When the user explicitly asks you to run/simulate and you can create a self-contained minimal Sentaurus deck, include a concise human explanation followed by exactly one run request block. "
+        "When the user explicitly asks you to run/simulate and you can create a self-contained minimal Sentaurus deck, include a concise human explanation, one simulation setup block, and exactly one run request block. "
+        "The setup block schema is: <SIMULATION_SETUP>{\"deviceType\":\"...\",\"gateBias\":\"...\",\"drainBias\":\"...\",\"sourceBulk\":\"...\",\"geometry\":\"...\",\"dopingOrImplant\":\"...\",\"physicsModels\":\"...\",\"mesh\":\"...\",\"temperature\":\"...\",\"simulationGoals\":\"...\",\"expectedOutputs\":[\"file or curve\"],\"notes\":\"...\"}</SIMULATION_SETUP>. "
+        "Populate the setup block with actual assumptions from the same browser session; omit unknown fields instead of inventing critical process/device parameters. "
         "The block schema is: <SENTAURUS_RUN_REQUEST>{\"title\":\"short-title\",\"files\":[{\"name\":\"main.cmd\",\"content\":\"...\"}],\"steps\":[{\"tool\":\"sde|sprocess|sdevice|inspect\",\"input\":\"main.cmd\"}]}</SENTAURUS_RUN_REQUEST>. "
         "Use only safe ASCII file names without spaces, and only .cmd, .des, .par, .scm, .tcl, .txt, or .dat files. "
         "If the required deck cannot be made self-contained, ask for the missing files/assumptions instead of emitting a run request. "
@@ -837,7 +946,14 @@ def process_queue_file(path):
         else:
             append_progress(session_id, "llm_context", "running", "Building session history and manual context", 12)
         reply, meta = reply_for(text, session_id, item.get("id") or "")
-        run_request, visible_reply = extract_run_request(reply)
+        simulation_setup, setup_visible_reply = extract_json_tag(reply, "SIMULATION_SETUP")
+        if simulation_setup:
+            simulation_setup = normalize_simulation_setup(simulation_setup)
+            meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
+        run_request, visible_reply = extract_run_request(setup_visible_reply)
+        if run_request and not simulation_setup:
+            simulation_setup = setup_from_run_request(run_request)
+            meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
         if meta.get("kind") == "sentaurus_skill":
             append_progress(session_id, "skill", "completed", "Local skill reply is ready", 100)
         elif meta.get("kind") == "llm_error":
@@ -848,9 +964,14 @@ def process_queue_file(path):
             append_progress(session_id, "runner", "running", "Executing allowlisted Sentaurus run request", 45)
             result = execute_run_request(run_request, session_id)
             reply = (visible_reply + "\n\n" if visible_reply else "") + format_run_result(result)
+            artifacts = result.get("artifacts") or []
             meta["kind"] = "sentaurus_run"
             meta["runId"] = result.get("id")
+            meta["vmRunId"] = result.get("id")
             meta["runStatus"] = result.get("status")
+            meta["vmRunStatus"] = result.get("status")
+            meta["vmRunArtifactCount"] = len(artifacts)
+            meta["vmRunArtifactsJson"] = json.dumps(artifacts, ensure_ascii=True, sort_keys=True)
         elif meta.get("kind") != "llm_error":
             append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
         if session_id:
@@ -901,7 +1022,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.3"
+AGENT_VERSION = "0.4.4"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 
@@ -1287,6 +1408,96 @@ except Exception as exc:
     sys.exit(0)
 `;
 
+const remoteArtifactDownloadScript = String.raw`# -*- coding: utf-8 -*-
+import base64
+import json
+import os
+import re
+import sys
+
+REQUEST_B64 = "__ARTIFACT_REQUEST_B64__"
+HOME = os.path.expanduser("~")
+RUNS_DIR = os.path.join(HOME, "STDB", "web-agent-runs")
+MAX_BYTES = __MAX_VM_ARTIFACT_BYTES__
+ALLOWED_EXT = set([".log", ".out", ".err", ".plt", ".tdr", ".grd", ".dat", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".bnd", ".sat"])
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
+
+def respond(payload):
+    print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+
+def fail(message, status_code=400):
+    respond({"ok": False, "error": message, "statusCode": status_code})
+    sys.exit(0)
+
+def safe_text(value, limit=1000):
+    if value is None:
+        return ""
+    if not isinstance(value, string_types):
+        value = str(value)
+    return value[:limit]
+
+def load_request():
+    raw = base64.b64decode(REQUEST_B64)
+    try:
+        text = raw.decode("utf-8")
+    except AttributeError:
+        text = raw
+    return json.loads(text)
+
+def safe_segments(rel_path):
+    rel_path = safe_text(rel_path, 1000).strip().replace("\\", "/")
+    if not rel_path or rel_path.startswith("/") or re.match(r"^[A-Za-z]:/", rel_path):
+        fail("invalid artifact path")
+    parts = []
+    for part in rel_path.split("/"):
+        if not part or part in [".", ".."] or part.startswith("."):
+            fail("invalid artifact path segment")
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._@()+, -]{0,159}$", part):
+            fail("artifact path contains unsupported characters")
+        parts.append(part)
+    return parts
+
+try:
+    request = load_request()
+    run_id = safe_text(request.get("runId"), 180).strip()
+    if not re.match(r"^run_[A-Za-z0-9_-]+$", run_id):
+        fail("invalid VM run id")
+    parts = safe_segments(request.get("path"))
+    ext = os.path.splitext(parts[-1])[1].lower()
+    if ext not in ALLOWED_EXT:
+        fail("artifact extension is not allowlisted")
+    run_dir = os.path.abspath(os.path.join(RUNS_DIR, run_id))
+    target = os.path.abspath(os.path.join(run_dir, *parts))
+    if target != run_dir and not target.startswith(run_dir + os.sep):
+        fail("artifact path escapes run directory")
+    if not os.path.isfile(target):
+        fail("artifact not found", 404)
+    size = os.path.getsize(target)
+    if size > MAX_BYTES:
+        fail("artifact is too large to download through the web relay", 413)
+    with open(target, "rb") as handle:
+        content = base64.b64encode(handle.read())
+    try:
+        content = content.decode("ascii")
+    except AttributeError:
+        pass
+    respond({
+        "ok": True,
+        "path": "/".join(parts),
+        "fileName": os.path.basename(target),
+        "size": size,
+        "contentB64": content,
+    })
+except SystemExit:
+    raise
+except Exception as exc:
+    fail(str(exc), 500)
+`;
+
 function remoteAgentScript(request: RemoteAgentRequest): string {
   const encodedRequest = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
   const encodedWorker = Buffer.from(remoteWorkerScript, "utf8").toString("base64");
@@ -1295,11 +1506,61 @@ function remoteAgentScript(request: RemoteAgentRequest): string {
     .replace("__WORKER_SOURCE_B64__", encodedWorker);
 }
 
+function remoteArtifactScript(runId: string, artifactPath: string): string {
+  const encodedRequest = Buffer.from(JSON.stringify({ runId, path: artifactPath }), "utf8").toString("base64");
+  return remoteArtifactDownloadScript
+    .replace("__ARTIFACT_REQUEST_B64__", encodedRequest)
+    .replace("__MAX_VM_ARTIFACT_BYTES__", String(maxVmArtifactBytes));
+}
+
 function parseRemoteJson(raw: string): RemoteAgentPayload {
   const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const jsonLine = [...lines].reverse().find((line) => line.startsWith("{") && line.endsWith("}"));
   if (!jsonLine) throw new Error(`VM agent did not return JSON: ${raw.slice(0, 500)}`);
   return JSON.parse(jsonLine) as RemoteAgentPayload;
+}
+
+type RemoteArtifactPayload = {
+  ok?: boolean;
+  error?: string;
+  statusCode?: number;
+  path?: string;
+  fileName?: string;
+  size?: number;
+  contentB64?: string;
+};
+
+function parseRemoteArtifactJson(raw: string): RemoteArtifactPayload {
+  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const jsonLine = [...lines].reverse().find((line) => line.startsWith("{") && line.endsWith("}"));
+  if (!jsonLine) throw httpError(502, `VM artifact download did not return JSON: ${raw.slice(0, 500)}`);
+  return JSON.parse(jsonLine) as RemoteArtifactPayload;
+}
+
+function httpError(statusCode: number, message: string): Error & { statusCode: number } {
+  const error = new Error(message) as Error & { statusCode: number };
+  error.statusCode = statusCode;
+  return error;
+}
+
+function artifactExtension(artifactPath: string): string {
+  const name = artifactPath.split("/").at(-1) || "";
+  const dotIndex = name.lastIndexOf(".");
+  return dotIndex >= 0 ? name.slice(dotIndex).toLowerCase() : "";
+}
+
+function validateVmArtifactRequest(runId: string, artifactPath: string): { runId: string; artifactPath: string } {
+  try {
+    const safeRun = safeRunId(runId);
+    const safePath = safeRelativePath(artifactPath);
+    const extension = artifactExtension(safePath);
+    if (!vmArtifactExtensions.has(extension)) {
+      throw new Error("Artifact extension is not allowlisted");
+    }
+    return { runId: safeRun, artifactPath: safePath };
+  } catch (err) {
+    throw httpError(400, err instanceof Error ? err.message : "Invalid VM artifact path");
+  }
 }
 
 function parseEpochMs(value: unknown): number | undefined {
@@ -1425,6 +1686,31 @@ async function callVmAgent(request: RemoteAgentRequest): Promise<RemoteAgentPayl
   } catch (err) {
     return hostTiming({ ok: false, error: err instanceof Error ? err.message : String(err), raw: raw.slice(0, 500), messages: [], cursor: 0 }, hostEpochMs);
   }
+}
+
+export async function downloadVmRunArtifact(runId: string, artifactPath: string): Promise<VmRunArtifactDownload> {
+  const safe = validateVmArtifactRequest(runId, artifactPath);
+  const result = await runSshCommandWithInput("python -", remoteArtifactScript(safe.runId, safe.artifactPath), 90_000);
+  const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  if (!result.ok) {
+    throw httpError(502, result.error || result.stderr || "VM artifact SSH download failed");
+  }
+  const payload = parseRemoteArtifactJson(raw);
+  if (payload.ok === false) {
+    const statusCode = typeof payload.statusCode === "number" ? payload.statusCode : 400;
+    throw httpError(statusCode, payload.error || "VM artifact download failed");
+  }
+  if (typeof payload.contentB64 !== "string" || typeof payload.path !== "string" || typeof payload.fileName !== "string") {
+    throw httpError(502, "VM artifact download response was incomplete");
+  }
+  const data = Buffer.from(payload.contentB64, "base64");
+  const size = typeof payload.size === "number" && Number.isFinite(payload.size) ? payload.size : data.byteLength;
+  return {
+    path: payload.path,
+    fileName: payload.fileName,
+    size,
+    data
+  };
 }
 
 export async function getVmAgentStatus(): Promise<VmAgentStatus> {

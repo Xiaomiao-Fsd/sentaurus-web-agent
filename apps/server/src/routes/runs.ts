@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import type { SimulationSetup } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
 import { prepareRemoteRun } from "../services/sentaurusRunner.js";
@@ -13,6 +14,7 @@ import {
   listRunFiles,
   readRunLog,
   resolveRunFile,
+  saveSimulationSetup,
   saveInputFile,
   setRunStatus,
   streamRunFile,
@@ -58,6 +60,11 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
       throw error;
     }
     return { run: await updateRun(request.params.id, { title }) };
+  });
+
+  app.patch<{ Params: RunParams; Body: Partial<SimulationSetup> }>("/api/runs/:id/simulation-setup", async (request) => {
+    requireAuth(request);
+    return { run: await saveSimulationSetup(request.params.id, request.body || {}) };
   });
 
   app.delete<{ Params: RunParams }>("/api/runs/:id", async (request) => {

@@ -3,11 +3,12 @@ import { createReadStream } from "node:fs";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { nanoid } from "nanoid";
-import type { RunDetail, RunFile, RunFileKind, RunStatus, RunSummary } from "@sentaurus-agent/shared";
+import type { RunDetail, RunFile, RunFileKind, RunStatus, RunSummary, SimulationSetup } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
 import { assertInsideBase, safeFileName, safeRunId } from "../security/pathSafe.js";
 
 const manifestName = "manifest.json";
+const setupTextLimit = 500;
 
 async function ensureBase(): Promise<void> {
   await fs.mkdir(config.LOCAL_RUN_BASE_ABS, { recursive: true });
@@ -31,6 +32,39 @@ function areaDir(run: RunSummary, kind: RunFileKind): string {
 
 function runDir(id: string): string {
   return assertInsideBase(config.LOCAL_RUN_BASE_ABS, path.join(config.LOCAL_RUN_BASE_ABS, safeRunId(id)));
+}
+
+function setupText(value: unknown, limit = setupTextLimit): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, limit) : undefined;
+}
+
+function normalizeSimulationSetup(input: Partial<SimulationSetup> | undefined): SimulationSetup {
+  const source = input || {};
+  const expectedOutputs = Array.isArray(source.expectedOutputs)
+    ? source.expectedOutputs.flatMap((item) => {
+      const value = setupText(item, 220);
+      return value ? [value] : [];
+    }).slice(0, 24)
+    : undefined;
+  const updatedBy = source.updatedBy === "user" || source.updatedBy === "system" ? source.updatedBy : "vm-agent";
+  return {
+    deviceType: setupText(source.deviceType),
+    gateBias: setupText(source.gateBias),
+    drainBias: setupText(source.drainBias),
+    sourceBulk: setupText(source.sourceBulk),
+    geometry: setupText(source.geometry),
+    dopingOrImplant: setupText(source.dopingOrImplant),
+    physicsModels: setupText(source.physicsModels),
+    mesh: setupText(source.mesh),
+    temperature: setupText(source.temperature),
+    simulationGoals: setupText(source.simulationGoals, 800),
+    expectedOutputs,
+    notes: setupText(source.notes, 1000),
+    updatedAt: setupText(source.updatedAt, 80) || new Date().toISOString(),
+    updatedBy
+  };
 }
 
 export async function createRun(title?: string): Promise<RunSummary> {
@@ -107,6 +141,10 @@ export async function deleteRun(id: string): Promise<void> {
 
 export async function setRunStatus(id: string, status: RunStatus, lastError?: string): Promise<RunSummary> {
   return updateRun(id, { status, lastError });
+}
+
+export async function saveSimulationSetup(id: string, setup: Partial<SimulationSetup>): Promise<RunSummary> {
+  return updateRun(id, { simulationSetup: normalizeSimulationSetup(setup) });
 }
 
 async function listArea(run: RunSummary, kind: RunFileKind): Promise<RunFile[]> {

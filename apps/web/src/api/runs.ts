@@ -1,4 +1,4 @@
-import type { RunDetail, RunFile, RunSummary } from "@sentaurus-agent/shared";
+import type { RunDetail, RunFile, RunSummary, SimulationSetup } from "@sentaurus-agent/shared";
 import { apiUrl, requestJson, tokenQuery, uploadJson } from "./client.js";
 
 export async function listRuns(): Promise<{ runs: RunSummary[] }> {
@@ -11,6 +11,10 @@ export async function getRun(id: string): Promise<RunDetail> {
 
 export async function renameRun(id: string, title: string): Promise<{ run: RunSummary }> {
   return requestJson(`/api/runs/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ title }) });
+}
+
+export async function saveRunSimulationSetup(id: string, setup: SimulationSetup): Promise<{ run: RunSummary }> {
+  return requestJson(`/api/runs/${encodeURIComponent(id)}/simulation-setup`, { method: "PATCH", body: JSON.stringify(setup) });
 }
 
 export async function deleteRun(id: string): Promise<{ ok: boolean }> {

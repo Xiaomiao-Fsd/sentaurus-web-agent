@@ -853,6 +853,27 @@ code {
   font-weight: 800;
 }
 
+a.attachment-chip {
+  text-decoration: none;
+}
+
+.attachment-chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-chip {
+  max-width: min(100%, 320px);
+}
+
+.muted-chip {
+  border-color: var(--color-border);
+  background: var(--color-surface-2);
+  color: var(--color-muted);
+}
+
 .message-row.user .attachment-chip {
   border-color: rgba(255, 255, 255, 0.3);
   background: rgba(255, 255, 255, 0.14);

@@ -105,6 +105,28 @@ export type RunFile = {
   modifiedAt: string;
 };
 
+export type SimulationSetup = {
+  deviceType?: string;
+  gateBias?: string;
+  drainBias?: string;
+  sourceBulk?: string;
+  geometry?: string;
+  dopingOrImplant?: string;
+  physicsModels?: string;
+  mesh?: string;
+  temperature?: string;
+  simulationGoals?: string;
+  expectedOutputs?: string[];
+  notes?: string;
+  updatedAt: string;
+  updatedBy: "vm-agent" | "user" | "system";
+};
+
+export type VmRunArtifact = {
+  path: string;
+  size: number;
+};
+
 export type RunSummary = {
   id: string;
   status: RunStatus;
@@ -115,6 +137,7 @@ export type RunSummary = {
   remoteDir?: string;
   remotePreparedAt?: string;
   lastError?: string;
+  simulationSetup?: SimulationSetup;
 };
 
 export type RunDetail = {

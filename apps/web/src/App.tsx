@@ -5,8 +5,10 @@ import type {
   RunFile,
   RunStatus,
   RunSummary,
+  SimulationSetup,
   VmAgentHistoryResponse,
   VmAgentMessage,
+  VmRunArtifact,
   VmAgentStatus,
   VmStatus
 } from "@sentaurus-agent/shared";
@@ -23,10 +25,12 @@ import {
   getVmStatus,
   listRuns,
   renameRun,
+  saveRunSimulationSetup,
   sendVmAgentMessage,
   setAuthToken,
   uploadRunFile,
-  vmAgentMessageStreamUrl
+  vmAgentMessageStreamUrl,
+  vmRunArtifactDownloadUrl
 } from "./lib/api.js";
 import { errorMessage, formatBytes, formatCompactNumber, formatDate, formatFullDate, normalizeAuthToken, shortId } from "./utils/format.js";
 
@@ -59,6 +63,13 @@ type ProgressRow = {
   detail: string;
   progress: number | null;
   runId: string | null;
+};
+
+type SessionVmArtifact = VmRunArtifact & {
+  runId: string;
+  status?: string;
+  messageId: string;
+  createdAt: string;
 };
 
 type SessionMenuState = {
@@ -100,13 +111,27 @@ const QUICK_PROMPTS: QuickPrompt[] = [
   }
 ];
 
-const SIMULATION_SETUP = [
+const SIMULATION_SETUP_FALLBACK = [
   { label: "Gate bias", value: "Vg sweep, defined by prompt or uploaded deck" },
   { label: "Drain bias", value: "Vd / Id target, extracted from experiment goal" },
   { label: "Source / bulk", value: "Reference terminal conditions" },
   { label: "Ion implantation", value: "Dose and concentration from SProcess inputs" },
   { label: "Device geometry", value: "Channel, oxide and contact setup from structure files" },
   { label: "Simulation goals", value: "Transfer curve, output curve, threshold and leakage extraction" }
+];
+
+const SETUP_FIELDS: Array<{ key: keyof SimulationSetup; label: string }> = [
+  { key: "deviceType", label: "Device" },
+  { key: "gateBias", label: "Gate bias" },
+  { key: "drainBias", label: "Drain bias" },
+  { key: "sourceBulk", label: "Source / bulk" },
+  { key: "geometry", label: "Geometry" },
+  { key: "dopingOrImplant", label: "Doping / implant" },
+  { key: "physicsModels", label: "Physics models" },
+  { key: "mesh", label: "Mesh" },
+  { key: "temperature", label: "Temperature" },
+  { key: "simulationGoals", label: "Simulation goals" },
+  { key: "notes", label: "Notes" }
 ];
 
 const EXPECTED_OUTPUTS = [
@@ -124,6 +149,109 @@ function messageSessionId(message: VmAgentMessage): string | null {
 
 function messageBelongsToSession(message: VmAgentMessage, sessionId: string): boolean {
   return messageSessionId(message) === sessionId;
+}
+
+function metaString(message: VmAgentMessage, key: string): string | null {
+  const value = message.meta?.[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function parseJsonValue<T>(value: string | null): T | null {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
+}
+
+function setupText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeSimulationSetup(value: unknown): SimulationSetup | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<SimulationSetup>;
+  const expectedOutputs = Array.isArray(record.expectedOutputs)
+    ? record.expectedOutputs.flatMap((item) => {
+      const text = setupText(item);
+      return text ? [text] : [];
+    })
+    : undefined;
+  return {
+    deviceType: setupText(record.deviceType),
+    gateBias: setupText(record.gateBias),
+    drainBias: setupText(record.drainBias),
+    sourceBulk: setupText(record.sourceBulk),
+    geometry: setupText(record.geometry),
+    dopingOrImplant: setupText(record.dopingOrImplant),
+    physicsModels: setupText(record.physicsModels),
+    mesh: setupText(record.mesh),
+    temperature: setupText(record.temperature),
+    simulationGoals: setupText(record.simulationGoals),
+    expectedOutputs: expectedOutputs?.length ? expectedOutputs : undefined,
+    notes: setupText(record.notes),
+    updatedAt: setupText(record.updatedAt) || new Date().toISOString(),
+    updatedBy: record.updatedBy === "user" || record.updatedBy === "system" ? record.updatedBy : "vm-agent"
+  };
+}
+
+function simulationSetupFromMessage(message: VmAgentMessage): SimulationSetup | null {
+  return normalizeSimulationSetup(parseJsonValue(metaString(message, "simulationSetupJson")));
+}
+
+function latestSimulationSetupFromMessages(messages: VmAgentMessage[]): SimulationSetup | null {
+  for (const message of [...messages].reverse()) {
+    const setup = simulationSetupFromMessage(message);
+    if (setup) return setup;
+  }
+  return null;
+}
+
+function simulationSetupRows(setup: SimulationSetup | null): Array<{ label: string; value: string }> {
+  if (!setup) return SIMULATION_SETUP_FALLBACK;
+  const rows = SETUP_FIELDS.flatMap((field) => {
+    const value = setup[field.key];
+    return typeof value === "string" && value.trim() ? [{ label: field.label, value }] : [];
+  });
+  return rows.length > 0 ? rows : SIMULATION_SETUP_FALLBACK;
+}
+
+function expectedOutputsForSetup(setup: SimulationSetup | null): string[] {
+  return setup?.expectedOutputs?.length ? setup.expectedOutputs : EXPECTED_OUTPUTS;
+}
+
+function messageRunId(message: VmAgentMessage): string | null {
+  const runId = message.meta?.vmRunId || message.meta?.runId;
+  return typeof runId === "string" && runId.trim() ? runId : null;
+}
+
+function vmArtifactsForMessage(message: VmAgentMessage): SessionVmArtifact[] {
+  const runId = messageRunId(message);
+  if (!runId) return [];
+  const parsed = parseJsonValue<unknown[]>(metaString(message, "vmRunArtifactsJson"));
+  if (!Array.isArray(parsed)) return [];
+  const status = metaString(message, "vmRunStatus") || metaString(message, "runStatus") || undefined;
+  return parsed.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Partial<VmRunArtifact>;
+    const artifactPath = setupText(record.path);
+    if (!artifactPath) return [];
+    const size = typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0;
+    return [{ path: artifactPath, size, runId, status, messageId: message.id, createdAt: message.createdAt }];
+  });
+}
+
+function vmArtifactsForSession(messages: VmAgentMessage[]): SessionVmArtifact[] {
+  const byKey = new Map<string, SessionVmArtifact>();
+  for (const artifact of messages.flatMap((message) => vmArtifactsForMessage(message))) {
+    byKey.set(`${artifact.runId}:${artifact.path}`, artifact);
+  }
+  return [...byKey.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function simulationSetupKey(setup: SimulationSetup | null | undefined): string {
+  return setup ? JSON.stringify(setup) : "";
 }
 
 function messagesForSession(messages: VmAgentMessage[], sessionId: string | null): VmAgentMessage[] {
@@ -361,6 +489,7 @@ export default function App() {
   const pendingReplyRetryRef = useRef(0);
   const vmAgentCursorRef = useRef(0);
   const sessionMenuCloseTimerRef = useRef<number | null>(null);
+  const setupSyncKeyRef = useRef("");
 
   const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
@@ -369,6 +498,11 @@ export default function App() {
   const currentMessages = useMemo(() => messagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
   const visibleMessages = useMemo(() => currentMessages.filter((message) => message.meta?.kind !== "progress"), [currentMessages]);
   const progressRows = useMemo(() => progressRowsForSession(vmAgentMessages, selectedRunId).slice(-12), [selectedRunId, vmAgentMessages]);
+  const messageSimulationSetup = useMemo(() => latestSimulationSetupFromMessages(currentMessages), [currentMessages]);
+  const currentSimulationSetup = messageSimulationSetup || runDetail?.run.simulationSetup || selectedRun?.simulationSetup || null;
+  const simulationRows = useMemo(() => simulationSetupRows(currentSimulationSetup), [currentSimulationSetup]);
+  const expectedOutputs = useMemo(() => expectedOutputsForSetup(currentSimulationSetup), [currentSimulationSetup]);
+  const vmRunArtifacts = useMemo(() => vmArtifactsForSession(currentMessages), [currentMessages]);
   const latestProgress = progressRows.at(-1);
   const globalMessages = useMemo(() => globalAgentMessages(vmAgentMessages).slice(-6), [vmAgentMessages]);
   const contextStats = useMemo(() => estimateContextUsage(visibleMessages), [visibleMessages]);
@@ -706,6 +840,27 @@ export default function App() {
     );
   }
 
+  function renderVmArtifactList(files: SessionVmArtifact[]) {
+    if (files.length === 0) return <p className="empty-line">No VM artifacts yet.</p>;
+    return (
+      <div className="file-list">
+        {files.map((file) => (
+          <a
+            className="file-row"
+            href={vmRunArtifactDownloadUrl(file.runId, file.path)}
+            key={`${file.runId}:${file.path}`}
+            rel="noreferrer"
+            target="_blank"
+            title={`${file.runId}/${file.path}`}
+          >
+            <span>{file.path}</span>
+            <small>{formatBytes(file.size)} - {file.status || "artifact"} - {shortId(file.runId)}</small>
+          </a>
+        ))}
+      </div>
+    );
+  }
+
   useEffect(() => {
     getHealth().then((h) => setHealth(`${h.service} OK`)).catch((err) => setHealth(errorMessage(err)));
   }, []);
@@ -930,6 +1085,32 @@ export default function App() {
   }, [selectedRunId, authKey]);
 
   useEffect(() => {
+    if (!authKey || !selectedRunId || !messageSimulationSetup) return;
+    const nextKey = `${selectedRunId}:${simulationSetupKey(messageSimulationSetup)}`;
+    if (setupSyncKeyRef.current === nextKey) return;
+    if (simulationSetupKey(runDetail?.run.simulationSetup) === simulationSetupKey(messageSimulationSetup)) {
+      setupSyncKeyRef.current = nextKey;
+      return;
+    }
+    let closed = false;
+    setupSyncKeyRef.current = nextKey;
+    void saveRunSimulationSetup(selectedRunId, messageSimulationSetup)
+      .then((result) => {
+        if (closed) return;
+        setRuns((prev) => prev.map((run) => run.id === result.run.id ? result.run : run));
+        setRunDetail((prev) => prev && prev.run.id === result.run.id ? { ...prev, run: result.run } : prev);
+      })
+      .catch((err) => {
+        if (closed) return;
+        setupSyncKeyRef.current = "";
+        recordError(err);
+      });
+    return () => {
+      closed = true;
+    };
+  }, [authKey, selectedRunId, messageSimulationSetup, runDetail?.run.simulationSetup]);
+
+  useEffect(() => {
     messageEndRef.current?.scrollIntoView({ block: "end" });
   }, [currentMessages.length, selectedRunId]);
 
@@ -1104,20 +1285,40 @@ export default function App() {
           )}
           {visibleMessages.map((message) => {
             const attachments = messageAttachments[message.id] || [];
+            const messageVmArtifacts = vmArtifactsForMessage(message);
+            const visibleVmArtifacts = messageVmArtifacts.slice(0, 16);
             const content = messageDisplayOverrides[message.id] ?? message.content;
             return (
               <article className={`message-row ${message.role}`} key={message.id}>
                 <div className="avatar">{message.role === "agent" ? "VM" : message.role === "user" ? "You" : "Sys"}</div>
                 <div className="message-bubble">
                   <div className="message-content">{content}</div>
-                  {attachments.length > 0 && (
+                  {(attachments.length > 0 || messageVmArtifacts.length > 0) && (
                     <div className="message-attachments">
                       {attachments.map((file) => (
                         <span className="attachment-chip" key={file.id}>
-                          {file.name}
+                          <span>{file.name}</span>
                           <small>{formatBytes(file.size)}</small>
                         </span>
                       ))}
+                      {visibleVmArtifacts.map((file) => (
+                        <a
+                          className="attachment-chip artifact-chip"
+                          href={vmRunArtifactDownloadUrl(file.runId, file.path)}
+                          key={`${file.runId}:${file.path}`}
+                          rel="noreferrer"
+                          target="_blank"
+                          title={`${file.runId}/${file.path}`}
+                        >
+                          <span>{file.path}</span>
+                          <small>{formatBytes(file.size)}</small>
+                        </a>
+                      ))}
+                      {messageVmArtifacts.length > visibleVmArtifacts.length && (
+                        <span className="attachment-chip muted-chip">
+                          <span>+{messageVmArtifacts.length - visibleVmArtifacts.length} more</span>
+                        </span>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1221,7 +1422,7 @@ export default function App() {
             {selectedRun && <em className={`run-state ${statusTone(selectedRun.status)} ${selectedRun.status}`}>{selectedRun.status}</em>}
           </div>
           <div className="simulation-list">
-            {SIMULATION_SETUP.map((item) => (
+            {simulationRows.map((item) => (
               <div className="simulation-row" key={item.label}>
                 <span>{item.label}</span>
                 <small>{item.value}</small>
@@ -1236,10 +1437,12 @@ export default function App() {
             {runDetail && <button className="link-button" onClick={() => void refreshRunDetail()}>Refresh</button>}
           </div>
           <div className="output-targets">
-            {EXPECTED_OUTPUTS.map((item) => <span key={item}>{item}</span>)}
+            {expectedOutputs.map((item) => <span key={item}>{item}</span>)}
           </div>
-          <h3>Generated artifacts</h3>
+          <h3>Host artifacts</h3>
           {runDetail ? renderArtifactList(runDetail.artifacts) : <p className="empty-line">Select a session to view generated outputs.</p>}
+          <h3>VM run artifacts</h3>
+          {renderVmArtifactList(vmRunArtifacts)}
         </section>
 
         {globalMessages.length > 0 && (

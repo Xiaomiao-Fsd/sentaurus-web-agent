@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
-import { connectVmAgent, getVmAgentMessages, getVmAgentStatus, sendVmAgentMessage } from "../services/vmAgent.js";
+import { connectVmAgent, downloadVmRunArtifact, getVmAgentMessages, getVmAgentStatus, sendVmAgentMessage } from "../services/vmAgent.js";
 
 function parseCursor(value: unknown): number {
   if (typeof value !== "string") return 0;
@@ -26,6 +26,10 @@ function parseSessionId(value: unknown): string | undefined {
     throw error;
   }
   return trimmed;
+}
+
+function contentDispositionFileName(name: string): string {
+  return name.replace(/["\\\r\n]/g, "_");
 }
 
 export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
@@ -65,6 +69,22 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     }
     const result = await sendVmAgentMessage(message, parseSessionId(request.body?.sessionId));
     return { ok: result.status.ok, ...result };
+  });
+
+  app.get<{ Params: { runId: string }; Querystring: { path?: string; token?: string } }>("/api/vm/agent/runs/:runId/artifacts", async (request, reply) => {
+    requireAuth(request);
+    const artifactPath = request.query.path;
+    if (!artifactPath) {
+      const error = new Error("path is required") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    const artifact = await downloadVmRunArtifact(request.params.runId, artifactPath);
+    reply.header("content-type", "application/octet-stream");
+    reply.header("content-length", String(artifact.data.byteLength));
+    reply.header("x-vm-artifact-path", artifact.path);
+    reply.header("content-disposition", `attachment; filename="${contentDispositionFileName(artifact.fileName)}"`);
+    return reply.send(artifact.data);
   });
 
   app.get<{ Querystring: { after?: string; token?: string } }>("/api/vm/agent/messages/stream", async (request, reply) => {

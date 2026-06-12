@@ -28,3 +28,7 @@ export async function getVmAgentMessages(after = 0, options: { limit?: number; s
 export function vmAgentMessageStreamUrl(after = 0): string {
   return apiUrl(`/api/vm/agent/messages/stream?after=${encodeURIComponent(String(after))}&token=${tokenQuery()}`);
 }
+
+export function vmRunArtifactDownloadUrl(runId: string, artifactPath: string): string {
+  return apiUrl(`/api/vm/agent/runs/${encodeURIComponent(runId)}/artifacts?path=${encodeURIComponent(artifactPath)}&token=${tokenQuery()}`);
+}
