@@ -18,8 +18,11 @@ export async function sendVmAgentMessage(message: string, sessionId?: string): P
   return requestJson("/api/vm/agent/messages", { method: "POST", body: JSON.stringify({ message, sessionId }) });
 }
 
-export async function getVmAgentMessages(after = 0): Promise<VmAgentHistoryResponse> {
-  return requestJson(`/api/vm/agent/messages?after=${encodeURIComponent(String(after))}`);
+export async function getVmAgentMessages(after = 0, options: { limit?: number; sessionId?: string } = {}): Promise<VmAgentHistoryResponse> {
+  const params = new URLSearchParams({ after: String(after) });
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.sessionId) params.set("sessionId", options.sessionId);
+  return requestJson(`/api/vm/agent/messages?${params.toString()}`);
 }
 
 export function vmAgentMessageStreamUrl(after = 0): string {

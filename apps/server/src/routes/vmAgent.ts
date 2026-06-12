@@ -9,6 +9,13 @@ function parseCursor(value: unknown): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
+function parseLimit(value: unknown, fallback = 50): number {
+  if (typeof value !== "string") return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, 1000);
+}
+
 function parseSessionId(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
@@ -33,9 +40,13 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     return { ok: result.status.ok, ...result };
   });
 
-  app.get<{ Querystring: { after?: string } }>("/api/vm/agent/messages", async (request) => {
+  app.get<{ Querystring: { after?: string; limit?: string; sessionId?: string } }>("/api/vm/agent/messages", async (request) => {
     requireAuth(request);
-    const result = await getVmAgentMessages(parseCursor(request.query.after));
+    const result = await getVmAgentMessages(
+      parseCursor(request.query.after),
+      parseLimit(request.query.limit),
+      parseSessionId(request.query.sessionId)
+    );
     return { ok: result.status.ok, ...result };
   });
 

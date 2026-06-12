@@ -33,6 +33,13 @@ type RemoteAgentPayload = {
   manualFiles?: string[];
   queueDepth?: number;
   sentaurusTools?: Record<string, string | null>;
+  vmTime?: string;
+  vmEpochMs?: number;
+  hostTime?: string;
+  hostEpochMs?: number;
+  hostReceivedAt?: string;
+  clockSkewMs?: number;
+  clockSkewWarning?: boolean;
   messages?: unknown[];
   cursor?: number;
   raw?: string;
@@ -965,9 +972,10 @@ def append_message(role, content, source, meta=None, id_prefix=None):
     audit("message", {"id": message.get("id"), "role": role, "source": source, "kind": (meta or {}).get("kind")})
     return message
 
-def read_messages(after=0, limit=50):
+def read_messages(after=0, limit=50, session_id=""):
     cursor = 0
     messages = []
+    session_id = safe_text(session_id, 160).strip()
     if os.path.exists(MESSAGES_PATH):
         with open(MESSAGES_PATH, "r") as handle:
             for line in handle:
@@ -978,9 +986,15 @@ def read_messages(after=0, limit=50):
                 if not line:
                     continue
                 try:
-                    messages.append(json.loads(line))
+                    item = json.loads(line)
                 except Exception:
-                    pass
+                    continue
+                if session_id:
+                    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+                    if safe_text(meta.get("sessionId"), 160).strip() != session_id:
+                        continue
+                item["sequence"] = cursor
+                messages.append(item)
     if limit > 0 and len(messages) > limit:
         messages = messages[-limit:]
     return messages, cursor
@@ -1210,6 +1224,8 @@ def build_status():
         "manualFiles": manuals[:20],
         "queueDepth": queue_depth(),
         "sentaurusTools": sentaurus_tools(),
+        "vmTime": now_iso(),
+        "vmEpochMs": int(time.time() * 1000),
     }
 
 def enqueue_message(content, session_id=None):
@@ -1243,7 +1259,7 @@ def handle(request):
         start_worker()
         messages = [enqueue_message(incoming, session_id)]
     elif operation == "history":
-        messages, _cursor = read_messages(after, limit)
+        messages, _cursor = read_messages(after, limit, session_id)
     elif operation == "status":
         messages, _cursor = read_messages(max(0, message_count() - limit), limit)
     else:
@@ -1286,17 +1302,55 @@ function parseRemoteJson(raw: string): RemoteAgentPayload {
   return JSON.parse(jsonLine) as RemoteAgentPayload;
 }
 
-function normalizeMessages(messages: unknown[] | undefined): VmAgentMessage[] {
+function parseEpochMs(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function hostTiming(payload: RemoteAgentPayload, hostEpochMs = Date.now()): RemoteAgentPayload {
+  const hostTime = new Date(hostEpochMs).toISOString();
+  const vmEpochMs = typeof payload.vmEpochMs === "number" && Number.isFinite(payload.vmEpochMs)
+    ? payload.vmEpochMs
+    : parseEpochMs(payload.vmTime);
+  const clockSkewMs = typeof vmEpochMs === "number" ? vmEpochMs - hostEpochMs : undefined;
+  return {
+    ...payload,
+    hostTime,
+    hostEpochMs,
+    hostReceivedAt: hostTime,
+    vmEpochMs,
+    clockSkewMs,
+    clockSkewWarning: typeof clockSkewMs === "number" ? Math.abs(clockSkewMs) > 30_000 : undefined
+  };
+}
+
+function adjustedTimestamp(value: unknown, clockSkewMs: number | undefined, fallback: string): string {
+  const vmEpochMs = parseEpochMs(value);
+  if (typeof vmEpochMs === "number" && typeof clockSkewMs === "number") {
+    return new Date(vmEpochMs - clockSkewMs).toISOString();
+  }
+  return typeof value === "string" && value.trim() ? value : fallback;
+}
+
+function normalizeMessages(messages: unknown[] | undefined, payload: RemoteAgentPayload): VmAgentMessage[] {
   if (!Array.isArray(messages)) return [];
+  const hostReceivedAt = payload.hostReceivedAt || new Date().toISOString();
   return messages.flatMap((message) => {
     if (!message || typeof message !== "object") return [];
-    const item = message as Partial<VmAgentMessage> & { source?: string };
+    const item = message as Partial<VmAgentMessage> & { source?: string; sequence?: unknown };
     const role = item.role === "user" || item.role === "agent" || item.role === "system" ? item.role : "agent";
+    const vmCreatedAt = typeof item.createdAt === "string" ? item.createdAt : undefined;
+    const sequence = typeof item.sequence === "number" && Number.isFinite(item.sequence) ? item.sequence : undefined;
     return [{
       id: typeof item.id === "string" ? item.id : `vm_msg_${Date.now()}_${Math.random().toString(36).slice(2)}`,
       role,
       content: typeof item.content === "string" ? item.content : "",
-      createdAt: typeof item.createdAt === "string" ? item.createdAt : new Date().toISOString(),
+      createdAt: adjustedTimestamp(vmCreatedAt, payload.clockSkewMs, hostReceivedAt),
+      vmCreatedAt,
+      hostReceivedAt,
+      sequence,
       meta: item.meta
     }];
   });
@@ -1326,6 +1380,12 @@ function toStatus(payload: RemoteAgentPayload): VmAgentStatus {
     manualFiles: payload.manualFiles,
     queueDepth: payload.queueDepth,
     sentaurusTools: payload.sentaurusTools,
+    vmTime: payload.vmTime,
+    vmEpochMs: payload.vmEpochMs,
+    hostTime: payload.hostTime,
+    hostEpochMs: payload.hostEpochMs,
+    clockSkewMs: payload.clockSkewMs,
+    clockSkewWarning: payload.clockSkewWarning,
     error: payload.error,
     raw: payload.raw
   };
@@ -1337,6 +1397,8 @@ function errorStatus(message: string, raw = ""): VmAgentStatus {
     checkedAt: new Date().toISOString(),
     sshTarget: config.SENTAURUS_SSH_TARGET,
     connected: false,
+    hostTime: new Date().toISOString(),
+    hostEpochMs: Date.now(),
     error: message,
     raw: raw.slice(0, 500)
   };
@@ -1354,13 +1416,14 @@ function fallbackAgentMessage(content: string): VmAgentMessage {
 async function callVmAgent(request: RemoteAgentRequest): Promise<RemoteAgentPayload> {
   const result = await runSshCommandWithInput("python -", remoteAgentScript(request), 20_000);
   const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  const hostEpochMs = Date.now();
   if (!result.ok) {
-    return { ok: false, error: result.error || result.stderr || "VM agent SSH call failed", raw: raw.slice(0, 500), messages: [], cursor: 0 };
+    return hostTiming({ ok: false, error: result.error || result.stderr || "VM agent SSH call failed", raw: raw.slice(0, 500), messages: [], cursor: 0 }, hostEpochMs);
   }
   try {
-    return parseRemoteJson(raw);
+    return hostTiming(parseRemoteJson(raw), hostEpochMs);
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err), raw: raw.slice(0, 500), messages: [], cursor: 0 };
+    return hostTiming({ ok: false, error: err instanceof Error ? err.message : String(err), raw: raw.slice(0, 500), messages: [], cursor: 0 }, hostEpochMs);
   }
 }
 
@@ -1372,20 +1435,20 @@ export async function getVmAgentStatus(): Promise<VmAgentStatus> {
 export async function connectVmAgent(): Promise<{ status: VmAgentStatus; messages: VmAgentMessage[]; message?: VmAgentMessage; cursor: number }> {
   const payload = await callVmAgent({ operation: "start" });
   const status = payload.ok === false ? errorStatus(payload.error || "VM agent connect failed", payload.raw) : toStatus(payload);
-  const messages = normalizeMessages(payload.messages);
+  const messages = normalizeMessages(payload.messages, payload);
   return { status, messages, message: messages.find((item) => item.role === "agent"), cursor: payload.cursor || 0 };
 }
 
-export async function getVmAgentMessages(after = 0, limit = 50): Promise<{ status: VmAgentStatus; messages: VmAgentMessage[]; cursor: number }> {
-  const payload = await callVmAgent({ operation: "history", after, limit });
+export async function getVmAgentMessages(after = 0, limit = 50, sessionId?: string): Promise<{ status: VmAgentStatus; messages: VmAgentMessage[]; cursor: number }> {
+  const payload = await callVmAgent({ operation: "history", after, limit, sessionId });
   const status = payload.ok === false ? errorStatus(payload.error || "VM agent history failed", payload.raw) : toStatus(payload);
-  return { status, messages: normalizeMessages(payload.messages), cursor: payload.cursor || after };
+  return { status, messages: normalizeMessages(payload.messages, payload), cursor: payload.cursor || after };
 }
 
 export async function sendVmAgentMessage(message: string, sessionId?: string): Promise<{ status: VmAgentStatus; message: VmAgentMessage; messages: VmAgentMessage[]; cursor: number }> {
   const payload = await callVmAgent({ operation: "send", message, sessionId });
   const status = payload.ok === false ? errorStatus(payload.error || "VM agent message failed", payload.raw) : toStatus(payload);
-  const messages = normalizeMessages(payload.messages);
+  const messages = normalizeMessages(payload.messages, payload);
   const representative = [...messages].reverse().find((item) => item.role === "agent") || messages[0] || fallbackAgentMessage("Message queued for the CentOS VM agent.");
   return { status, message: representative, messages, cursor: payload.cursor || 0 };
 }

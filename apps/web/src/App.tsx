@@ -53,6 +53,7 @@ type ProgressStatus = "running" | "completed" | "failed" | "queued" | "info";
 type ProgressRow = {
   id: string;
   createdAt: string;
+  vmCreatedAt?: string;
   stage: string;
   status: ProgressStatus;
   detail: string;
@@ -227,6 +228,7 @@ function progressRowsForSession(messages: VmAgentMessage[], sessionId: string | 
     return [{
       id: message.id,
       createdAt: message.createdAt,
+      vmCreatedAt: message.vmCreatedAt,
       stage,
       status: progressStatus(message.meta.progressStatus),
       detail,
@@ -264,17 +266,41 @@ function statusPillClass(ok: boolean | null | undefined, warning = false): strin
   return "status-pill idle";
 }
 
+function messageSequence(message: VmAgentMessage): number | null {
+  return typeof message.sequence === "number" && Number.isFinite(message.sequence) ? message.sequence : null;
+}
+
+function messageTime(message: VmAgentMessage): number {
+  const parsed = Date.parse(message.createdAt);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function mergeMessageList(prev: VmAgentMessage[], next: VmAgentMessage[] | undefined): VmAgentMessage[] {
   if (!next?.length) return prev;
-  const seen = new Set(prev.map((message) => message.id));
-  const merged = [...prev];
+  const byId = new Map(prev.map((message) => [message.id, message]));
   for (const message of next) {
-    if (!seen.has(message.id)) {
-      merged.push(message);
-      seen.add(message.id);
-    }
+    const existing = byId.get(message.id);
+    byId.set(message.id, existing ? { ...existing, ...message, meta: { ...existing.meta, ...message.meta } } : message);
   }
-  return merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  return [...byId.values()].sort((a, b) => {
+    const aSequence = messageSequence(a);
+    const bSequence = messageSequence(b);
+    if (aSequence !== null && bSequence !== null && aSequence !== bSequence) return aSequence - bSequence;
+    return messageTime(a) - messageTime(b);
+  });
+}
+
+function formatClockSkew(value?: number): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
+  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  let remaining = Math.round(Math.abs(value) / 1000);
+  const hours = Math.floor(remaining / 3600);
+  remaining -= hours * 3600;
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining - minutes * 60;
+  if (hours > 0) return `${sign}${hours}h ${minutes}m`;
+  if (minutes > 0) return `${sign}${minutes}m ${seconds}s`;
+  return `${sign}${seconds}s`;
 }
 
 function hasAgentReplyForSession(messages: VmAgentMessage[] | undefined, sessionId: string): boolean {
@@ -345,6 +371,9 @@ export default function App() {
   const vmOnline = vm?.ok ?? null;
   const workerRunning = vmAgent?.workerRunning ?? null;
   const llmConfigured = vmAgent?.llmConfigured ?? null;
+  const clockSkewWarning = vmAgent?.clockSkewWarning ?? false;
+  const clockSkewLabel = formatClockSkew(vmAgent?.clockSkewMs);
+  const clockSkewOk = typeof vmAgent?.clockSkewMs === "number" ? !clockSkewWarning : null;
   const canSendMessage = !!authKey && !!selectedRunId && !messageSending && !attachmentUploading;
   const waitingForAgentReply = !!pendingReplySessionId;
   const startAgentDisabled = !authKey || vmAgentConnectLoading || messageSending || waitingForAgentReply;
@@ -443,7 +472,9 @@ export default function App() {
   async function handleRefreshVmAgentMessages(showBusy = true) {
     if (showBusy) setVmAgentHistoryLoading(true);
     try {
-      const response = await getVmAgentMessages(0);
+      const response = selectedRunId
+        ? await getVmAgentMessages(0, { limit: 500, sessionId: selectedRunId })
+        : await getVmAgentMessages(0, { limit: 100 });
       setVmAgent(response.status);
       setVmAgentCursor(response.cursor);
       mergeVmAgentMessages(response.messages);
@@ -709,8 +740,9 @@ export default function App() {
     let inFlight = false;
     const interval = window.setInterval(() => {
       if (closed || inFlight || !pendingReplySessionRef.current) return;
+      const requestedSessionId = pendingReplySessionRef.current;
       inFlight = true;
-      void getVmAgentMessages(0)
+      void getVmAgentMessages(0, { limit: 500, sessionId: requestedSessionId })
         .then((response) => {
           if (closed) return;
           setVmAgent(response.status);
@@ -750,6 +782,24 @@ export default function App() {
   }, [pendingReplySessionId, authKey]);
 
   useEffect(() => {
+    if (!selectedRunId || !authKey) return;
+    let closed = false;
+    void getVmAgentMessages(0, { limit: 500, sessionId: selectedRunId })
+      .then((response) => {
+        if (closed) return;
+        setVmAgent(response.status);
+        setVmAgentCursor(response.cursor);
+        mergeVmAgentMessages(response.messages);
+      })
+      .catch((err) => {
+        if (!closed) recordError(err);
+      });
+    return () => {
+      closed = true;
+    };
+  }, [selectedRunId, authKey]);
+
+  useEffect(() => {
     if (!selectedRunId || !authKey) {
       setRunDetail(null);
       return;
@@ -786,6 +836,7 @@ export default function App() {
           <span className={statusPillClass(vmOnline, vmLoading)}><i />VM {vmLoading ? "Checking" : vm?.ok ? "Online" : vm ? "Offline" : "Unchecked"}</span>
           <span className={statusPillClass(workerRunning)}><i />Agent {vmAgent?.workerRunning ? "Running" : vmAgent ? "Stopped" : vmAgentStreamState}</span>
           <span className={statusPillClass(llmConfigured, vmAgent && !vmAgent.llmConfigured ? true : false)}><i />LLM {vmAgent?.llmConfigured ? "Configured" : "Pending"}</span>
+          <span className={statusPillClass(clockSkewOk, clockSkewWarning)} title={vmAgent?.vmTime ? `VM time: ${vmAgent.vmTime}` : undefined}><i />Clock {clockSkewLabel}</span>
         </div>
       </header>
 
@@ -864,6 +915,7 @@ export default function App() {
               <span>stream: {vmAgentStreamState}</span>
               {selectedRun && <span>{selectedRun.status}</span>}
               {latestProgress && <span>{progressLabel(latestProgress.stage)}: {latestProgress.status}</span>}
+              {clockSkewWarning && <span>VM clock skew: {clockSkewLabel}</span>}
               <span>context: {formatCompactNumber(contextStats.estimatedTokens)} / {formatCompactNumber(contextStats.maxTokens)} est. tokens</span>
             </div>
           </div>
@@ -920,7 +972,7 @@ export default function App() {
                     <tr><td colSpan={5}>No progress events yet.</td></tr>
                   ) : progressRows.map((row) => (
                     <tr className={`progress-${row.status}`} key={row.id}>
-                      <td>{formatDate(row.createdAt)}</td>
+                      <td title={row.vmCreatedAt ? `VM time: ${row.vmCreatedAt}` : undefined}>{formatDate(row.createdAt)}</td>
                       <td>{progressLabel(row.stage)}</td>
                       <td><span>{row.status}</span></td>
                       <td>{row.progress === null ? "-" : `${row.progress}%`}</td>
@@ -1049,6 +1101,7 @@ export default function App() {
             <dt>Manuals</dt><dd>{vmAgent?.manualCount ? `${vmAgent.manualCount} installed` : "none installed"}</dd>
             <dt>Messages</dt><dd>{vmAgent?.messageCount ?? currentMessages.length}</dd>
             <dt>Queue</dt><dd>{vmAgent?.queueDepth ?? 0}</dd>
+            <dt>Clock</dt><dd>{clockSkewWarning ? `skew ${clockSkewLabel}` : `skew ${clockSkewLabel}`}</dd>
           </dl>
         </section>
 

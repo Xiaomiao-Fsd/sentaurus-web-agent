@@ -15,6 +15,9 @@ export type VmAgentMessage = {
   role: "user" | "agent" | "system";
   content: string;
   createdAt: string;
+  vmCreatedAt?: string;
+  hostReceivedAt?: string;
+  sequence?: number;
   meta?: Record<string, string | number | boolean | null>;
 };
 
@@ -41,6 +44,12 @@ export type VmAgentStatus = {
   manualFiles?: string[];
   queueDepth?: number;
   sentaurusTools?: Record<string, string | null>;
+  vmTime?: string;
+  vmEpochMs?: number;
+  hostTime?: string;
+  hostEpochMs?: number;
+  clockSkewMs?: number;
+  clockSkewWarning?: boolean;
   error?: string;
   raw?: string;
 };
