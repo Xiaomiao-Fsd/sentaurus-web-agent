@@ -76,8 +76,10 @@ type UploadedAttachment = {
 };
 
 const REFERENCE_CONTEXT_TOKENS = 272_000;
-const REPLY_RETRY_INTERVAL_MS = 30_000;
-const MAX_REPLY_RETRIES = 5;
+const REPLY_RETRY_INTERVAL_MS = 10_000;
+const MAX_REPLY_RETRIES = 180;
+const STREAM_RECONNECT_DELAY_MS = 3_000;
+const STREAM_FALLBACK_POLL_MS = 10_000;
 const SESSION_ORDER_KEY = "sentaurus_session_order";
 const QUICK_PROMPTS: QuickPrompt[] = [
   {
@@ -303,6 +305,14 @@ function formatClockSkew(value?: number): string {
   return `${sign}${seconds}s`;
 }
 
+function formatReplyWait(retryCount: number): string {
+  const elapsedSeconds = Math.round((retryCount * REPLY_RETRY_INTERVAL_MS) / 1000);
+  if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = elapsedSeconds % 60;
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
 function hasAgentReplyForSession(messages: VmAgentMessage[] | undefined, sessionId: string): boolean {
   return !!messages?.some((message) => {
     const isAgentReply = message.role === "agent";
@@ -322,7 +332,6 @@ export default function App() {
   const [vmLoading, setVmLoading] = useState(false);
   const [vmAgent, setVmAgent] = useState<VmAgentStatus | null>(null);
   const [vmAgentMessages, setVmAgentMessages] = useState<VmAgentMessage[]>([]);
-  const [vmAgentCursor, setVmAgentCursor] = useState(0);
   const [composer, setComposer] = useState("");
   const [vmAgentStatusLoading, setVmAgentStatusLoading] = useState(false);
   const [vmAgentConnectLoading, setVmAgentConnectLoading] = useState(false);
@@ -350,6 +359,7 @@ export default function App() {
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const pendingReplySessionRef = useRef<string | null>(null);
   const pendingReplyRetryRef = useRef(0);
+  const vmAgentCursorRef = useRef(0);
   const sessionMenuCloseTimerRef = useRef<number | null>(null);
 
   const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
@@ -380,6 +390,11 @@ export default function App() {
   const canSendMessage = !!authKey && !!selectedRunId && !messageSending && !attachmentUploading;
   const waitingForAgentReply = !!pendingReplySessionId;
   const startAgentDisabled = !authKey || vmAgentConnectLoading || messageSending || waitingForAgentReply;
+
+  function setVmAgentCursorValue(cursor: number) {
+    const nextCursor = Number.isFinite(cursor) && cursor >= 0 ? cursor : 0;
+    vmAgentCursorRef.current = nextCursor;
+  }
 
   function beginPendingAgentReply(sessionId: string) {
     pendingReplySessionRef.current = sessionId;
@@ -462,7 +477,7 @@ export default function App() {
     try {
       const response = await connectVmAgent();
       setVmAgent(response.status);
-      setVmAgentCursor(response.cursor || 0);
+      setVmAgentCursorValue(response.cursor || 0);
       mergeVmAgentMessages(response.messages || (response.message ? [response.message] : []));
       setPanelNotice({ kind: "success", text: "VM agent connection refreshed." });
     } catch (err) {
@@ -479,7 +494,7 @@ export default function App() {
         ? await getVmAgentMessages(0, { limit: 500, sessionId: selectedRunId })
         : await getVmAgentMessages(0, { limit: 100 });
       setVmAgent(response.status);
-      setVmAgentCursor(response.cursor);
+      setVmAgentCursorValue(response.cursor);
       mergeVmAgentMessages(response.messages);
     } catch (err) {
       recordError(err);
@@ -519,7 +534,7 @@ export default function App() {
       const visibleText = text || `Attached ${uploadedAttachments.length} file${uploadedAttachments.length === 1 ? "" : "s"}.`;
       const response = await sendVmAgentMessage(`${visibleText}${attachmentLine}`, selectedRunId);
       setVmAgent(response.status);
-      setVmAgentCursor(response.cursor);
+      setVmAgentCursorValue(response.cursor);
       beginPendingAgentReply(selectedRunId);
       const userMessage = [...(response.messages || [response.message])]
         .reverse()
@@ -741,25 +756,95 @@ export default function App() {
     void refreshRuns(true);
     void refreshVm();
     void handleRefreshVmAgentMessages(false);
-    setVmAgentStreamState("connecting");
-    const events = new EventSource(vmAgentMessageStreamUrl(vmAgentCursor));
-    events.addEventListener("messages", (event) => {
-      const data = JSON.parse((event as MessageEvent).data) as VmAgentHistoryResponse;
-      setVmAgent(data.status);
-      setVmAgentCursor(data.cursor);
-      mergeVmAgentMessages(data.messages);
-      const pendingSessionId = pendingReplySessionRef.current;
-      if (pendingSessionId && hasAgentReplyForSession(data.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
-      setVmAgentStreamState("live");
-    });
-    events.addEventListener("ping", () => setVmAgentStreamState("live"));
-    events.addEventListener("error", () => {
-      setVmAgentStreamState("disconnected");
-      clearPendingAgentReply();
-      events.close();
-    });
-    return () => events.close();
+
+    let closed = false;
+    let reconnectTimer: number | null = null;
+    let events: EventSource | null = null;
+    let reconnecting = false;
+
+    const scheduleReconnect = () => {
+      if (closed || reconnectTimer !== null) return;
+      setVmAgentStreamState("reconnecting");
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        reconnecting = true;
+        connect();
+      }, STREAM_RECONNECT_DELAY_MS);
+    };
+
+    const connect = () => {
+      if (closed) return;
+      events?.close();
+      setVmAgentStreamState(reconnecting ? "reconnecting" : "connecting");
+      const source = new EventSource(vmAgentMessageStreamUrl(vmAgentCursorRef.current));
+      events = source;
+
+      source.addEventListener("open", () => {
+        if (closed || events !== source) return;
+        reconnecting = false;
+        setVmAgentStreamState("live");
+      });
+      source.addEventListener("messages", (event) => {
+        if (closed || events !== source) return;
+        const data = JSON.parse((event as MessageEvent).data) as VmAgentHistoryResponse;
+        setVmAgent(data.status);
+        setVmAgentCursorValue(data.cursor);
+        mergeVmAgentMessages(data.messages);
+        const pendingSessionId = pendingReplySessionRef.current;
+        if (pendingSessionId && hasAgentReplyForSession(data.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
+        reconnecting = false;
+        setVmAgentStreamState("live");
+      });
+      source.addEventListener("ping", () => {
+        if (closed || events !== source) return;
+        reconnecting = false;
+        setVmAgentStreamState("live");
+      });
+      source.addEventListener("error", () => {
+        if (closed || events !== source) return;
+        source.close();
+        if (events === source) events = null;
+        reconnecting = true;
+        scheduleReconnect();
+      });
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      events?.close();
+    };
   }, [authKey]);
+
+  useEffect(() => {
+    if (!authKey || vmAgentStreamState === "live") return;
+    let closed = false;
+    let inFlight = false;
+    const interval = window.setInterval(() => {
+      if (closed || inFlight) return;
+      inFlight = true;
+      void getVmAgentMessages(vmAgentCursorRef.current, { limit: 100 })
+        .then((response) => {
+          if (closed) return;
+          setVmAgent(response.status);
+          setVmAgentCursorValue(response.cursor);
+          mergeVmAgentMessages(response.messages);
+          const pendingSessionId = pendingReplySessionRef.current;
+          if (pendingSessionId && hasAgentReplyForSession(response.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
+        })
+        .catch(() => {
+          if (!closed && vmAgentStreamState !== "reconnecting") setVmAgentStreamState("disconnected");
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    }, STREAM_FALLBACK_POLL_MS);
+    return () => {
+      closed = true;
+      window.clearInterval(interval);
+    };
+  }, [authKey, vmAgentStreamState]);
 
   useEffect(() => {
     if (!pendingReplySessionId || !authKey) return;
@@ -773,7 +858,7 @@ export default function App() {
         .then((response) => {
           if (closed) return;
           setVmAgent(response.status);
-          setVmAgentCursor(response.cursor);
+          setVmAgentCursorValue(response.cursor);
           mergeVmAgentMessages(response.messages);
           const waitingSessionId = pendingReplySessionRef.current;
           if (waitingSessionId && hasAgentReplyForSession(response.messages, waitingSessionId)) {
@@ -785,7 +870,7 @@ export default function App() {
           setPendingReplyRetryCount(nextRetry);
           if (nextRetry >= MAX_REPLY_RETRIES) {
             clearPendingAgentReply(waitingSessionId || undefined);
-            recordSystemNotice("No agent reply after 5 retries. Stopped waiting so the agent can be restarted manually.", "error");
+            recordSystemNotice("No agent reply after 30 minutes of fallback polling. Stopped waiting so the agent can be restarted manually.", "error");
           }
         })
         .catch((err) => {
@@ -815,7 +900,7 @@ export default function App() {
       .then((response) => {
         if (closed) return;
         setVmAgent(response.status);
-        setVmAgentCursor(response.cursor);
+        setVmAgentCursorValue(response.cursor);
         mergeVmAgentMessages(response.messages);
       })
       .catch((err) => {
@@ -952,7 +1037,7 @@ export default function App() {
               disabled={startAgentDisabled}
               title={waitingForAgentReply ? "Disabled while waiting for the current agent reply to avoid interrupting a long task." : undefined}
             >
-              {waitingForAgentReply ? `Waiting reply ${pendingReplyRetryCount}/${MAX_REPLY_RETRIES}` : vmAgentConnectLoading ? "Starting" : "Start agent"}
+              {waitingForAgentReply ? `Waiting reply ${formatReplyWait(pendingReplyRetryCount)}` : vmAgentConnectLoading ? "Starting" : "Start agent"}
             </button>
             {waitingForAgentReply && (
               <button className="secondary danger-button" onClick={forceStopPendingReply} type="button">
