@@ -1118,20 +1118,92 @@ a.attachment-chip {
   align-items: center;
   justify-content: space-between;
   gap: 0.65rem;
+  width: 100%;
+  min-height: 0;
+  min-width: 0;
+  border: 0;
+  border-radius: 10px;
+  padding: 0.1rem 0;
+  background: transparent;
+  color: var(--color-text);
+  box-shadow: none;
+  text-align: left;
+}
+
+.output-category-head:hover:not(:disabled) {
+  filter: none;
+  transform: none;
+}
+
+.output-category-title {
+  display: flex;
+  align-items: center;
+  gap: 0.42rem;
   min-width: 0;
 }
 
-.output-category-head h3 {
-  margin: 0;
+.output-category-chevron {
+  position: relative;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border: 1px solid rgba(15, 118, 110, 0.28);
+  border-radius: 999px;
+  background: var(--color-primary-soft);
+  transition: transform 180ms ease, background-color 180ms ease, border-color 180ms ease;
 }
 
-.output-category-head span {
+.output-category-chevron::before {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: 6px;
+  width: 5px;
+  height: 5px;
+  border-right: 2px solid var(--color-primary);
+  border-bottom: 2px solid var(--color-primary);
+  transform: rotate(45deg);
+}
+
+.output-category.collapsed .output-category-chevron {
+  transform: rotate(-90deg);
+}
+
+.output-category-head h3 {
+  overflow: hidden;
+  margin: 0;
+  font-size: 0.9rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.output-category-count {
+  flex: 0 0 auto;
   border-radius: 999px;
   background: var(--color-surface-2);
   color: var(--color-muted);
   padding: 0.12rem 0.42rem;
   font-size: 0.72rem;
   font-weight: 850;
+}
+
+.output-category-body {
+  max-height: 460px;
+  overflow: auto;
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
+  transition: max-height 220ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 170ms ease, transform 220ms ease, visibility 0s linear 0s;
+}
+
+.output-category.collapsed .output-category-body {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-5px);
+  visibility: hidden;
+  transition: max-height 220ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 170ms ease, transform 220ms ease, visibility 0s linear 220ms;
 }
 
 .output-file-tile {
@@ -1427,6 +1499,8 @@ a.attachment-chip {
 @media (prefers-reduced-motion: reduce) {
   .progress-panel,
   .progress-table-wrap,
+  .output-category-body,
+  .output-category-chevron,
   .session-menu,
   .session-menu-body,
   .menu-form,

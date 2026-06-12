@@ -510,6 +510,7 @@ export default function App() {
   const [vmAgentHistoryLoading, setVmAgentHistoryLoading] = useState(false);
   const [vmSessionFiles, setVmSessionFiles] = useState<VmSessionFilesResponse>({ categories: OUTPUT_CATEGORIES, files: [] });
   const [vmSessionFilesLoading, setVmSessionFilesLoading] = useState(false);
+  const [collapsedOutputCategories, setCollapsedOutputCategories] = useState<Partial<Record<VmSessionOutputCategory, boolean>>>({});
   const [messageSending, setMessageSending] = useState(false);
   const [attachmentUploading, setAttachmentUploading] = useState(false);
   const [pendingReplySessionId, setPendingReplySessionId] = useState<string | null>(null);
@@ -962,23 +963,47 @@ export default function App() {
     );
   }
 
+  function outputCategoryCollapsed(category: VmSessionOutputCategory): boolean {
+    return collapsedOutputCategories[category] ?? true;
+  }
+
+  function toggleOutputCategory(category: VmSessionOutputCategory) {
+    setCollapsedOutputCategories((current) => ({
+      ...current,
+      [category]: !(current[category] ?? true)
+    }));
+  }
+
   function renderVmSessionOutputBrowser() {
     const categories = vmSessionFiles.categories.length > 0 ? vmSessionFiles.categories : OUTPUT_CATEGORIES;
     return (
       <div className="session-output-browser">
-        {categories.map((category) => {
+        {categories.map((category, index) => {
           const files = vmSessionFiles.files.filter((file) => file.category === category);
+          const collapsed = outputCategoryCollapsed(category);
+          const bodyId = `output-category-${index}`;
           return (
-            <section className="output-category" key={category}>
-              <div className="output-category-head">
-                <h3>{category}</h3>
-                <span>{files.length}</span>
+            <section className={`output-category ${collapsed ? "collapsed" : ""}`} key={category}>
+              <button
+                aria-controls={bodyId}
+                aria-expanded={!collapsed}
+                className="output-category-head"
+                onClick={() => toggleOutputCategory(category)}
+                type="button"
+              >
+                <span className="output-category-title">
+                  <span className="output-category-chevron" aria-hidden="true" />
+                  <h3>{category}</h3>
+                </span>
+                <span className="output-category-count">{files.length}</span>
+              </button>
+              <div aria-hidden={collapsed} className="output-category-body" id={bodyId}>
+                {files.length > 0 ? (
+                  <div className="file-list">{files.map((file) => renderVmSessionFile(file))}</div>
+                ) : (
+                  <p className="empty-line">No files yet.</p>
+                )}
               </div>
-              {files.length > 0 ? (
-                <div className="file-list">{files.map((file) => renderVmSessionFile(file))}</div>
-              ) : (
-                <p className="empty-line">No files yet.</p>
-              )}
             </section>
           );
         })}
