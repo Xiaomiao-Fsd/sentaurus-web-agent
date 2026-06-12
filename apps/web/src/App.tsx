@@ -342,6 +342,7 @@ export default function App() {
   const [draggedRunId, setDraggedRunId] = useState<string | null>(null);
   const [dragOverRunId, setDragOverRunId] = useState<string | null>(null);
   const [sessionMenu, setSessionMenu] = useState<SessionMenuState | null>(null);
+  const [closingSessionMenu, setClosingSessionMenu] = useState<SessionMenuState | null>(null);
   const [renameTitle, setRenameTitle] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<File[]>([]);
   const [messageAttachments, setMessageAttachments] = useState<Record<string, UploadedAttachment[]>>({});
@@ -349,10 +350,12 @@ export default function App() {
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const pendingReplySessionRef = useRef<string | null>(null);
   const pendingReplyRetryRef = useRef(0);
+  const sessionMenuCloseTimerRef = useRef<number | null>(null);
 
   const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
-  const menuRun = useMemo(() => runs.find((run) => run.id === sessionMenu?.runId) || null, [runs, sessionMenu]);
+  const visibleSessionMenu = sessionMenu || closingSessionMenu;
+  const menuRun = useMemo(() => runs.find((run) => run.id === visibleSessionMenu?.runId) || null, [runs, visibleSessionMenu]);
   const currentMessages = useMemo(() => messagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
   const visibleMessages = useMemo(() => currentMessages.filter((message) => message.meta?.kind !== "progress"), [currentMessages]);
   const progressRows = useMemo(() => progressRowsForSession(vmAgentMessages, selectedRunId).slice(-12), [selectedRunId, vmAgentMessages]);
@@ -573,8 +576,28 @@ export default function App() {
     }
   }
 
+  function clearSessionMenuCloseTimer() {
+    if (sessionMenuCloseTimerRef.current !== null) {
+      window.clearTimeout(sessionMenuCloseTimerRef.current);
+      sessionMenuCloseTimerRef.current = null;
+    }
+  }
+
+  function closeSessionMenu() {
+    if (!sessionMenu) return;
+    clearSessionMenuCloseTimer();
+    setClosingSessionMenu(sessionMenu);
+    setSessionMenu(null);
+    sessionMenuCloseTimerRef.current = window.setTimeout(() => {
+      setClosingSessionMenu(null);
+      sessionMenuCloseTimerRef.current = null;
+    }, 180);
+  }
+
   function openSessionMenu(event: MouseEvent, runId: string) {
     event.preventDefault();
+    clearSessionMenuCloseTimer();
+    setClosingSessionMenu(null);
     setRenameTitle("");
     setSessionMenu({ runId, x: event.clientX, y: event.clientY, mode: "menu" });
   }
@@ -604,11 +627,11 @@ export default function App() {
     event.preventDefault();
     const title = renameTitle.trim();
     if (!title || title === run.title) {
-      setSessionMenu(null);
+      closeSessionMenu();
       setRenameTitle("");
       return;
     }
-    setSessionMenu(null);
+    closeSessionMenu();
     setPanelNotice({ kind: "info", text: "Renaming session..." });
     try {
       const result = await renameRun(run.id, title);
@@ -627,7 +650,7 @@ export default function App() {
   }
 
   async function handleDeleteSession(run: RunSummary) {
-    setSessionMenu(null);
+    closeSessionMenu();
     setPanelNotice({ kind: "info", text: "Deleting session..." });
     try {
       const nextSelectedRun = orderedRuns.find((item) => item.id !== run.id) || null;
@@ -678,7 +701,7 @@ export default function App() {
 
   useEffect(() => {
     if (!sessionMenu) return;
-    const close = () => setSessionMenu(null);
+    const close = () => closeSessionMenu();
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") close();
     };
@@ -691,6 +714,10 @@ export default function App() {
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [sessionMenu]);
+
+  useEffect(() => {
+    return () => clearSessionMenuCloseTimer();
+  }, []);
 
   useEffect(() => {
     const runIds = runs.map((run) => run.id);
@@ -955,34 +982,32 @@ export default function App() {
               </button>
             </div>
           </div>
-          {!progressCollapsed && (
-            <div className="progress-table-wrap" id="agent-progress-table">
-              <table className="progress-table">
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Stage</th>
-                    <th>Status</th>
-                    <th>Progress</th>
-                    <th>Detail</th>
+          <div className="progress-table-wrap" id="agent-progress-table" aria-hidden={progressCollapsed}>
+            <table className="progress-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Stage</th>
+                  <th>Status</th>
+                  <th>Progress</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {progressRows.length === 0 ? (
+                  <tr><td colSpan={5}>No progress events yet.</td></tr>
+                ) : progressRows.map((row) => (
+                  <tr className={`progress-${row.status}`} key={row.id}>
+                    <td title={row.vmCreatedAt ? `VM time: ${row.vmCreatedAt}` : undefined}>{formatDate(row.createdAt)}</td>
+                    <td>{progressLabel(row.stage)}</td>
+                    <td><span>{row.status}</span></td>
+                    <td>{row.progress === null ? "-" : `${row.progress}%`}</td>
+                    <td title={row.runId || undefined}>{row.detail}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {progressRows.length === 0 ? (
-                    <tr><td colSpan={5}>No progress events yet.</td></tr>
-                  ) : progressRows.map((row) => (
-                    <tr className={`progress-${row.status}`} key={row.id}>
-                      <td title={row.vmCreatedAt ? `VM time: ${row.vmCreatedAt}` : undefined}>{formatDate(row.createdAt)}</td>
-                      <td>{progressLabel(row.stage)}</td>
-                      <td><span>{row.status}</span></td>
-                      <td>{row.progress === null ? "-" : `${row.progress}%`}</td>
-                      <td title={row.runId || undefined}>{row.detail}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <div className="message-list">
@@ -1142,37 +1167,43 @@ export default function App() {
         )}
       </aside>
 
-      {sessionMenu && menuRun && (
-        <div className="session-menu" style={{ left: sessionMenu.x, top: sessionMenu.y }} onClick={(event) => event.stopPropagation()}>
+      {visibleSessionMenu && menuRun && (
+        <div
+          className={`session-menu ${closingSessionMenu && !sessionMenu ? "closing" : ""}`}
+          style={{ left: visibleSessionMenu.x, top: visibleSessionMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
           <strong>{menuRun.title}</strong>
-          {sessionMenu.mode === "menu" && (
-            <>
+          <div className="session-menu-body" key={visibleSessionMenu.mode}>
+            {visibleSessionMenu.mode === "menu" && (
+              <>
               <button onClick={() => showRenameSession(menuRun)}>Rename</button>
               <button className="danger-button" onClick={() => showDeleteSession(menuRun)}>Delete</button>
-            </>
-          )}
-          {sessionMenu.mode === "rename" && (
-            <form className="menu-form" onSubmit={(event) => void handleRenameSession(event, menuRun)}>
-              <label>
-                Session name
-                <input autoFocus value={renameTitle} onChange={(event) => setRenameTitle(event.target.value)} />
-              </label>
-              <div className="confirm-actions">
-                <button type="button" className="secondary" onClick={() => setSessionMenu((prev) => prev ? { ...prev, mode: "menu" } : prev)}>Cancel</button>
-                <button type="submit" disabled={!renameTitle.trim() || renameTitle.trim() === menuRun.title}>Save</button>
+              </>
+            )}
+            {visibleSessionMenu.mode === "rename" && (
+              <form className="menu-form" onSubmit={(event) => void handleRenameSession(event, menuRun)}>
+                <label>
+                  Session name
+                  <input autoFocus value={renameTitle} onChange={(event) => setRenameTitle(event.target.value)} />
+                </label>
+                <div className="confirm-actions">
+                  <button type="button" className="secondary" onClick={closeSessionMenu}>Cancel</button>
+                  <button type="submit" disabled={!renameTitle.trim() || renameTitle.trim() === menuRun.title}>Save</button>
+                </div>
+              </form>
+            )}
+            {visibleSessionMenu.mode === "delete" && (
+              <div className="menu-confirm danger">
+                <p>Delete this session and its local files?</p>
+                <span>This cannot be undone.</span>
+                <div className="confirm-actions">
+                  <button className="secondary" onClick={closeSessionMenu}>Cancel</button>
+                  <button className="danger-button" onClick={() => void handleDeleteSession(menuRun)}>Delete session</button>
+                </div>
               </div>
-            </form>
-          )}
-          {sessionMenu.mode === "delete" && (
-            <div className="menu-confirm danger">
-              <p>Delete this session and its local files?</p>
-              <span>This cannot be undone.</span>
-              <div className="confirm-actions">
-                <button className="secondary" onClick={() => setSessionMenu((prev) => prev ? { ...prev, mode: "menu" } : prev)}>Cancel</button>
-                <button className="danger-button" onClick={() => void handleDeleteSession(menuRun)}>Delete session</button>
-              </div>
-            </div>
-          )}
+            )}
+          </div>
           <dl>
             <dt>Created</dt><dd>{formatFullDate(menuRun.createdAt)}</dd>
             <dt>Updated</dt><dd>{formatFullDate(menuRun.updatedAt)}</dd>
