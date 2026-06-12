@@ -20,6 +20,7 @@ import {
   streamRunFile,
   updateRun
 } from "../services/runStore.js";
+import { syncInputFileToVmSession } from "../services/vmSessionFiles.js";
 
 type RunParams = { id: string };
 type FileParams = RunParams & { name: string };
@@ -88,6 +89,14 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
     }
     const saved = await saveInputFile(request.params.id, file.filename, file.file);
     await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] uploaded input/${saved.name}`);
+    try {
+      const localPath = await resolveRunFile(request.params.id, "input", saved.name);
+      await syncInputFileToVmSession(request.params.id, saved.name, localPath);
+      await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] synced input/${saved.name} to VM output/我的输入`);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] VM input sync failed for ${saved.name}: ${detail}`);
+    }
     return { file: saved, run: await getPublicRun(request.params.id) };
   });
 

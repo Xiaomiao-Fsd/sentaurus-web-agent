@@ -117,6 +117,12 @@ LLM_HARD_TIMEOUT_SECONDS = 120
 class HardTimeout(Exception):
     pass
 RUNS_DIR = os.path.join(HOME, "STDB", "web-agent-runs")
+SESSION_OUTPUT_ROOT = os.path.join(HOME, "STDB", "web-agent-sessions")
+OUTPUT_CATEGORY_INPUT = u"我的输入"
+OUTPUT_CATEGORY_RESULTS = u"仿真结果文件"
+OUTPUT_CATEGORY_LOGS = u"仿真日志文件"
+OUTPUT_CATEGORY_PARAMS = u"仿真参数文件"
+OUTPUT_CATEGORY_OTHER = u"其它文件"
 STOP_PATH = os.path.join(ROOT, "stop")
 
 try:
@@ -443,7 +449,7 @@ def run_step(run_dir, step, index, timeout_seconds=1800):
     }
 
 def collect_run_artifacts(run_dir, limit=80):
-    allowed = set([".log", ".out", ".err", ".plt", ".tdr", ".grd", ".dat", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".bnd", ".sat"])
+    allowed = set([".log", ".out", ".err", ".plt", ".tdr", ".grd", ".dat", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".bnd", ".sat", ".md", ".rst", ".sde"])
     artifacts = []
     for root, _dirs, files in os.walk(run_dir):
         for name in files:
@@ -460,6 +466,77 @@ def collect_run_artifacts(run_dir, limit=80):
             artifacts.append({"path": os.path.relpath(path, run_dir), "size": size})
     artifacts.sort(key=lambda item: item.get("path"))
     return artifacts[:limit]
+
+def output_category_for_artifact(rel_path):
+    lowered = safe_text(rel_path, 400).replace("\\", "/").lower()
+    name = os.path.basename(lowered)
+    ext = os.path.splitext(name)[1]
+    if lowered.startswith("logs/") or ext in [".log", ".out", ".err"] or name in ["run_result.json"]:
+        return OUTPUT_CATEGORY_LOGS
+    if ext in [".cmd", ".des", ".par", ".scm", ".tcl", ".sde"] or name in ["run_request.json", "setup.json"]:
+        return OUTPUT_CATEGORY_PARAMS
+    if ext in [".plt", ".tdr", ".grd", ".dat", ".csv", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bnd", ".sat"]:
+        return OUTPUT_CATEGORY_RESULTS
+    return OUTPUT_CATEGORY_OTHER
+
+def safe_artifact_rel_parts(rel_path):
+    parts = safe_text(rel_path, 500).replace("\\", "/").split("/")
+    clean = []
+    for part in parts:
+        if not part:
+            continue
+        clean.append(safe_file_name(part))
+    if not clean:
+        raise ValueError("empty artifact path")
+    return clean
+
+def sync_run_artifacts_to_session_output(session_id, run_id, run_dir, artifacts):
+    session_id = safe_text(session_id, 180).strip()
+    run_id = safe_text(run_id, 180).strip()
+    if not session_id or not re.match(r"^run_[A-Za-z0-9_-]+$", session_id):
+        return 0
+    synced = 0
+    root = os.path.abspath(os.path.join(SESSION_OUTPUT_ROOT, session_id, "output"))
+    for category in [OUTPUT_CATEGORY_INPUT, OUTPUT_CATEGORY_RESULTS, OUTPUT_CATEGORY_LOGS, OUTPUT_CATEGORY_PARAMS, OUTPUT_CATEGORY_OTHER]:
+        ensure_dir(os.path.join(root, category))
+    for item in artifacts or []:
+        rel_path = safe_text(item.get("path"), 500).replace("\\", "/")
+        try:
+            parts = safe_artifact_rel_parts(rel_path)
+            source = os.path.abspath(os.path.join(run_dir, *parts))
+            run_base = os.path.abspath(run_dir)
+            if source != run_base and not source.startswith(run_base + os.sep):
+                continue
+            if not os.path.isfile(source):
+                continue
+            category = output_category_for_artifact(rel_path)
+            dest = os.path.abspath(os.path.join(root, category, safe_file_name(run_id), *parts))
+            category_base = os.path.abspath(os.path.join(root, category))
+            if dest != category_base and not dest.startswith(category_base + os.sep):
+                continue
+            ensure_dir(os.path.dirname(dest))
+            shutil.copy2(source, dest)
+            synced += 1
+        except Exception as exc:
+            audit("session_output_sync_skipped", {"sessionId": session_id, "runId": run_id, "path": rel_path, "error": safe_text(str(exc), 400)})
+    if synced:
+        audit("session_output_synced", {"sessionId": session_id, "runId": run_id, "count": synced})
+    return synced
+
+def sync_session_setup_to_output(session_id, setup):
+    session_id = safe_text(session_id, 180).strip()
+    if not session_id or not setup or not re.match(r"^run_[A-Za-z0-9_-]+$", session_id):
+        return
+    try:
+        root = os.path.abspath(os.path.join(SESSION_OUTPUT_ROOT, session_id, "output", OUTPUT_CATEGORY_PARAMS))
+        ensure_dir(root)
+        target = os.path.abspath(os.path.join(root, "setup.json"))
+        if not target.startswith(root + os.sep):
+            return
+        write_utf8(target, json.dumps(setup, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+        audit("session_setup_synced", {"sessionId": session_id})
+    except Exception as exc:
+        audit("session_setup_sync_failed", {"sessionId": session_id, "error": safe_text(str(exc), 400)})
 
 def extract_run_request(reply):
     start_tag = "<SENTAURUS_RUN_REQUEST>"
@@ -619,12 +696,17 @@ def execute_run_request(request, session_id=""):
             append_progress(session_id, "sentaurus_step", "failed", "Step %s/%s: %s %s exit %s" % (index, step_count, result.get("tool"), result.get("input"), result.get("exitCode")), step_start_progress, run_id)
             break
         append_progress(session_id, "sentaurus_step", "completed", "Step %s/%s: %s %s exit 0 in %ss" % (index, step_count, result.get("tool"), result.get("input"), result.get("seconds")), min(95, step_start_progress + max(1, int(35 / float(step_count)))), run_id)
-    artifacts = collect_run_artifacts(run_dir)
     manifest["status"] = "succeeded" if ok else "failed"
     manifest["finishedAt"] = now_iso()
     manifest["stepResults"] = step_results
+    artifacts = collect_run_artifacts(run_dir)
     manifest["artifacts"] = artifacts
     write_utf8(os.path.join(run_dir, "run_result.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+    artifacts = collect_run_artifacts(run_dir)
+    manifest["artifacts"] = artifacts
+    manifest["sessionOutputSyncedCount"] = sync_run_artifacts_to_session_output(session_id, run_id, run_dir, artifacts)
+    write_utf8(os.path.join(run_dir, "run_result.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+    sync_run_artifacts_to_session_output(session_id, run_id, run_dir, [{"path": "run_result.json", "size": 0}])
     audit("sentaurus_run_finished", {"runId": run_id, "ok": ok, "steps": step_results})
     append_progress(session_id, "artifacts", "completed" if ok else "failed", "Collected %s artifact/log file(s)" % len(artifacts), 100 if ok else 95, run_id)
     return manifest
@@ -787,6 +869,10 @@ def build_repair_prompt(original_user_text, previous_run_request, result, attemp
         "- Use only allowed tools: sde, sprocess, sdevice, inspect.",
         "- Use only safe ASCII file names without spaces and extensions .cmd, .des, .par, .scm, .tcl, .txt, or .dat.",
         "- If convergence failed, adjust solver, physics, or sweep settings conservatively.",
+        "",
+        "Durable SDE/SDevice generation guardrails:",
+        deck_generation_guardrails(),
+        "",
         "- Do not ask the user for confirmation if a safe fix is possible.",
         "- Return a concise diagnostic plus exactly one corrected <SENTAURUS_RUN_REQUEST> JSON block.",
         "- You may also include one updated <SIMULATION_SETUP> JSON block.",
@@ -1005,6 +1091,7 @@ def skill_snapshot():
         "coreMission": "build Sentaurus simulation tasks, prepare decks/data, run allowlisted Sentaurus jobs, and export logs/artifacts/results",
         "safeSkills": ["vm_status", "sentaurus_tools", "list_agent_instances", "sentaurus_manual_context", "simulation_setup", "sentaurus_run_request"],
         "realJobExecution": "available through a VM-local allowlisted runner when the assistant emits a valid <SENTAURUS_RUN_REQUEST> JSON block; arbitrary shell is not allowed",
+        "deckGenerationGuardrails": deck_generation_guardrails(),
     }
 
 def wants_skill_reply(text):
@@ -1028,6 +1115,18 @@ def local_skill_reply(text):
     for name, path in sorted(snapshot.get("sentaurusTools").items()):
         lines.append("  - %s: %s" % (name, path or "not found"))
     return "\n".join(lines)
+
+def deck_generation_guardrails():
+    return "\n".join([
+        "- Prefer known-good minimal SDE/SDevice patterns over complex overlapping geometry.",
+        "- Never reuse the same name for a geometry region and a contact/electrode. Use region names like R.Source, R.Channel, R.Drain, R.GateOx, R.GatePoly and contact names like source, drain, gate, substrate.",
+        "- Avoid an explicit gate polysilicon region unless it is required; a top gate contact on oxide/channel boundary is safer for minimal 2D decks.",
+        "- Use non-overlapping source/channel/drain rectangles and simple oxide/body stacks to avoid ACIS PM_UNBALANCED_STATES failures.",
+        "- Prefer define-contact-set plus define-2d-contact on explicit edges. Avoid broad set-contact-boundary-edges patterns unless the edge selection is proven.",
+        "- Use a proven mesh sequence: (sde:save-model \"name\") then (sde:build-mesh \"snmesh\" \"-a\" \"name_msh\") or the known-good three-argument form (sde:build-mesh \"snmesh\" \"\" \"name\"). Never call (sde:build-mesh \"snmesh\" \"name\") because SDE treats the second argument as an option.",
+        "- For DIBL/Id-Vg, prefer two separate SDevice files or clearly separated solve sections for low/high drain bias. Add Inspect only after SDE and SDevice produce valid .plt files.",
+        "- If a previous run failed with duplicate region/contact names, PM_UNBALANCED_STATES, or unknown snmesh option, repair those exact patterns before changing physics goals.",
+    ])
 
 def chat_completions_url(api_base):
     base = api_base.rstrip("/")
@@ -1132,6 +1231,7 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
         "If the user says 'continue', 'that project', or similar, resolve it from the same-session context whenever possible. "
         "The browser and host backend only relay messages; API credentials stay inside this VM. "
         "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True) + "\n\n" +
+        "Durable SDE/SDevice generation guardrails:\n" + deck_generation_guardrails() + "\n\n" +
         "Recent browser-session context, newest last:\n" + recent_session_context + "\n\n" +
         "VM-local Sentaurus manual/context excerpts:\n" + manual_context
     )
@@ -1221,6 +1321,8 @@ def process_queue_file(path):
             append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
         if session_id:
             meta["sessionId"] = session_id
+            if simulation_setup:
+                sync_session_setup_to_output(session_id, simulation_setup)
         append_message("agent", reply, "vm-agent-worker", meta)
         shutil.move(path, os.path.join(DONE_DIR, os.path.basename(path)))
         audit("queue_processed", {"file": os.path.basename(path), "replyKind": meta.get("kind")})
@@ -1590,7 +1692,7 @@ def build_status():
         "version": AGENT_VERSION,
         "hostname": socket.gethostname(),
         "user": getpass.getuser(),
-        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "sentaurus_skills", "sentaurus_run_request", "sentaurus_autodebug"],
+        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "sentaurus_skills", "sentaurus_run_request", "sentaurus_autodebug", "sentaurus_session_output"],
         "instanceCount": len(instances),
         "latestInstance": instances[-1] if instances else None,
         "mailbox": "~/.sentaurus-web-agent/vm-agent",

@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
 import { connectVmAgent, downloadVmRunArtifact, getVmAgentMessages, getVmAgentStatus, sendVmAgentMessage } from "../services/vmAgent.js";
+import { contentTypeForName, downloadVmSessionFile, listVmSessionFiles } from "../services/vmSessionFiles.js";
 
 function parseCursor(value: unknown): number {
   if (typeof value !== "string") return 0;
@@ -80,11 +81,32 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
       throw error;
     }
     const artifact = await downloadVmRunArtifact(request.params.runId, artifactPath);
-    reply.header("content-type", "application/octet-stream");
+    reply.header("content-type", contentTypeForName(artifact.fileName));
     reply.header("content-length", String(artifact.data.byteLength));
     reply.header("x-vm-artifact-path", artifact.path);
     reply.header("content-disposition", `attachment; filename="${contentDispositionFileName(artifact.fileName)}"`);
     return reply.send(artifact.data);
+  });
+
+  app.get<{ Params: { sessionId: string }; Querystring: { token?: string } }>("/api/vm/agent/sessions/:sessionId/files", async (request) => {
+    requireAuth(request);
+    return listVmSessionFiles(request.params.sessionId);
+  });
+
+  app.get<{ Params: { sessionId: string }; Querystring: { category?: string; path?: string; token?: string } }>("/api/vm/agent/sessions/:sessionId/files/download", async (request, reply) => {
+    requireAuth(request);
+    if (!request.query.category || !request.query.path) {
+      const error = new Error("category and path are required") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    const file = await downloadVmSessionFile(request.params.sessionId, request.query.category, request.query.path);
+    reply.header("content-type", file.contentType);
+    reply.header("content-length", String(file.data.byteLength));
+    reply.header("x-vm-session-category", file.category);
+    reply.header("x-vm-session-path", file.path);
+    reply.header("content-disposition", `attachment; filename="${contentDispositionFileName(file.fileName)}"`);
+    return reply.send(file.data);
   });
 
   app.get<{ Querystring: { after?: string; token?: string } }>("/api/vm/agent/messages/stream", async (request, reply) => {

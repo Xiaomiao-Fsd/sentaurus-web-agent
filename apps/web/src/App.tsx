@@ -10,6 +10,9 @@ import type {
   VmAgentMessage,
   VmRunArtifact,
   VmAgentStatus,
+  VmSessionFilesResponse,
+  VmSessionOutputCategory,
+  VmSessionOutputFile,
   VmStatus
 } from "@sentaurus-agent/shared";
 import {
@@ -20,6 +23,7 @@ import {
   getAuthToken,
   getHealth,
   getRun,
+  getVmSessionFiles,
   getVmAgentMessages,
   getVmAgentStatus,
   getVmStatus,
@@ -30,7 +34,8 @@ import {
   setAuthToken,
   uploadRunFile,
   vmAgentMessageStreamUrl,
-  vmRunArtifactDownloadUrl
+  vmRunArtifactDownloadUrl,
+  vmSessionFileDownloadUrl
 } from "./lib/api.js";
 import { errorMessage, formatBytes, formatCompactNumber, formatDate, formatFullDate, normalizeAuthToken, shortId } from "./utils/format.js";
 
@@ -87,12 +92,19 @@ type UploadedAttachment = {
   uploadedAt: string;
 };
 
+type ImagePreview = {
+  src: string;
+  title: string;
+  downloadUrl: string;
+};
+
 const REFERENCE_CONTEXT_TOKENS = 272_000;
 const REPLY_RETRY_INTERVAL_MS = 10_000;
 const MAX_REPLY_RETRIES = 180;
 const STREAM_RECONNECT_DELAY_MS = 3_000;
 const STREAM_FALLBACK_POLL_MS = 10_000;
 const SESSION_ORDER_KEY = "sentaurus_session_order";
+const OUTPUT_CATEGORIES: VmSessionOutputCategory[] = ["我的输入", "仿真结果文件", "仿真日志文件", "仿真参数文件", "其它文件"];
 const QUICK_PROMPTS: QuickPrompt[] = [
   {
     label: "Set bias",
@@ -220,6 +232,10 @@ function simulationSetupRows(setup: SimulationSetup | null): Array<{ label: stri
 
 function expectedOutputsForSetup(setup: SimulationSetup | null): string[] {
   return setup?.expectedOutputs?.length ? setup.expectedOutputs : EXPECTED_OUTPUTS;
+}
+
+function isImagePath(filePath: string): boolean {
+  return /\.(png|jpe?g|webp|gif)$/i.test(filePath);
 }
 
 function messageRunId(message: VmAgentMessage): string | null {
@@ -492,6 +508,8 @@ export default function App() {
   const [vmAgentStatusLoading, setVmAgentStatusLoading] = useState(false);
   const [vmAgentConnectLoading, setVmAgentConnectLoading] = useState(false);
   const [vmAgentHistoryLoading, setVmAgentHistoryLoading] = useState(false);
+  const [vmSessionFiles, setVmSessionFiles] = useState<VmSessionFilesResponse>({ categories: OUTPUT_CATEGORIES, files: [] });
+  const [vmSessionFilesLoading, setVmSessionFilesLoading] = useState(false);
   const [messageSending, setMessageSending] = useState(false);
   const [attachmentUploading, setAttachmentUploading] = useState(false);
   const [pendingReplySessionId, setPendingReplySessionId] = useState<string | null>(null);
@@ -512,6 +530,7 @@ export default function App() {
   const [pendingAttachments, setPendingAttachments] = useState<File[]>([]);
   const [messageAttachments, setMessageAttachments] = useState<Record<string, UploadedAttachment[]>>({});
   const [messageDisplayOverrides, setMessageDisplayOverrides] = useState<Record<string, string>>({});
+  const [imagePreview, setImagePreview] = useState<ImagePreview | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const pendingReplySessionRef = useRef<string | null>(null);
   const pendingReplyRetryRef = useRef(0);
@@ -531,6 +550,10 @@ export default function App() {
   const simulationRows = useMemo(() => simulationSetupRows(currentSimulationSetup), [currentSimulationSetup]);
   const expectedOutputs = useMemo(() => expectedOutputsForSetup(currentSimulationSetup), [currentSimulationSetup]);
   const vmRunArtifacts = useMemo(() => vmArtifactsForSession(currentMessages), [currentMessages]);
+  const latestRunMessageKey = useMemo(() => {
+    const latest = [...currentMessages].reverse().find((message) => message.meta?.kind === "sentaurus_run");
+    return latest ? `${latest.id}:${latest.meta?.vmRunArtifactCount ?? ""}:${latest.meta?.autoDebugAttemptCount ?? ""}` : "";
+  }, [currentMessages]);
   const latestProgress = progressRows.at(-1);
   const globalMessages = useMemo(() => globalAgentMessages(vmAgentMessages).slice(-6), [vmAgentMessages]);
   const contextStats = useMemo(() => estimateContextUsage(visibleMessages), [visibleMessages]);
@@ -689,6 +712,7 @@ export default function App() {
         });
       }
       if (uploadedAttachments.length > 0) await refreshRunDetail(selectedRunId);
+      if (uploadedAttachments.length > 0) await refreshVmSessionFiles(selectedRunId, false);
 
       const attachmentLine = uploadedAttachments.length > 0
         ? `\n\nAttachments uploaded to this session: ${uploadedAttachments.map((file) => file.name).join(", ")}.`
@@ -736,6 +760,18 @@ export default function App() {
       setSelectedRunId(detail.run.id);
     } catch (err) {
       recordError(err);
+    }
+  }
+
+  async function refreshVmSessionFiles(id = selectedRunId, showBusy = true) {
+    if (!id || !authKey) return;
+    if (showBusy) setVmSessionFilesLoading(true);
+    try {
+      setVmSessionFiles(await getVmSessionFiles(id));
+    } catch (err) {
+      recordError(err);
+    } finally {
+      if (showBusy) setVmSessionFilesLoading(false);
     }
   }
 
@@ -868,6 +904,22 @@ export default function App() {
     );
   }
 
+  function renderImagePreview(src: string, title: string, downloadHref: string) {
+    return (
+      <span className="image-preview-card">
+        <button
+          className="image-thumb-button"
+          onClick={() => setImagePreview({ src, title, downloadUrl: downloadHref })}
+          title={title}
+          type="button"
+        >
+          <img alt={title} loading="lazy" src={src} />
+        </button>
+        <a className="image-download-link" href={downloadHref} rel="noreferrer" target="_blank">Download</a>
+      </span>
+    );
+  }
+
   function renderVmArtifactList(files: SessionVmArtifact[]) {
     if (files.length === 0) return <p className="empty-line">No VM artifacts yet.</p>;
     return (
@@ -885,6 +937,51 @@ export default function App() {
             <small>{formatBytes(file.size)} - {file.attempt ? `attempt ${file.attempt}` : file.status || "artifact"} - {shortId(file.runId)}</small>
           </a>
         ))}
+      </div>
+    );
+  }
+
+  function renderVmSessionFile(file: VmSessionOutputFile) {
+    const href = selectedRunId ? vmSessionFileDownloadUrl(selectedRunId, file.category, file.path) : "";
+    if (file.isImage && href) {
+      return (
+        <div className="output-file-tile image-file-tile" key={`${file.category}:${file.path}`}>
+          {renderImagePreview(href, file.name, href)}
+          <div>
+            <span>{file.path}</span>
+            <small>{formatBytes(file.size)} - {formatDate(file.modifiedAt)}</small>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <a className="file-row" href={href} key={`${file.category}:${file.path}`} rel="noreferrer" target="_blank" title={`${file.category}/${file.path}`}>
+        <span>{file.path}</span>
+        <small>{formatBytes(file.size)} - {formatDate(file.modifiedAt)}</small>
+      </a>
+    );
+  }
+
+  function renderVmSessionOutputBrowser() {
+    const categories = vmSessionFiles.categories.length > 0 ? vmSessionFiles.categories : OUTPUT_CATEGORIES;
+    return (
+      <div className="session-output-browser">
+        {categories.map((category) => {
+          const files = vmSessionFiles.files.filter((file) => file.category === category);
+          return (
+            <section className="output-category" key={category}>
+              <div className="output-category-head">
+                <h3>{category}</h3>
+                <span>{files.length}</span>
+              </div>
+              {files.length > 0 ? (
+                <div className="file-list">{files.map((file) => renderVmSessionFile(file))}</div>
+              ) : (
+                <p className="empty-line">No files yet.</p>
+              )}
+            </section>
+          );
+        })}
       </div>
     );
   }
@@ -1097,6 +1194,7 @@ export default function App() {
   useEffect(() => {
     if (!selectedRunId || !authKey) {
       setRunDetail(null);
+      setVmSessionFiles({ categories: OUTPUT_CATEGORIES, files: [] });
       return;
     }
     let closed = false;
@@ -1111,6 +1209,16 @@ export default function App() {
       closed = true;
     };
   }, [selectedRunId, authKey]);
+
+  useEffect(() => {
+    if (!selectedRunId || !authKey) return;
+    void refreshVmSessionFiles(selectedRunId);
+  }, [selectedRunId, authKey]);
+
+  useEffect(() => {
+    if (!selectedRunId || !authKey || !latestRunMessageKey) return;
+    void refreshVmSessionFiles(selectedRunId, false);
+  }, [selectedRunId, authKey, latestRunMessageKey]);
 
   useEffect(() => {
     if (!authKey || !selectedRunId || !messageSimulationSetup) return;
@@ -1324,23 +1432,35 @@ export default function App() {
                   {(attachments.length > 0 || messageVmArtifacts.length > 0) && (
                     <div className="message-attachments">
                       {attachments.map((file) => (
-                        <span className="attachment-chip" key={file.id}>
-                          <span>{file.name}</span>
-                          <small>{formatBytes(file.size)}</small>
-                        </span>
+                        isImagePath(file.name) && selectedRunId ? (
+                          <span className="chat-image-with-link" key={file.id}>
+                            {renderImagePreview(downloadUrl(selectedRunId, "files", file.name), file.name, downloadUrl(selectedRunId, "files", file.name))}
+                          </span>
+                        ) : (
+                          <span className="attachment-chip" key={file.id}>
+                            <span>{file.name}</span>
+                            <small>{formatBytes(file.size)}</small>
+                          </span>
+                        )
                       ))}
                       {visibleVmArtifacts.map((file) => (
-                        <a
-                          className="attachment-chip artifact-chip"
-                          href={vmRunArtifactDownloadUrl(file.runId, file.path)}
-                          key={`${file.runId}:${file.path}`}
-                          rel="noreferrer"
-                          target="_blank"
-                          title={`${file.runId}/${file.path}`}
-                        >
-                          <span>{file.path}</span>
-                          <small>{file.attempt ? `try ${file.attempt} / ${formatBytes(file.size)}` : formatBytes(file.size)}</small>
-                        </a>
+                        isImagePath(file.path) ? (
+                          <span className="chat-image-with-link" key={`${file.runId}:${file.path}`}>
+                            {renderImagePreview(vmRunArtifactDownloadUrl(file.runId, file.path), file.path, vmRunArtifactDownloadUrl(file.runId, file.path))}
+                          </span>
+                        ) : (
+                          <a
+                            className="attachment-chip artifact-chip"
+                            href={vmRunArtifactDownloadUrl(file.runId, file.path)}
+                            key={`${file.runId}:${file.path}`}
+                            rel="noreferrer"
+                            target="_blank"
+                            title={`${file.runId}/${file.path}`}
+                          >
+                            <span>{file.path}</span>
+                            <small>{file.attempt ? `try ${file.attempt} / ${formatBytes(file.size)}` : formatBytes(file.size)}</small>
+                          </a>
+                        )
                       ))}
                       {messageVmArtifacts.length > visibleVmArtifacts.length && (
                         <span className="attachment-chip muted-chip">
@@ -1461,12 +1581,17 @@ export default function App() {
 
         <section className="inspector-card">
           <div className="section-head">
-            <h2>Expected Outputs</h2>
-            {runDetail && <button className="link-button" onClick={() => void refreshRunDetail()}>Refresh</button>}
+            <h2>Output Files</h2>
+            {selectedRunId && (
+              <button className="link-button" onClick={() => { void refreshRunDetail(); void refreshVmSessionFiles(); }} disabled={vmSessionFilesLoading}>
+                {vmSessionFilesLoading ? "Loading" : "Refresh"}
+              </button>
+            )}
           </div>
           <div className="output-targets">
             {expectedOutputs.map((item) => <span key={item}>{item}</span>)}
           </div>
+          {renderVmSessionOutputBrowser()}
           <h3>Host artifacts</h3>
           {runDetail ? renderArtifactList(runDetail.artifacts) : <p className="empty-line">Select a session to view generated outputs.</p>}
           <h3>VM run artifacts</h3>
@@ -1482,6 +1607,21 @@ export default function App() {
           </section>
         )}
       </aside>
+
+      {imagePreview && (
+        <div className="image-lightbox" onClick={() => setImagePreview(null)}>
+          <div className="image-lightbox-body" onClick={(event) => event.stopPropagation()}>
+            <div className="section-head">
+              <h2>{imagePreview.title}</h2>
+              <div className="confirm-actions">
+                <a className="link-button image-lightbox-download" href={imagePreview.downloadUrl} rel="noreferrer" target="_blank">Download</a>
+                <button className="secondary" onClick={() => setImagePreview(null)} type="button">Close</button>
+              </div>
+            </div>
+            <img alt={imagePreview.title} src={imagePreview.src} />
+          </div>
+        </div>
+      )}
 
       {visibleSessionMenu && menuRun && (
         <div

@@ -2,7 +2,9 @@ import type {
   VmAgentConnectResponse,
   VmAgentHistoryResponse,
   VmAgentMessageResponse,
-  VmAgentStatus
+  VmAgentStatus,
+  VmSessionOutputCategory,
+  VmSessionFilesResponse
 } from "@sentaurus-agent/shared";
 import { apiUrl, requestJson, tokenQuery } from "./client.js";
 
@@ -31,4 +33,12 @@ export function vmAgentMessageStreamUrl(after = 0): string {
 
 export function vmRunArtifactDownloadUrl(runId: string, artifactPath: string): string {
   return apiUrl(`/api/vm/agent/runs/${encodeURIComponent(runId)}/artifacts?path=${encodeURIComponent(artifactPath)}&token=${tokenQuery()}`);
+}
+
+export async function getVmSessionFiles(sessionId: string): Promise<VmSessionFilesResponse> {
+  return requestJson(`/api/vm/agent/sessions/${encodeURIComponent(sessionId)}/files`);
+}
+
+export function vmSessionFileDownloadUrl(sessionId: string, category: VmSessionOutputCategory, filePath: string): string {
+  return apiUrl(`/api/vm/agent/sessions/${encodeURIComponent(sessionId)}/files/download?category=${encodeURIComponent(category)}&path=${encodeURIComponent(filePath)}&token=${tokenQuery()}`);
 }

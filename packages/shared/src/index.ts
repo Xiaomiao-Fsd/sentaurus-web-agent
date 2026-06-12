@@ -128,6 +128,22 @@ export type VmRunArtifact = {
   size: number;
 };
 
+export type VmSessionOutputCategory = "我的输入" | "仿真结果文件" | "仿真日志文件" | "仿真参数文件" | "其它文件";
+
+export type VmSessionOutputFile = {
+  category: VmSessionOutputCategory;
+  path: string;
+  name: string;
+  size: number;
+  modifiedAt: string;
+  isImage: boolean;
+};
+
+export type VmSessionFilesResponse = {
+  categories: VmSessionOutputCategory[];
+  files: VmSessionOutputFile[];
+};
+
 export type RunSummary = {
   id: string;
   status: RunStatus;
