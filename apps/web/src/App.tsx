@@ -380,6 +380,7 @@ function progressLabel(stage: string): string {
     llm_context: "Context",
     llm: "LLM",
     reply: "Reply",
+    final: "Final",
     runner: "Runner",
     autodebug: "Auto-debug",
     repair_llm: "Repair LLM",
@@ -485,6 +486,15 @@ function formatReplyWait(retryCount: number): string {
   return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
+function isSentaurusRunCompletion(message: VmAgentMessage): boolean {
+  return message.role === "agent" && message.meta?.kind === "sentaurus_run";
+}
+
+function sentaurusRunStatus(message: VmAgentMessage): string | null {
+  const value = message.meta?.runStatus ?? message.meta?.vmRunStatus;
+  return typeof value === "string" ? value : null;
+}
+
 function hasAgentReplyForSession(messages: VmAgentMessage[] | undefined, sessionId: string): boolean {
   return !!messages?.some((message) => {
     const isAgentReply = message.role === "agent";
@@ -536,8 +546,12 @@ export default function App() {
   const pendingReplySessionRef = useRef<string | null>(null);
   const pendingReplyRetryRef = useRef(0);
   const vmAgentCursorRef = useRef(0);
+  const selectedRunIdRef = useRef<string | null>(null);
+  const notifiedCompletionIdsRef = useRef<Set<string>>(new Set());
   const sessionMenuCloseTimerRef = useRef<number | null>(null);
   const setupSyncKeyRef = useRef("");
+
+  selectedRunIdRef.current = selectedRunId;
 
   const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
@@ -616,6 +630,35 @@ export default function App() {
     recordSystemNotice(errorMessage(err), "error");
   }
 
+  function handleVmAgentMessageBatch(batch: VmAgentMessage[] | undefined) {
+    if (!batch?.length) return;
+    for (const message of batch) {
+      if (!isSentaurusRunCompletion(message)) continue;
+      if (notifiedCompletionIdsRef.current.has(message.id)) continue;
+      notifiedCompletionIdsRef.current.add(message.id);
+
+      const sessionId = messageSessionId(message);
+      const runStatus = sentaurusRunStatus(message);
+      const ok = runStatus === "succeeded";
+      setPanelNotice({
+        kind: ok ? "success" : "error",
+        text: ok
+          ? "Sentaurus simulation completed. Final result has been appended to the chat."
+          : "Sentaurus simulation finished with errors. Check the final result message and logs."
+      });
+      if (sessionId && sessionId === selectedRunIdRef.current) {
+        void refreshRunDetail(sessionId);
+        void refreshVmSessionFiles(sessionId, false);
+      }
+      void refreshRuns();
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification(ok ? "Sentaurus simulation completed" : "Sentaurus simulation finished with errors", {
+          body: sessionId ? `Session ${shortId(sessionId)} - ${runStatus || "finished"}` : runStatus || "finished"
+        });
+      }
+    }
+  }
+
   async function saveToken() {
     const next = normalizeAuthToken(authInput);
     setAuthInput(next);
@@ -662,9 +705,11 @@ export default function App() {
     setVmAgentConnectLoading(true);
     try {
       const response = await connectVmAgent();
+      const messages = response.messages || (response.message ? [response.message] : []);
       setVmAgent(response.status);
       setVmAgentCursorValue(response.cursor || 0);
-      mergeVmAgentMessages(response.messages || (response.message ? [response.message] : []));
+      mergeVmAgentMessages(messages);
+      handleVmAgentMessageBatch(messages);
       setPanelNotice({ kind: "success", text: "VM agent connection refreshed." });
     } catch (err) {
       recordError(err);
@@ -682,6 +727,7 @@ export default function App() {
       setVmAgent(response.status);
       setVmAgentCursorValue(response.cursor);
       mergeVmAgentMessages(response.messages);
+      handleVmAgentMessageBatch(response.messages);
     } catch (err) {
       recordError(err);
     } finally {
@@ -720,18 +766,20 @@ export default function App() {
         : "";
       const visibleText = text || `Attached ${uploadedAttachments.length} file${uploadedAttachments.length === 1 ? "" : "s"}.`;
       const response = await sendVmAgentMessage(`${visibleText}${attachmentLine}`, selectedRunId);
+      const messages = response.messages || [response.message];
       setVmAgent(response.status);
       setVmAgentCursorValue(response.cursor);
       beginPendingAgentReply(selectedRunId);
-      const userMessage = [...(response.messages || [response.message])]
+      const userMessage = [...messages]
         .reverse()
         .find((message) => message.role === "user" && messageBelongsToSession(message, selectedRunId));
       if (userMessage && uploadedAttachments.length > 0) {
         setMessageAttachments((prev) => ({ ...prev, [userMessage.id]: uploadedAttachments }));
         setMessageDisplayOverrides((prev) => ({ ...prev, [userMessage.id]: visibleText }));
       }
-      mergeVmAgentMessages(response.messages || [response.message]);
-      if (hasAgentReplyForSession(response.messages || [response.message], selectedRunId)) clearPendingAgentReply(selectedRunId);
+      mergeVmAgentMessages(messages);
+      handleVmAgentMessageBatch(messages);
+      if (hasAgentReplyForSession(messages, selectedRunId)) clearPendingAgentReply(selectedRunId);
     } catch (err) {
       recordError(err);
       clearPendingAgentReply(selectedRunId);
@@ -1095,6 +1143,7 @@ export default function App() {
         setVmAgent(data.status);
         setVmAgentCursorValue(data.cursor);
         mergeVmAgentMessages(data.messages);
+        handleVmAgentMessageBatch(data.messages);
         const pendingSessionId = pendingReplySessionRef.current;
         if (pendingSessionId && hasAgentReplyForSession(data.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
         reconnecting = false;
@@ -1135,6 +1184,7 @@ export default function App() {
           setVmAgent(response.status);
           setVmAgentCursorValue(response.cursor);
           mergeVmAgentMessages(response.messages);
+          handleVmAgentMessageBatch(response.messages);
           const pendingSessionId = pendingReplySessionRef.current;
           if (pendingSessionId && hasAgentReplyForSession(response.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
         })
@@ -1165,6 +1215,7 @@ export default function App() {
           setVmAgent(response.status);
           setVmAgentCursorValue(response.cursor);
           mergeVmAgentMessages(response.messages);
+          handleVmAgentMessageBatch(response.messages);
           const waitingSessionId = pendingReplySessionRef.current;
           if (waitingSessionId && hasAgentReplyForSession(response.messages, waitingSessionId)) {
             clearPendingAgentReply(waitingSessionId);
@@ -1207,6 +1258,7 @@ export default function App() {
         setVmAgent(response.status);
         setVmAgentCursorValue(response.cursor);
         mergeVmAgentMessages(response.messages);
+        handleVmAgentMessageBatch(response.messages);
       })
       .catch((err) => {
         if (!closed) recordError(err);

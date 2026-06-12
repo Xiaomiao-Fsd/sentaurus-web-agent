@@ -48,7 +48,7 @@ type RemoteAgentPayload = {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.4.4";
+const agentVersion = "0.4.5";
 const maxVmArtifactBytes = 50 * 1024 * 1024;
 const vmArtifactExtensions = new Set([
   ".log",
@@ -101,7 +101,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.4"
+AGENT_VERSION = "0.4.5"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -714,7 +714,8 @@ def execute_run_request(request, session_id=""):
 def format_run_result(result):
     lines = []
     ok = result.get("status") == "succeeded"
-    lines.append("Sentaurus allowlisted runner %s." % ("completed successfully" if ok else "finished with errors"))
+    lines.append("Sentaurus simulation completed." if ok else "Sentaurus simulation finished with errors.")
+    lines.append("The VM agent has finished the allowlisted run and this is the final result notification.")
     lines.append("- run id: %s" % result.get("id"))
     lines.append("- status: %s" % result.get("status"))
     lines.append("- VM directory: %s" % os.path.join(RUNS_DIR, result.get("id")))
@@ -1172,7 +1173,7 @@ def call_llm_model(user_text, config, model, system):
         request = urllib2.Request(responses_url(config.get("api_base")), body, {
             "content-type": "application/json",
             "authorization": "Bearer %s" % config.get("api_key"),
-            "user-agent": "sentaurus-vm-agent/0.4.4",
+            "user-agent": "sentaurus-vm-agent/0.4.5",
         })
         response = urllib2.urlopen(request, timeout=90).read()
         try:
@@ -1196,7 +1197,7 @@ def call_llm_model(user_text, config, model, system):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.4.4",
+        "user-agent": "sentaurus-vm-agent/0.4.5",
     })
     response = urllib2.urlopen(request, timeout=90).read()
     try:
@@ -1313,6 +1314,7 @@ def process_queue_file(path):
             meta["vmRunArtifactsJson"] = json.dumps(artifacts, ensure_ascii=True, sort_keys=True)
             meta["autoDebugAttemptCount"] = len(attempts)
             meta["autoDebugAttemptsJson"] = json.dumps(attempts_meta(attempts), ensure_ascii=True, sort_keys=True)
+            append_progress(session_id, "final", "completed" if result.get("status") == "succeeded" else "failed", "Final simulation result appended to chat", 100, result.get("id") or "")
             if stop_reason:
                 meta["autoDebugStoppedReason"] = stop_reason
             if simulation_setup:
@@ -1369,7 +1371,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.4"
+AGENT_VERSION = "0.4.5"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 
