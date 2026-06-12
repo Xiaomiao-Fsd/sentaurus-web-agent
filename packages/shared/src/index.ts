@@ -40,6 +40,7 @@ export type VmAgentStatus = {
   llmConfigured?: boolean;
   llmModel?: string;
   llmModels?: string[];
+  maxAutodebugAttempts?: number;
   manualCount?: number;
   manualFiles?: string[];
   queueDepth?: number;

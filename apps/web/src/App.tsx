@@ -68,6 +68,7 @@ type ProgressRow = {
 type SessionVmArtifact = VmRunArtifact & {
   runId: string;
   status?: string;
+  attempt?: number;
   messageId: string;
   createdAt: string;
 };
@@ -227,19 +228,44 @@ function messageRunId(message: VmAgentMessage): string | null {
 }
 
 function vmArtifactsForMessage(message: VmAgentMessage): SessionVmArtifact[] {
+  const artifacts: SessionVmArtifact[] = [];
+  const attempts = parseJsonValue<unknown[]>(metaString(message, "autoDebugAttemptsJson"));
+  if (Array.isArray(attempts)) {
+    for (const attempt of attempts) {
+      if (!attempt || typeof attempt !== "object") continue;
+      const attemptRecord = attempt as { attempt?: unknown; runId?: unknown; status?: unknown; artifacts?: unknown };
+      const runId = setupText(attemptRecord.runId);
+      if (!runId || !Array.isArray(attemptRecord.artifacts)) continue;
+      const attemptNo = typeof attemptRecord.attempt === "number" && Number.isFinite(attemptRecord.attempt) ? attemptRecord.attempt : undefined;
+      const status = setupText(attemptRecord.status);
+      for (const item of attemptRecord.artifacts) {
+        if (!item || typeof item !== "object") continue;
+        const record = item as Partial<VmRunArtifact>;
+        const artifactPath = setupText(record.path);
+        if (!artifactPath) continue;
+        const size = typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0;
+        artifacts.push({ path: artifactPath, size, runId, status, attempt: attemptNo, messageId: message.id, createdAt: message.createdAt });
+      }
+    }
+  }
+
   const runId = messageRunId(message);
-  if (!runId) return [];
   const parsed = parseJsonValue<unknown[]>(metaString(message, "vmRunArtifactsJson"));
-  if (!Array.isArray(parsed)) return [];
-  const status = metaString(message, "vmRunStatus") || metaString(message, "runStatus") || undefined;
-  return parsed.flatMap((item) => {
-    if (!item || typeof item !== "object") return [];
-    const record = item as Partial<VmRunArtifact>;
-    const artifactPath = setupText(record.path);
-    if (!artifactPath) return [];
-    const size = typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0;
-    return [{ path: artifactPath, size, runId, status, messageId: message.id, createdAt: message.createdAt }];
-  });
+  if (runId && Array.isArray(parsed)) {
+    const status = metaString(message, "vmRunStatus") || metaString(message, "runStatus") || undefined;
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as Partial<VmRunArtifact>;
+      const artifactPath = setupText(record.path);
+      if (!artifactPath) continue;
+      const size = typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0;
+      artifacts.push({ path: artifactPath, size, runId, status, messageId: message.id, createdAt: message.createdAt });
+    }
+  }
+
+  const byKey = new Map<string, SessionVmArtifact>();
+  for (const artifact of artifacts) byKey.set(`${artifact.runId}:${artifact.path}`, artifact);
+  return [...byKey.values()];
 }
 
 function vmArtifactsForSession(messages: VmAgentMessage[]): SessionVmArtifact[] {
@@ -339,6 +365,8 @@ function progressLabel(stage: string): string {
     llm: "LLM",
     reply: "Reply",
     runner: "Runner",
+    autodebug: "Auto-debug",
+    repair_llm: "Repair LLM",
     runner_prepare: "Prepare",
     sentaurus_step: "Sentaurus",
     artifacts: "Artifacts",
@@ -854,7 +882,7 @@ export default function App() {
             title={`${file.runId}/${file.path}`}
           >
             <span>{file.path}</span>
-            <small>{formatBytes(file.size)} - {file.status || "artifact"} - {shortId(file.runId)}</small>
+            <small>{formatBytes(file.size)} - {file.attempt ? `attempt ${file.attempt}` : file.status || "artifact"} - {shortId(file.runId)}</small>
           </a>
         ))}
       </div>
@@ -1311,7 +1339,7 @@ export default function App() {
                           title={`${file.runId}/${file.path}`}
                         >
                           <span>{file.path}</span>
-                          <small>{formatBytes(file.size)}</small>
+                          <small>{file.attempt ? `try ${file.attempt} / ${formatBytes(file.size)}` : formatBytes(file.size)}</small>
                         </a>
                       ))}
                       {messageVmArtifacts.length > visibleVmArtifacts.length && (

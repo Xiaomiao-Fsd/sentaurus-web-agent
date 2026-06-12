@@ -30,6 +30,7 @@ type RemoteAgentPayload = {
   llmConfigured?: boolean;
   llmModel?: string;
   llmModels?: string[];
+  maxAutodebugAttempts?: number;
   manualCount?: number;
   manualFiles?: string[];
   queueDepth?: number;
@@ -270,6 +271,18 @@ def model_candidates(primary_model, configured_models):
         models = ["gpt-5.5"]
     return models
 
+def config_int(env, file_config, env_key, file_key, fallback, minimum, maximum):
+    raw = env.get(env_key)
+    if raw is None:
+        raw = file_config.get(file_key)
+    if raw is None:
+        raw = file_config.get(env_key)
+    try:
+        value = int(raw)
+    except Exception:
+        value = fallback
+    return max(minimum, min(maximum, value))
+
 def load_config():
     env = read_env_file(ENV_PATH)
     file_config = {}
@@ -287,6 +300,7 @@ def load_config():
         "model": primary_model,
         "models": model_candidates(primary_model, raw_models),
         "api_style": env.get("LLM_API_STYLE") or file_config.get("llmApiStyle") or file_config.get("LLM_API_STYLE") or "chat-completions",
+        "max_autodebug_attempts": config_int(env, file_config, "VM_AGENT_MAX_AUTODEBUG_ATTEMPTS", "vmAgentMaxAutodebugAttempts", 5, 1, 8),
     }
 
 def llm_configured(config):
@@ -408,6 +422,7 @@ def run_step(run_dir, step, index, timeout_seconds=1800):
                     "seconds": int(time.time() - started),
                     "stdout": os.path.relpath(stdout_path, run_dir),
                     "stderr": os.path.relpath(stderr_path, run_dir),
+                    "stdoutTail": read_file_tail(stdout_path),
                     "stderrTail": read_file_tail(stderr_path),
                 }
             time.sleep(0.5)
@@ -423,6 +438,7 @@ def run_step(run_dir, step, index, timeout_seconds=1800):
         "seconds": int(time.time() - started),
         "stdout": os.path.relpath(stdout_path, run_dir),
         "stderr": os.path.relpath(stderr_path, run_dir),
+        "stdoutTail": read_file_tail(stdout_path),
         "stderrTail": read_file_tail(stderr_path),
     }
 
@@ -632,6 +648,231 @@ def format_run_result(result):
     if len(artifacts) > 18:
         lines.append("  - ... %s more" % (len(artifacts) - 18))
     return "\n".join(lines)
+
+def run_dir_for_result(result):
+    run_id = safe_text(result.get("id"), 180).strip()
+    return os.path.join(RUNS_DIR, run_id) if run_id else ""
+
+def first_failed_step(result):
+    for step in result.get("stepResults") or []:
+        if step.get("timedOut") or step.get("exitCode") != 0:
+            return step
+    return None
+
+def safe_read_run_file(result, rel_path, limit=8000):
+    run_dir = os.path.abspath(run_dir_for_result(result))
+    rel_path = safe_text(rel_path, 240).strip().replace("\\", "/")
+    if not run_dir or not rel_path or os.path.isabs(rel_path) or ".." in rel_path.split("/"):
+        return ""
+    target = os.path.abspath(os.path.join(run_dir, rel_path))
+    if target != run_dir and not target.startswith(run_dir + os.sep):
+        return ""
+    return read_file_tail(target, limit)
+
+def request_file_content(run_request, name, limit=8000):
+    name = safe_text(name, 180).strip()
+    for item in run_request.get("files") or []:
+        if isinstance(item, dict) and safe_text(item.get("name"), 180).strip() == name:
+            return safe_text(item.get("content"), limit)
+    return ""
+
+def step_diagnostic(step):
+    if not step:
+        return "no failed step recorded"
+    parts = [
+        "%s %s" % (step.get("tool"), step.get("input")),
+        "exit %s" % step.get("exitCode"),
+    ]
+    if step.get("timedOut"):
+        parts.append("timed out")
+    if step.get("stderrTail"):
+        parts.append("stderr: %s" % safe_text(step.get("stderrTail").replace("\n", " | "), 500))
+    elif step.get("stdoutTail"):
+        parts.append("stdout: %s" % safe_text(step.get("stdoutTail").replace("\n", " | "), 500))
+    return "; ".join(parts)
+
+def attempt_summary_line(result):
+    attempt = result.get("autoDebugAttempt") or "?"
+    failed = first_failed_step(result)
+    suffix = " ok" if result.get("status") == "succeeded" else " failed: " + step_diagnostic(failed)
+    return "attempt %s run %s status %s%s" % (attempt, result.get("id"), result.get("status"), suffix)
+
+def attempts_meta(attempts):
+    items = []
+    for result in attempts:
+        failed = first_failed_step(result)
+        failed_item = None
+        if failed:
+            failed_item = {
+                "tool": failed.get("tool"),
+                "input": failed.get("input"),
+                "exitCode": failed.get("exitCode"),
+                "timedOut": bool(failed.get("timedOut")),
+                "stderrTail": safe_text((failed.get("stderrTail") or "").replace("\n", " | "), 500),
+            }
+        items.append({
+            "attempt": result.get("autoDebugAttempt"),
+            "runId": result.get("id"),
+            "status": result.get("status"),
+            "failedStep": failed_item,
+            "artifacts": result.get("artifacts") or [],
+        })
+    return items
+
+def is_recoverable_run_failure(result):
+    if result.get("status") != "failed":
+        return False
+    failed = first_failed_step(result)
+    if not failed:
+        return False
+    text = ("%s\n%s" % (failed.get("stderrTail") or "", failed.get("stdoutTail") or "")).lower()
+    nonrecoverable = [
+        "license",
+        "no space left",
+        "disk quota",
+        "permission denied",
+        "operation not permitted",
+        "command not found",
+        "not found in path",
+        "sentaurus tool not found",
+        "killed",
+    ]
+    return not any(marker in text for marker in nonrecoverable)
+
+def build_repair_prompt(original_user_text, previous_run_request, result, attempts):
+    failed = first_failed_step(result)
+    failed_input = safe_text(failed.get("input"), 180).strip() if failed else ""
+    failed_deck = safe_read_run_file(result, failed_input, 12000) if failed_input else ""
+    if not failed_deck and failed_input:
+        failed_deck = request_file_content(previous_run_request, failed_input, 12000)
+    artifacts = result.get("artifacts") or []
+    artifact_lines = []
+    for item in artifacts[:40]:
+        artifact_lines.append("- %s (%s bytes)" % (item.get("path"), item.get("size")))
+    history_lines = [attempt_summary_line(item) for item in attempts]
+    lines = [
+        "Auto-debug a failed Sentaurus allowlisted runner attempt and produce a corrected run request.",
+        "",
+        "Original user request:",
+        safe_text(original_user_text, 3000),
+        "",
+        "Attempt history:",
+        "\n".join(history_lines) or "none",
+        "",
+        "Failed attempt:",
+        "- run id: %s" % result.get("id"),
+        "- status: %s" % result.get("status"),
+        "- VM directory: %s" % run_dir_for_result(result),
+        "- failed step: %s" % step_diagnostic(failed),
+        "",
+        "Previous run request JSON:",
+        safe_text(json.dumps(previous_run_request, ensure_ascii=True, indent=2, sort_keys=True), 16000),
+        "",
+        "Failed input deck content (%s):" % (failed_input or "unknown"),
+        safe_text(failed_deck, 12000) or "(not readable)",
+        "",
+        "Failed step stdout tail:",
+        safe_text((failed or {}).get("stdoutTail"), 3000) or "(empty)",
+        "",
+        "Failed step stderr tail:",
+        safe_text((failed or {}).get("stderrTail"), 5000) or "(empty)",
+        "",
+        "Generated artifacts/logs from failed attempt:",
+        "\n".join(artifact_lines) or "(none)",
+        "",
+        "Repair instructions:",
+        "- Diagnose the concrete deck/syntax/contact/solve/convergence issue from the logs.",
+        "- Keep the original simulation goal and change only what is necessary.",
+        "- Do not use shell commands or unsafe paths.",
+        "- Use only allowed tools: sde, sprocess, sdevice, inspect.",
+        "- Use only safe ASCII file names without spaces and extensions .cmd, .des, .par, .scm, .tcl, .txt, or .dat.",
+        "- If convergence failed, adjust solver, physics, or sweep settings conservatively.",
+        "- Do not ask the user for confirmation if a safe fix is possible.",
+        "- Return a concise diagnostic plus exactly one corrected <SENTAURUS_RUN_REQUEST> JSON block.",
+        "- You may also include one updated <SIMULATION_SETUP> JSON block.",
+    ]
+    return "\n".join(lines)
+
+def format_autodebug_reply(visible_reply, attempts, stop_reason, repair_notes):
+    final = attempts[-1] if attempts else {}
+    if len(attempts) <= 1 and final.get("status") == "succeeded":
+        return (visible_reply + "\n\n" if visible_reply else "") + format_run_result(final)
+    lines = []
+    if visible_reply:
+        lines.append(safe_text(visible_reply, 1400))
+        lines.append("")
+    if final.get("status") == "succeeded":
+        lines.append("Auto-debug completed successfully.")
+        lines.append("- attempts: %s" % len(attempts))
+        lines.append("- successful run id: %s" % final.get("id"))
+    else:
+        lines.append("Auto-debug stopped after %s attempt(s)." % len(attempts))
+        lines.append("- reason: %s" % (stop_reason or "retry budget reached"))
+        lines.append("- last run id: %s" % final.get("id"))
+        lines.append("- last status: %s" % final.get("status"))
+    failed_attempts = [item for item in attempts if item.get("status") != "succeeded"]
+    if failed_attempts:
+        lines.append("- failed attempts:")
+        for item in failed_attempts:
+            failed = first_failed_step(item)
+            lines.append("  - attempt %s: %s (%s)" % (item.get("autoDebugAttempt"), item.get("id"), step_diagnostic(failed)))
+    if repair_notes:
+        lines.append("- repair notes:")
+        for note in repair_notes[-3:]:
+            lines.append("  - %s" % safe_text(note.replace("\n", " | "), 500))
+    lines.append("")
+    lines.append(format_run_result(final))
+    if final.get("status") != "succeeded":
+        lines.append("")
+        lines.append("Suggested next step: review the failed deck/logs above or provide the missing process/device assumptions so the next repair has better constraints.")
+    return "\n".join(lines)
+
+def run_with_autodebug(original_user_text, initial_run_request, visible_reply, session_id, current_message_id, initial_setup=None):
+    config = load_config()
+    max_attempts = int(config.get("max_autodebug_attempts") or 5)
+    run_request = initial_run_request
+    attempts = []
+    repair_notes = []
+    latest_setup = initial_setup
+    stop_reason = ""
+    for attempt_no in range(1, max_attempts + 1):
+        append_progress(session_id, "runner", "running", "Attempt %s/%s: executing allowlisted Sentaurus run request" % (attempt_no, max_attempts), 45, "")
+        result = execute_run_request(run_request, session_id)
+        result["autoDebugAttempt"] = attempt_no
+        attempts.append(result)
+        if result.get("status") == "succeeded":
+            if attempt_no > 1:
+                append_progress(session_id, "autodebug", "completed", "Auto-debug succeeded on attempt %s/%s" % (attempt_no, max_attempts), 100, result.get("id"))
+            return format_autodebug_reply(visible_reply, attempts, "", repair_notes), result, attempts, latest_setup, ""
+        if attempt_no >= max_attempts:
+            stop_reason = "retry budget reached"
+            break
+        if not is_recoverable_run_failure(result):
+            stop_reason = "failure was not considered safely recoverable"
+            break
+        append_progress(session_id, "autodebug", "running", "Attempt %s failed; diagnosing logs and repairing deck" % attempt_no, 95, result.get("id"))
+        repair_prompt = build_repair_prompt(original_user_text, run_request, result, attempts)
+        try:
+            repair_reply, _repair_meta = run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent auto-debug repair LLM call", call_llm, repair_prompt, config, session_id, current_message_id)
+            repair_setup, repair_without_setup = extract_json_tag(repair_reply, "SIMULATION_SETUP")
+            if repair_setup:
+                latest_setup = normalize_simulation_setup(repair_setup)
+            next_run_request, repair_visible = extract_run_request(repair_without_setup)
+            if repair_visible:
+                repair_notes.append(repair_visible)
+            if not next_run_request:
+                stop_reason = "repair LLM did not produce a corrected run request"
+                append_progress(session_id, "repair_llm", "failed", stop_reason, 100, result.get("id"))
+                break
+            run_request = next_run_request
+            append_progress(session_id, "repair_llm", "completed", "Repair request ready for attempt %s/%s" % (attempt_no + 1, max_attempts), 45, result.get("id"))
+        except Exception as exc:
+            stop_reason = "repair LLM failed: %s" % safe_text(str(exc), 500)
+            append_progress(session_id, "repair_llm", "failed", stop_reason, 100, result.get("id"))
+            break
+    final = attempts[-1] if attempts else {}
+    append_progress(session_id, "autodebug", "failed", stop_reason or "auto-debug stopped without a successful run", 100, final.get("id"))
+    return format_autodebug_reply(visible_reply, attempts, stop_reason, repair_notes), final, attempts, latest_setup, stop_reason
 
 def list_instances():
     root = os.path.join(HOME, "STDB", "agent_instances")
@@ -961,9 +1202,7 @@ def process_queue_file(path):
         else:
             append_progress(session_id, "llm", "completed", "LLM produced %s" % ("a Sentaurus run request" if run_request else "a chat reply"), 35)
         if run_request:
-            append_progress(session_id, "runner", "running", "Executing allowlisted Sentaurus run request", 45)
-            result = execute_run_request(run_request, session_id)
-            reply = (visible_reply + "\n\n" if visible_reply else "") + format_run_result(result)
+            reply, result, attempts, simulation_setup, stop_reason = run_with_autodebug(text, run_request, visible_reply, session_id, item.get("id") or "", simulation_setup)
             artifacts = result.get("artifacts") or []
             meta["kind"] = "sentaurus_run"
             meta["runId"] = result.get("id")
@@ -972,6 +1211,12 @@ def process_queue_file(path):
             meta["vmRunStatus"] = result.get("status")
             meta["vmRunArtifactCount"] = len(artifacts)
             meta["vmRunArtifactsJson"] = json.dumps(artifacts, ensure_ascii=True, sort_keys=True)
+            meta["autoDebugAttemptCount"] = len(attempts)
+            meta["autoDebugAttemptsJson"] = json.dumps(attempts_meta(attempts), ensure_ascii=True, sort_keys=True)
+            if stop_reason:
+                meta["autoDebugStoppedReason"] = stop_reason
+            if simulation_setup:
+                meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
         elif meta.get("kind") != "llm_error":
             append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
         if session_id:
@@ -1215,6 +1460,18 @@ def model_candidates(primary_model, configured_models):
         models = ["gpt-5.5"]
     return models
 
+def config_int(env, file_config, env_key, file_key, fallback, minimum, maximum):
+    raw = env.get(env_key)
+    if raw is None:
+        raw = file_config.get(file_key)
+    if raw is None:
+        raw = file_config.get(env_key)
+    try:
+        value = int(raw)
+    except Exception:
+        value = fallback
+    return max(minimum, min(maximum, value))
+
 def load_config():
     env = read_env_file(ENV_PATH)
     file_config = {}
@@ -1232,6 +1489,7 @@ def load_config():
         "model": primary_model,
         "models": model_candidates(primary_model, raw_models),
         "api_style": env.get("LLM_API_STYLE") or file_config.get("llmApiStyle") or file_config.get("LLM_API_STYLE") or "chat-completions",
+        "max_autodebug_attempts": config_int(env, file_config, "VM_AGENT_MAX_AUTODEBUG_ATTEMPTS", "vmAgentMaxAutodebugAttempts", 5, 1, 8),
     }
 
 def llm_configured():
@@ -1276,11 +1534,12 @@ def write_worker_files():
                 "llmApiKey": "put-real-key-here-inside-vm-only",
                 "llmModel": "gpt-5.5",
                 "llmModels": ["gpt-5.5", "gpt-5.4"],
-                "llmApiStyle": "chat-completions"
+                "llmApiStyle": "chat-completions",
+                "vmAgentMaxAutodebugAttempts": 5
             }, indent=2, sort_keys=True) + "\n")
     if not os.path.exists(ENV_EXAMPLE_PATH):
         with open(ENV_EXAMPLE_PATH, "w") as handle:
-            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_MODELS=gpt-5.5,gpt-5.4\nLLM_API_STYLE=chat-completions\n")
+            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_MODELS=gpt-5.5,gpt-5.4\nLLM_API_STYLE=chat-completions\nVM_AGENT_MAX_AUTODEBUG_ATTEMPTS=5\n")
 
 def stop_worker(pid):
     if not pid:
@@ -1331,7 +1590,7 @@ def build_status():
         "version": AGENT_VERSION,
         "hostname": socket.gethostname(),
         "user": getpass.getuser(),
-        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "sentaurus_skills", "sentaurus_run_request"],
+        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "sentaurus_skills", "sentaurus_run_request", "sentaurus_autodebug"],
         "instanceCount": len(instances),
         "latestInstance": instances[-1] if instances else None,
         "mailbox": "~/.sentaurus-web-agent/vm-agent",
@@ -1341,6 +1600,7 @@ def build_status():
         "llmConfigured": bool(llm_config.get("api_base") and llm_config.get("api_key")),
         "llmModel": llm_config.get("model"),
         "llmModels": llm_config.get("models"),
+        "maxAutodebugAttempts": llm_config.get("max_autodebug_attempts"),
         "manualCount": len(manuals),
         "manualFiles": manuals[:20],
         "queueDepth": queue_depth(),
@@ -1637,6 +1897,7 @@ function toStatus(payload: RemoteAgentPayload): VmAgentStatus {
     llmConfigured: payload.llmConfigured,
     llmModel: payload.llmModel,
     llmModels: payload.llmModels,
+    maxAutodebugAttempts: payload.maxAutodebugAttempts,
     manualCount: payload.manualCount,
     manualFiles: payload.manualFiles,
     queueDepth: payload.queueDepth,
