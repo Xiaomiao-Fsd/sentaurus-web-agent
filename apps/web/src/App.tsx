@@ -75,8 +75,9 @@ type UploadedAttachment = {
 };
 
 const REFERENCE_CONTEXT_TOKENS = 272_000;
-const REPLY_RETRY_INTERVAL_MS = 30_000;
-const MAX_REPLY_RETRIES = 5;
+const REPLY_RETRY_INTERVAL_MS = 10_000;
+const MAX_REPLY_RETRIES = 180;
+const VM_AGENT_STREAM_RECONNECT_MS = 3_000;
 const SESSION_ORDER_KEY = "sentaurus_session_order";
 const QUICK_PROMPTS: QuickPrompt[] = [
   {
@@ -320,6 +321,7 @@ export default function App() {
   const [messageAttachments, setMessageAttachments] = useState<Record<string, UploadedAttachment[]>>({});
   const [messageDisplayOverrides, setMessageDisplayOverrides] = useState<Record<string, string>>({});
   const messageEndRef = useRef<HTMLDivElement | null>(null);
+  const vmAgentCursorRef = useRef(0);
   const pendingReplySessionRef = useRef<string | null>(null);
   const pendingReplyRetryRef = useRef(0);
 
@@ -371,6 +373,12 @@ export default function App() {
 
   function mergeVmAgentMessages(next: VmAgentMessage[] | undefined) {
     setVmAgentMessages((prev) => mergeMessageList(prev, next));
+  }
+
+  function updateVmAgentCursor(cursor: number | undefined) {
+    const nextCursor = cursor || 0;
+    vmAgentCursorRef.current = nextCursor;
+    setVmAgentCursor(nextCursor);
   }
 
   function recordSystemNotice(text: string, kind: PanelNotice["kind"] = "info") {
@@ -429,7 +437,7 @@ export default function App() {
     try {
       const response = await connectVmAgent();
       setVmAgent(response.status);
-      setVmAgentCursor(response.cursor || 0);
+      updateVmAgentCursor(response.cursor);
       mergeVmAgentMessages(response.messages || (response.message ? [response.message] : []));
       setPanelNotice({ kind: "success", text: "VM agent connection refreshed." });
     } catch (err) {
@@ -444,7 +452,7 @@ export default function App() {
     try {
       const response = await getVmAgentMessages(0);
       setVmAgent(response.status);
-      setVmAgentCursor(response.cursor);
+      updateVmAgentCursor(response.cursor);
       mergeVmAgentMessages(response.messages);
     } catch (err) {
       recordError(err);
@@ -484,7 +492,7 @@ export default function App() {
       const visibleText = text || `Attached ${uploadedAttachments.length} file${uploadedAttachments.length === 1 ? "" : "s"}.`;
       const response = await sendVmAgentMessage(`${visibleText}${attachmentLine}`, selectedRunId);
       setVmAgent(response.status);
-      setVmAgentCursor(response.cursor);
+      updateVmAgentCursor(response.cursor);
       beginPendingAgentReply(selectedRunId);
       const userMessage = [...(response.messages || [response.message])]
         .reverse()
@@ -682,24 +690,46 @@ export default function App() {
     void refreshRuns(true);
     void refreshVm();
     void handleRefreshVmAgentMessages(false);
-    setVmAgentStreamState("connecting");
-    const events = new EventSource(vmAgentMessageStreamUrl(vmAgentCursor));
-    events.addEventListener("messages", (event) => {
-      const data = JSON.parse((event as MessageEvent).data) as VmAgentHistoryResponse;
-      setVmAgent(data.status);
-      setVmAgentCursor(data.cursor);
-      mergeVmAgentMessages(data.messages);
-      const pendingSessionId = pendingReplySessionRef.current;
-      if (pendingSessionId && hasAgentReplyForSession(data.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
-      setVmAgentStreamState("live");
-    });
-    events.addEventListener("ping", () => setVmAgentStreamState("live"));
-    events.addEventListener("error", () => {
-      setVmAgentStreamState("disconnected");
-      clearPendingAgentReply();
+    let closed = false;
+    let reconnectTimer: number | undefined;
+    let events: EventSource | null = null;
+
+    const closeStream = () => {
+      if (!events) return;
       events.close();
-    });
-    return () => events.close();
+      events = null;
+    };
+
+    const connectStream = () => {
+      if (closed) return;
+      closeStream();
+      setVmAgentStreamState("connecting");
+      events = new EventSource(vmAgentMessageStreamUrl(vmAgentCursorRef.current));
+      events.addEventListener("messages", (event) => {
+        const data = JSON.parse((event as MessageEvent).data) as VmAgentHistoryResponse;
+        setVmAgent(data.status);
+        updateVmAgentCursor(data.cursor);
+        mergeVmAgentMessages(data.messages);
+        const pendingSessionId = pendingReplySessionRef.current;
+        if (pendingSessionId && hasAgentReplyForSession(data.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
+        setVmAgentStreamState("live");
+      });
+      events.addEventListener("ping", () => setVmAgentStreamState("live"));
+      events.addEventListener("error", () => {
+        if (closed) return;
+        closeStream();
+        setVmAgentStreamState("reconnecting");
+        if (reconnectTimer) window.clearTimeout(reconnectTimer);
+        reconnectTimer = window.setTimeout(connectStream, VM_AGENT_STREAM_RECONNECT_MS);
+      });
+    };
+
+    connectStream();
+    return () => {
+      closed = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      closeStream();
+    };
   }, [authKey]);
 
   useEffect(() => {
@@ -713,7 +743,7 @@ export default function App() {
         .then((response) => {
           if (closed) return;
           setVmAgent(response.status);
-          setVmAgentCursor(response.cursor);
+          updateVmAgentCursor(response.cursor);
           mergeVmAgentMessages(response.messages);
           const waitingSessionId = pendingReplySessionRef.current;
           if (waitingSessionId && hasAgentReplyForSession(response.messages, waitingSessionId)) {
@@ -725,7 +755,7 @@ export default function App() {
           setPendingReplyRetryCount(nextRetry);
           if (nextRetry >= MAX_REPLY_RETRIES) {
             clearPendingAgentReply(waitingSessionId || undefined);
-            recordSystemNotice("No agent reply after 5 retries. Stopped waiting so the agent can be restarted manually.", "error");
+            recordSystemNotice("No agent reply after a long wait. Stopped waiting so the agent can be restarted manually.", "error");
           }
         })
         .catch((err) => {
