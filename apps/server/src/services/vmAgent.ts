@@ -48,7 +48,7 @@ type RemoteAgentPayload = {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.4.6";
+const agentVersion = "0.4.7";
 const maxVmArtifactBytes = 50 * 1024 * 1024;
 const vmArtifactExtensions = new Set([
   ".log",
@@ -101,7 +101,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.6"
+AGENT_VERSION = "0.4.7"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -1352,7 +1352,7 @@ def call_llm_model(user_text, config, model, system):
         request = urllib2.Request(responses_url(config.get("api_base")), body, {
             "content-type": "application/json",
             "authorization": "Bearer %s" % config.get("api_key"),
-            "user-agent": "sentaurus-vm-agent/0.4.6",
+            "user-agent": "sentaurus-vm-agent/0.4.7",
         })
         response = urllib2.urlopen(request, timeout=90).read()
         try:
@@ -1376,7 +1376,7 @@ def call_llm_model(user_text, config, model, system):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.4.6",
+        "user-agent": "sentaurus-vm-agent/0.4.7",
     })
     response = urllib2.urlopen(request, timeout=90).read()
     try:
@@ -1574,7 +1574,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.6"
+AGENT_VERSION = "0.4.7"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 
