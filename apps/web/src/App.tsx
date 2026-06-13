@@ -528,6 +528,10 @@ export default function App() {
   const [pendingReplyRetryCount, setPendingReplyRetryCount] = useState(0);
   const [vmAgentStreamState, setVmAgentStreamState] = useState("idle");
   const [progressCollapsed, setProgressCollapsed] = useState(true);
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
+  const [mobileLeftPanelOpen, setMobileLeftPanelOpen] = useState(false);
+  const [mobileRightPanelOpen, setMobileRightPanelOpen] = useState(false);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
@@ -616,6 +620,11 @@ export default function App() {
     if (!pendingReplySessionRef.current) return;
     clearPendingAgentReply();
     recordSystemNotice("Stopped waiting for the current agent reply. You can restart the agent if needed.", "error");
+  }
+
+  function closeMobilePanels() {
+    setMobileLeftPanelOpen(false);
+    setMobileRightPanelOpen(false);
   }
 
   function mergeVmAgentMessages(next: VmAgentMessage[] | undefined) {
@@ -1085,6 +1094,15 @@ export default function App() {
   }, [sessionMenu]);
 
   useEffect(() => {
+    if (!mobileLeftPanelOpen && !mobileRightPanelOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeMobilePanels();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [mobileLeftPanelOpen, mobileRightPanelOpen]);
+
+  useEffect(() => {
     return () => clearSessionMenuCloseTimer();
   }, []);
 
@@ -1328,9 +1346,38 @@ export default function App() {
     messageEndRef.current?.scrollIntoView({ block: "end" });
   }, [currentMessages.length, selectedRunId]);
 
+  const shellClassName = [
+    "app-shell",
+    leftPanelCollapsed ? "left-collapsed" : "",
+    rightPanelCollapsed ? "right-collapsed" : "",
+    mobileLeftPanelOpen ? "mobile-left-open" : "",
+    mobileRightPanelOpen ? "mobile-right-open" : ""
+  ].filter(Boolean).join(" ");
+
   return (
-    <main className="app-shell">
+    <main className={shellClassName}>
       <header className="top-status-bar">
+        <button
+          aria-controls="session-sidebar"
+          aria-expanded={!leftPanelCollapsed}
+          className="secondary desktop-panel-toggle"
+          onClick={() => setLeftPanelCollapsed((collapsed) => !collapsed)}
+          type="button"
+        >
+          {leftPanelCollapsed ? "Show sessions" : "Hide sessions"}
+        </button>
+        <button
+          aria-controls="session-sidebar"
+          aria-expanded={mobileLeftPanelOpen}
+          className="secondary mobile-panel-trigger"
+          onClick={() => {
+            setMobileRightPanelOpen(false);
+            setMobileLeftPanelOpen(true);
+          }}
+          type="button"
+        >
+          Sessions
+        </button>
         <div className="brand-lockup">
           <span className="brand-mark">S</span>
           <div>
@@ -1344,10 +1391,39 @@ export default function App() {
           <span className={statusPillClass(workerRunning)}><i />Agent {vmAgent?.workerRunning ? "Running" : vmAgent ? "Stopped" : vmAgentStreamState}</span>
           <span className={statusPillClass(llmConfigured, vmAgent && !vmAgent.llmConfigured ? true : false)}><i />LLM {vmAgent?.llmConfigured ? "Configured" : "Pending"}</span>
           <span className={statusPillClass(clockSkewOk, clockSkewWarning)} title={vmAgent?.vmTime ? `VM time: ${vmAgent.vmTime}` : undefined}><i />Clock {clockSkewLabel}</span>
+          <button
+            aria-controls="inspector-panel"
+            aria-expanded={!rightPanelCollapsed}
+            className="secondary desktop-panel-toggle"
+            onClick={() => setRightPanelCollapsed((collapsed) => !collapsed)}
+            type="button"
+          >
+            {rightPanelCollapsed ? "Show details" : "Hide details"}
+          </button>
         </div>
+        <button
+          aria-controls="inspector-panel"
+          aria-expanded={mobileRightPanelOpen}
+          className="secondary mobile-panel-trigger"
+          onClick={() => {
+            setMobileLeftPanelOpen(false);
+            setMobileRightPanelOpen(true);
+          }}
+          type="button"
+        >
+          Details
+        </button>
       </header>
 
-      <aside className="session-sidebar">
+      {(mobileLeftPanelOpen || mobileRightPanelOpen) && (
+        <button className="drawer-backdrop" onClick={closeMobilePanels} type="button" aria-label="Close side panel" />
+      )}
+
+      <aside className="session-sidebar" id="session-sidebar" aria-label="Sessions panel">
+        <div className="drawer-panel-head">
+          <strong>Sessions</strong>
+          <button className="secondary" onClick={closeMobilePanels} type="button">Close</button>
+        </div>
         <section className="auth-card">
           <label htmlFor="auth-token-input">AUTH_TOKEN</label>
           <div className="auth-input-row">
@@ -1380,7 +1456,10 @@ export default function App() {
               className={`session-card ${selectedRunId === run.id ? "selected" : ""} ${draggedRunId === run.id ? "dragging" : ""} ${dragOverRunId === run.id ? "drag-over" : ""}`}
               draggable
               key={run.id}
-              onClick={() => setSelectedRunId(run.id)}
+              onClick={() => {
+                setSelectedRunId(run.id);
+                setMobileLeftPanelOpen(false);
+              }}
               onContextMenu={(event) => openSessionMenu(event, run.id)}
               onDragStart={() => setDraggedRunId(run.id)}
               onDragOver={(event) => {
@@ -1608,7 +1687,11 @@ export default function App() {
         </form>
       </section>
 
-      <aside className="inspector-panel">
+      <aside className="inspector-panel" id="inspector-panel" aria-label="Details panel">
+        <div className="drawer-panel-head">
+          <strong>Details</strong>
+          <button className="secondary" onClick={closeMobilePanels} type="button">Close</button>
+        </div>
         <section className="inspector-card context-card">
           <div className="section-head">
             <h2>Context Usage</h2>
