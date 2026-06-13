@@ -1,6 +1,6 @@
 {
   "name": "sentaurus-web-agent",
-  "version": "0.4.4",
+  "version": "0.4.7",
   "private": true,
   "packageManager": "npm@11.6.2",
   "description": "Browser dashboard/chat for a Sentaurus TCAD agent bridge.",

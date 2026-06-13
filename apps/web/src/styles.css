@@ -212,6 +212,10 @@ code {
 }
 
 .mobile-panel-trigger,
+.mobile-session-strip,
+.mobile-composer-toolbar,
+.mobile-attach-row,
+.mobile-progress-backdrop,
 .drawer-panel-head,
 .drawer-backdrop {
   display: none;
@@ -564,7 +568,7 @@ code {
   backdrop-filter: blur(14px);
 }
 
-.chat-header > div:first-child {
+.chat-title-details {
   display: grid;
   gap: 0.38rem;
   min-width: 0;
@@ -944,6 +948,11 @@ a.attachment-chip {
   background: linear-gradient(180deg, rgba(248, 250, 252, 0.86), #ffffff);
 }
 
+.composer-tools {
+  display: grid;
+  gap: 0.68rem;
+}
+
 .quick-prompts {
   align-items: center;
 }
@@ -1003,6 +1012,10 @@ a.attachment-chip {
   font-size: 0.84rem;
   font-weight: 850;
   cursor: pointer;
+}
+
+.attach-button input {
+  display: none;
 }
 
 .attach-button:has(input:disabled) {
@@ -1551,6 +1564,8 @@ a.attachment-chip {
   .output-category-body,
   .output-category-chevron,
   .session-sidebar,
+  .composer-tools,
+  .mobile-progress-backdrop,
   .session-menu,
   .session-menu-body,
   .menu-form,
@@ -1670,8 +1685,82 @@ a.attachment-chip {
 
   .chat-header {
     display: grid;
-    gap: 0.72rem;
-    padding: 0.82rem 0.88rem;
+    gap: 0.5rem;
+    padding: 0.42rem 0.72rem;
+  }
+
+  .mobile-session-strip {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .mobile-session-strip div {
+    display: grid;
+    gap: 0.08rem;
+    min-width: 0;
+  }
+
+  .mobile-session-strip strong,
+  .mobile-session-strip small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mobile-session-strip strong {
+    font-size: 0.86rem;
+  }
+
+  .mobile-session-strip small {
+    color: var(--color-muted);
+    font-size: 0.7rem;
+    font-weight: 800;
+  }
+
+  .mobile-session-strip button {
+    min-height: 30px;
+    border-radius: 999px;
+    padding: 0.32rem 0.56rem;
+    font-size: 0.72rem;
+  }
+
+  .mobile-session-dot {
+    width: 0.62rem;
+    height: 0.62rem;
+    border-radius: 999px;
+    background: var(--color-muted-2);
+    box-shadow: 0 0 0 4px rgba(148, 163, 184, 0.12);
+  }
+
+  .mobile-session-dot.good {
+    background: var(--color-success);
+    box-shadow: 0 0 0 4px rgba(22, 163, 74, 0.12);
+  }
+
+  .mobile-session-dot.warn {
+    background: var(--color-warn);
+    box-shadow: 0 0 0 4px rgba(217, 119, 6, 0.12);
+  }
+
+  .mobile-session-dot.bad {
+    background: var(--color-danger);
+    box-shadow: 0 0 0 4px rgba(220, 38, 38, 0.12);
+  }
+
+  .chat-header:not(.mobile-open) .chat-title-details,
+  .chat-header:not(.mobile-open) .chat-actions {
+    display: none;
+  }
+
+  .chat-header.mobile-open {
+    padding: 0.72rem 0.88rem;
+  }
+
+  .chat-title-details {
+    gap: 0.32rem;
   }
 
   .chat-header h1 {
@@ -1702,22 +1791,91 @@ a.attachment-chip {
   }
 
   .progress-panel {
-    padding: 0.62rem 0.88rem 0.68rem;
+    position: relative;
+    z-index: 12;
+    gap: 0;
+    padding: 0.38rem 0.72rem;
+  }
+
+  .progress-panel.collapsed {
+    padding-block: 0.38rem;
   }
 
   .progress-panel-header {
-    align-items: flex-start;
+    align-items: center;
+    gap: 0.55rem;
+  }
+
+  .progress-panel-header > div:first-child {
+    display: flex;
+    align-items: center;
+    gap: 0.42rem;
+    overflow: hidden;
+  }
+
+  .progress-panel-header .eyebrow {
+    display: none;
+  }
+
+  .progress-panel-header h2 {
+    font-size: 0.82rem;
+  }
+
+  .progress-panel-controls > span {
+    display: none;
   }
 
   .progress-panel-controls {
     flex-wrap: wrap;
   }
 
+  .progress-toggle {
+    min-height: 30px;
+    border-radius: 999px;
+    padding: 0.3rem 0.56rem;
+    font-size: 0.72rem;
+  }
+
+  .mobile-progress-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 72;
+    min-height: 0;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    background: rgba(15, 23, 42, 0.28);
+    box-shadow: none;
+  }
+
+  .mobile-progress-backdrop:hover {
+    filter: none;
+    transform: none;
+  }
+
+  .progress-panel:not(.collapsed) .progress-table-wrap {
+    position: fixed;
+    right: 0.72rem;
+    bottom: calc(5.2rem + env(safe-area-inset-bottom));
+    left: 0.72rem;
+    z-index: 95;
+    max-height: min(62dvh, 420px);
+    border-radius: 16px;
+    background: #ffffff;
+    box-shadow: var(--shadow-float);
+    transform: translateY(0);
+  }
+
+  .progress-panel:not(.collapsed) .progress-table {
+    min-width: 640px;
+  }
+
   .message-list {
     min-height: 0;
     max-height: none;
     overflow-y: auto;
-    padding: 1rem 0.82rem;
+    padding: 0.78rem 0.72rem;
   }
 
   .message-row,
@@ -1740,16 +1898,89 @@ a.attachment-chip {
 
   .chat-composer {
     position: static;
-    padding: 0.75rem 0.82rem 0.9rem;
+    gap: 0.45rem;
+    padding: 0.48rem 0.72rem calc(0.52rem + env(safe-area-inset-bottom));
+  }
+
+  .mobile-composer-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .mobile-composer-toolbar span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--color-muted);
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .composer-tools-toggle {
+    min-height: 30px;
+    border-radius: 999px;
+    padding: 0.32rem 0.56rem;
+    font-size: 0.72rem;
+  }
+
+  .composer-tools {
+    max-height: 0;
+    overflow: hidden;
+    gap: 0.45rem;
+    opacity: 0;
+    transform: translateY(6px);
+    transition: max-height 220ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 170ms ease, transform 220ms ease;
+  }
+
+  .chat-composer.tools-open .composer-tools {
+    max-height: 178px;
+    overflow: auto;
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .mobile-attach-row {
+    display: flex;
   }
 
   .composer-box {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.45rem;
+    align-items: end;
+    border-radius: 16px;
+    padding: 0.42rem;
   }
 
   .composer-actions {
-    grid-template-columns: 1fr 1fr;
-    min-width: 0;
+    grid-template-columns: 1fr;
+    min-width: 76px;
+  }
+
+  .composer-actions .attach-button {
+    display: none;
+  }
+
+  .composer-actions button {
+    min-width: 76px;
+    min-height: 42px;
+    width: auto;
+    padding: 0.45rem 0.58rem;
+  }
+
+  .composer-box textarea {
+    height: 42px;
+    min-height: 42px;
+    max-height: 112px;
+    resize: none;
+  }
+
+  .chat-composer.has-draft .composer-box textarea,
+  .composer-box:focus-within textarea {
+    height: 76px;
   }
 
   .quick-prompts {
@@ -1766,7 +1997,7 @@ a.attachment-chip {
     display: block;
     position: fixed;
     inset: 0;
-    z-index: 80;
+    z-index: 100;
     min-height: 0;
     border: 0;
     border-radius: 0;
@@ -1806,7 +2037,7 @@ a.attachment-chip {
   .app-shell.left-collapsed .session-sidebar {
     position: fixed;
     inset: 0 auto 0 0;
-    z-index: 90;
+    z-index: 110;
     grid-template-rows: auto auto auto auto minmax(0, 1fr);
     width: min(88vw, 340px);
     max-width: 340px;
@@ -1838,7 +2069,7 @@ a.attachment-chip {
   .app-shell.right-collapsed .inspector-panel {
     position: fixed;
     inset: 0 0 0 auto;
-    z-index: 90;
+    z-index: 110;
     width: min(90vw, 380px);
     max-width: 380px;
     min-height: 100dvh;

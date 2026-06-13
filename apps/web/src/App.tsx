@@ -532,6 +532,8 @@ export default function App() {
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
   const [mobileLeftPanelOpen, setMobileLeftPanelOpen] = useState(false);
   const [mobileRightPanelOpen, setMobileRightPanelOpen] = useState(false);
+  const [mobileChatInfoOpen, setMobileChatInfoOpen] = useState(false);
+  const [mobileComposerToolsOpen, setMobileComposerToolsOpen] = useState(false);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
@@ -1353,6 +1355,21 @@ export default function App() {
     mobileLeftPanelOpen ? "mobile-left-open" : "",
     mobileRightPanelOpen ? "mobile-right-open" : ""
   ].filter(Boolean).join(" ");
+  const mobileSessionStatus = latestProgress ? `${progressLabel(latestProgress.stage)} ${latestProgress.status}` : selectedRun?.status || vmAgentStreamState;
+  const composerStatus = pendingAttachments.length
+    ? `${pendingAttachments.length} attachment${pendingAttachments.length === 1 ? "" : "s"} ready`
+    : waitingForAgentReply
+      ? "Waiting for agent"
+      : canSendMessage
+        ? "Ready"
+        : selectedRunId
+          ? "Agent unavailable"
+          : "Select a session";
+  const chatComposerClassName = [
+    "chat-composer",
+    composer.trim() || pendingAttachments.length ? "has-draft" : "",
+    mobileComposerToolsOpen ? "tools-open" : ""
+  ].filter(Boolean).join(" ");
 
   return (
     <main className={shellClassName}>
@@ -1492,8 +1509,24 @@ export default function App() {
       </aside>
 
       <section className="chat-workspace">
-        <header className="chat-header">
-          <div>
+        <header className={`chat-header ${mobileChatInfoOpen ? "mobile-open" : ""}`}>
+          <div className="mobile-session-strip">
+            <span className={`mobile-session-dot ${statusTone(selectedRun?.status)}`} />
+            <div>
+              <strong>{currentTitle}</strong>
+              <small>{mobileSessionStatus}</small>
+            </div>
+            <button
+              aria-controls="mobile-session-details"
+              aria-expanded={mobileChatInfoOpen}
+              className="secondary"
+              onClick={() => setMobileChatInfoOpen((open) => !open)}
+              type="button"
+            >
+              {mobileChatInfoOpen ? "Hide" : "Info"}
+            </button>
+          </div>
+          <div className="chat-title-details" id="mobile-session-details">
             <p className="eyebrow">Current session</p>
             <h1>{currentTitle}</h1>
             <div className="meta-row">
@@ -1522,6 +1555,14 @@ export default function App() {
           </div>
         </header>
 
+        {!progressCollapsed && (
+          <button
+            aria-label="Close progress"
+            className="mobile-progress-backdrop"
+            onClick={() => setProgressCollapsed(true)}
+            type="button"
+          />
+        )}
         <section className={`progress-panel ${progressCollapsed ? "collapsed" : ""}`} aria-label="Agent progress">
           <div className="progress-panel-header">
             <div>
@@ -1633,7 +1674,20 @@ export default function App() {
           <div ref={messageEndRef} />
         </div>
 
-        <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void handleVmAgentMessage(); }}>
+        <form className={chatComposerClassName} onSubmit={(event) => { event.preventDefault(); void handleVmAgentMessage(); }}>
+          <div className="mobile-composer-toolbar">
+            <button
+              aria-controls="mobile-composer-tools"
+              aria-expanded={mobileComposerToolsOpen}
+              className="secondary composer-tools-toggle"
+              onClick={() => setMobileComposerToolsOpen((open) => !open)}
+              type="button"
+            >
+              {mobileComposerToolsOpen ? "Hide tools" : "Tools"}
+            </button>
+            <span>{composerStatus}</span>
+          </div>
+          <div className="composer-tools" id="mobile-composer-tools">
           <div className="quick-prompts">
             {QUICK_PROMPTS.map((prompt) => (
               <button
@@ -1647,6 +1701,15 @@ export default function App() {
               </button>
             ))}
           </div>
+          <div className="mobile-attach-row">
+            <label className="attach-button">
+              Attach files
+              <input type="file" multiple disabled={!authKey || !selectedRunId || messageSending || attachmentUploading} onChange={(event) => {
+                handleSelectAttachments(event.target.files);
+                event.currentTarget.value = "";
+              }} />
+            </label>
+          </div>
           {pendingAttachments.length > 0 && (
             <div className="pending-attachments">
               {pendingAttachments.map((file, index) => (
@@ -1658,6 +1721,7 @@ export default function App() {
               ))}
             </div>
           )}
+          </div>
           <div className="composer-box">
             <textarea
               value={composer}
