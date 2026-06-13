@@ -48,7 +48,7 @@ type RemoteAgentPayload = {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.4.5";
+const agentVersion = "0.4.6";
 const maxVmArtifactBytes = 50 * 1024 * 1024;
 const vmArtifactExtensions = new Set([
   ".log",
@@ -101,7 +101,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.5"
+AGENT_VERSION = "0.4.6"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -551,6 +551,96 @@ def extract_run_request(reply):
     if not isinstance(request, dict):
         raise ValueError("run request must be a JSON object")
     return request, visible
+
+def run_request_file_count(run_request):
+    if not isinstance(run_request, dict):
+        return 0
+    files = run_request.get("files")
+    if not isinstance(files, list):
+        return 0
+    return len([item for item in files if isinstance(item, dict) and safe_text(item.get("content"), 200).strip()])
+
+def sentaurus_tool_steps(run_request):
+    if not isinstance(run_request, dict):
+        return []
+    steps = run_request.get("steps")
+    if not isinstance(steps, list):
+        return []
+    allowed = set(["sde", "sprocess", "sdevice", "inspect"])
+    result = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        tool = safe_text(step.get("tool"), 40).strip().lower()
+        entry = safe_text(step.get("input") or step.get("entry") or step.get("entryFile"), 180).strip()
+        if tool in allowed and entry:
+            result.append({"tool": tool, "input": entry})
+    return result
+
+def run_request_validation_error(run_request, visible_reply, user_text):
+    if not run_request:
+        return ""
+    file_count = run_request_file_count(run_request)
+    steps = sentaurus_tool_steps(run_request)
+    if file_count == 0:
+        return "Run request contains no complete input file content."
+    if not steps:
+        return "Run request contains no executable Sentaurus tool step."
+    raw = (safe_text(visible_reply, 3000) + "\n" + safe_text(user_text, 3000)).lower()
+    continuation_markers = [
+        "next step", "continue", "then run", "then execute", "after that", "will run",
+        u"\u9700\u8981\u540e\u7eed", u"\u4e0b\u4e00\u6b65", u"\u7ee7\u7eed",
+        u"\u518d\u8fd0\u884c", u"\u7136\u540e\u8fd0\u884c", u"\u968f\u540e\u8fd0\u884c", u"\u540e\u7eed\u6267\u884c",
+    ]
+    final_markers = [
+        "extract", "curve", "result", "plot",
+        u"\u8f93\u51fa", u"\u7ed3\u679c", u"\u66f2\u7ebf", u"\u63d0\u53d6",
+    ]
+    has_continuation = any(marker in raw for marker in continuation_markers)
+    asks_for_final = any(marker in raw for marker in final_markers)
+    tools = [step.get("tool") for step in steps]
+    if has_continuation and asks_for_final and "sdevice" not in tools and "inspect" not in tools:
+        return "Run request appears incomplete: it promises later simulation/result extraction but only includes early setup steps."
+    return ""
+
+def format_validation_rejection(error_text, visible_reply):
+    lines = []
+    if visible_reply:
+        lines.append(safe_text(visible_reply, 1600))
+        lines.append("")
+    lines.append("I did not start Sentaurus because the generated run request was incomplete.")
+    lines.append("- validation: %s" % safe_text(error_text, 500))
+    lines.append("- next step: provide the missing deck/files/assumptions, or ask me to create a complete self-contained SDE/SDevice/Inspect flow.")
+    return "\n".join(lines)
+
+def repair_run_request_reply(user_text, original_reply, validation_error, session_id="", current_message_id=""):
+    config = load_config()
+    if not llm_configured(config):
+        return None, {"kind": "run_request_validation_error", "llmConfigured": False}
+    repair_prompt = "\n".join([
+        "Repair your previous Sentaurus response before it reaches the allowlisted runner.",
+        "",
+        "Validation error:",
+        safe_text(validation_error, 1000),
+        "",
+        "User request:",
+        safe_text(user_text, 3000),
+        "",
+        "Previous response:",
+        safe_text(original_reply, 12000),
+        "",
+        "Return a concise corrected answer.",
+        "If you can produce a complete self-contained executable flow, include exactly one complete <SENTAURUS_RUN_REQUEST> JSON block with every file content and all required steps.",
+        "If the flow still needs missing files, geometry, bias, or physics assumptions, do not include any run request; ask for the missing information instead.",
+        "Do not promise to run later steps unless they are included in the run request.",
+    ])
+    try:
+        reply, meta = run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent run-request repair", call_llm, repair_prompt, config, session_id, current_message_id)
+        meta["kind"] = "llm"
+        meta["runRequestRepair"] = True
+        return reply, meta
+    except Exception as exc:
+        return None, {"kind": "run_request_validation_error", "llmConfigured": True, "error": safe_text(str(exc), 1000)}
 
 def extract_json_tag(reply, tag_name):
     start_tag = "<%s>" % tag_name
@@ -1173,7 +1263,7 @@ def call_llm_model(user_text, config, model, system):
         request = urllib2.Request(responses_url(config.get("api_base")), body, {
             "content-type": "application/json",
             "authorization": "Bearer %s" % config.get("api_key"),
-            "user-agent": "sentaurus-vm-agent/0.4.5",
+            "user-agent": "sentaurus-vm-agent/0.4.6",
         })
         response = urllib2.urlopen(request, timeout=90).read()
         try:
@@ -1197,7 +1287,7 @@ def call_llm_model(user_text, config, model, system):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.4.5",
+        "user-agent": "sentaurus-vm-agent/0.4.6",
     })
     response = urllib2.urlopen(request, timeout=90).read()
     try:
@@ -1225,6 +1315,9 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
         "The setup block schema is: <SIMULATION_SETUP>{\"deviceType\":\"...\",\"gateBias\":\"...\",\"drainBias\":\"...\",\"sourceBulk\":\"...\",\"geometry\":\"...\",\"dopingOrImplant\":\"...\",\"physicsModels\":\"...\",\"mesh\":\"...\",\"temperature\":\"...\",\"simulationGoals\":\"...\",\"expectedOutputs\":[\"file or curve\"],\"notes\":\"...\"}</SIMULATION_SETUP>. "
         "Populate the setup block with actual assumptions from the same browser session; omit unknown fields instead of inventing critical process/device parameters. "
         "The block schema is: <SENTAURUS_RUN_REQUEST>{\"title\":\"short-title\",\"files\":[{\"name\":\"main.cmd\",\"content\":\"...\"}],\"steps\":[{\"tool\":\"sde|sprocess|sdevice|inspect\",\"input\":\"main.cmd\"}]}</SENTAURUS_RUN_REQUEST>. "
+        "A run request is executable only when it contains every file content needed by at least one complete step chain. "
+        "Do not emit placeholder files, references to missing uploads, or an SDE-only setup while promising later SDevice/Inspect execution. Ask for missing data instead. "
+        "Never say that the agent will continue with later run steps unless those steps are included in the same run request. "
         "Use only safe ASCII file names without spaces, and only .cmd, .des, .par, .scm, .tcl, .txt, or .dat files. "
         "If the required deck cannot be made self-contained, ask for the missing files/assumptions instead of emitting a run request. "
         "Use the installed tool paths and VM state in the snapshot. Ask for missing physics/process assumptions instead of inventing critical parameters. "
@@ -1293,7 +1386,28 @@ def process_queue_file(path):
             simulation_setup = normalize_simulation_setup(simulation_setup)
             meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
         run_request, visible_reply = extract_run_request(setup_visible_reply)
-        if run_request and not simulation_setup:
+        validation_error = run_request_validation_error(run_request, visible_reply, text)
+        if validation_error:
+            append_progress(session_id, "run_validation", "failed", validation_error, 100)
+            repaired_reply, repaired_meta = repair_run_request_reply(text, reply, validation_error, session_id, item.get("id") or "")
+            meta = repaired_meta
+            if repaired_reply:
+                repaired_setup, repaired_visible_reply = extract_json_tag(repaired_reply, "SIMULATION_SETUP")
+                if repaired_setup:
+                    simulation_setup = normalize_simulation_setup(repaired_setup)
+                run_request, visible_reply = extract_run_request(repaired_visible_reply)
+                validation_error = run_request_validation_error(run_request, visible_reply, text)
+            else:
+                run_request = None
+                visible_reply = ""
+            if validation_error:
+                run_request = None
+                visible_reply = format_validation_rejection(validation_error, visible_reply or repaired_reply or reply)
+                meta["kind"] = "run_request_validation_error"
+            reply = visible_reply
+        if simulation_setup:
+            meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
+        elif run_request:
             simulation_setup = setup_from_run_request(run_request)
             meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
         if meta.get("kind") == "sentaurus_skill":
@@ -1371,7 +1485,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.5"
+AGENT_VERSION = "0.4.6"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 

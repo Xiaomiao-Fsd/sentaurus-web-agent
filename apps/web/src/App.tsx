@@ -384,6 +384,7 @@ function progressLabel(stage: string): string {
     runner: "Runner",
     autodebug: "Auto-debug",
     repair_llm: "Repair LLM",
+    run_validation: "Run validation",
     runner_prepare: "Prepare",
     sentaurus_step: "Sentaurus",
     artifacts: "Artifacts",
