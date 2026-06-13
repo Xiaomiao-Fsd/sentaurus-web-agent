@@ -552,6 +552,58 @@ def extract_run_request(reply):
         raise ValueError("run request must be a JSON object")
     return request, visible
 
+def unicode_text(value, limit=6000):
+    text = safe_text(value, limit)
+    if sys.version_info[0] < 3:
+        try:
+            if isinstance(text, str):
+                return text.decode("utf-8", "replace")
+        except Exception:
+            pass
+    return text
+
+def lowered_text(value, limit=6000):
+    try:
+        return unicode_text(value, limit).lower()
+    except Exception:
+        return u""
+
+def preview_run_steps(run_request):
+    if not isinstance(run_request, dict):
+        return []
+    steps = run_request.get("steps")
+    if not isinstance(steps, list) or not steps:
+        tool = safe_text(run_request.get("tool"), 40).strip().lower()
+        entry = run_request.get("entryFile") or run_request.get("input")
+        if tool and entry:
+            steps = [{"tool": tool, "input": entry}]
+    allowed = set(["sde", "sprocess", "sdevice", "inspect"])
+    result = []
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            tool = safe_text(step.get("tool"), 40).strip().lower()
+            entry = safe_text(step.get("input") or step.get("entry") or step.get("entryFile"), 180).strip()
+            if tool in allowed and entry:
+                result.append({"tool": tool, "input": entry})
+    return result
+
+def run_request_file_summary(run_request, limit=12000):
+    if not isinstance(run_request, dict):
+        return u""
+    parts = []
+    files = run_request.get("files")
+    if isinstance(files, list):
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            parts.append(unicode_text(item.get("name"), 200))
+            parts.append(unicode_text(item.get("content"), max(1000, limit // 3)))
+            if len(u"\n".join(parts)) > limit:
+                break
+    return lowered_text(u"\n".join(parts), limit)
+
 def run_request_file_count(run_request):
     if not isinstance(run_request, dict):
         return 0
@@ -560,50 +612,83 @@ def run_request_file_count(run_request):
         return 0
     return len([item for item in files if isinstance(item, dict) and safe_text(item.get("content"), 200).strip()])
 
-def sentaurus_tool_steps(run_request):
-    if not isinstance(run_request, dict):
-        return []
-    steps = run_request.get("steps")
-    if not isinstance(steps, list):
-        return []
-    allowed = set(["sde", "sprocess", "sdevice", "inspect"])
-    result = []
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        tool = safe_text(step.get("tool"), 40).strip().lower()
-        entry = safe_text(step.get("input") or step.get("entry") or step.get("entryFile"), 180).strip()
-        if tool in allowed and entry:
-            result.append({"tool": tool, "input": entry})
-    return result
+def contains_any(text, phrases):
+    return any(phrase and phrase in text for phrase in phrases)
 
-def run_request_validation_error(run_request, visible_reply, user_text):
+def has_future_work_promise(visible_reply):
+    text = lowered_text(visible_reply, 8000)
+    phrases = [
+        "will continue", "i will continue", "i'll continue", "after that i will",
+        "then i will", "next i will", "follow up", "continue with", "later i will",
+        "next step", "then run", "then execute", "after that",
+        u"\u7ee7\u7eed", u"\u4e0b\u4e00\u6b65", u"\u4e4b\u540e", u"\u7136\u540e",
+        u"\u540e\u7eed", u"\u518d\u8fd0\u884c", u"\u968f\u540e\u8fd0\u884c",
+    ]
+    return contains_any(text, phrases)
+
+def user_requested_final_data(user_text):
+    text = lowered_text(user_text, 8000)
+    phrases = [
+        "extract", "result", "curve", "final", "complete", "plot", "plt", "csv",
+        "id-vg", "idvg", "sdevice", "simulation result",
+        u"\u8f93\u51fa", u"\u7ed3\u679c", u"\u66f2\u7ebf", u"\u63d0\u53d6",
+        u"\u6570\u636e", u"\u6700\u7ec8", u"\u5b8c\u6574", u"\u4eff\u771f",
+    ]
+    return contains_any(text, phrases)
+
+def validate_run_request_against_reply(user_text, visible_reply, run_request):
     if not run_request:
-        return ""
-    file_count = run_request_file_count(run_request)
-    steps = sentaurus_tool_steps(run_request)
-    if file_count == 0:
+        return None
+    if run_request_file_count(run_request) == 0:
         return "Run request contains no complete input file content."
+    steps = preview_run_steps(run_request)
     if not steps:
         return "Run request contains no executable Sentaurus tool step."
-    raw = (safe_text(visible_reply, 3000) + "\n" + safe_text(user_text, 3000)).lower()
-    continuation_markers = [
-        "next step", "continue", "then run", "then execute", "after that", "will run",
-        u"\u9700\u8981\u540e\u7eed", u"\u4e0b\u4e00\u6b65", u"\u7ee7\u7eed",
-        u"\u518d\u8fd0\u884c", u"\u7136\u540e\u8fd0\u884c", u"\u968f\u540e\u8fd0\u884c", u"\u540e\u7eed\u6267\u884c",
-    ]
-    final_markers = [
-        "extract", "curve", "result", "plot",
-        u"\u8f93\u51fa", u"\u7ed3\u679c", u"\u66f2\u7ebf", u"\u63d0\u53d6",
-    ]
-    has_continuation = any(marker in raw for marker in continuation_markers)
-    asks_for_final = any(marker in raw for marker in final_markers)
-    tools = [step.get("tool") for step in steps]
-    if has_continuation and asks_for_final and "sdevice" not in tools and "inspect" not in tools:
-        return "Run request appears incomplete: it promises later simulation/result extraction but only includes early setup steps."
-    return ""
+    tool_set = set([step.get("tool") for step in steps if step.get("tool")])
+    visible = lowered_text(visible_reply, 10000)
+    file_text = run_request_file_summary(run_request, 16000)
+    future_promise = has_future_work_promise(visible_reply)
+    user_wants_result = user_requested_final_data(user_text)
+    missing = []
 
-def format_validation_rejection(error_text, visible_reply):
+    visible_mentions_sdevice = contains_any(visible, ["sdevice", "id-vg", "idvg", "device simulation", "drain sweep", "gate sweep"])
+    if visible_mentions_sdevice and "sdevice" not in tool_set:
+        missing.append("sdevice")
+
+    visible_mentions_extract = contains_any(visible, [
+        "inspect", "csv", ".csv", ".plt", "extract", "curve", "result", "data extraction",
+        u"\u63d0\u53d6", u"\u66f2\u7ebf", u"\u6570\u636e", u"\u7ed3\u679c",
+    ])
+    if visible_mentions_extract and "inspect" not in tool_set and "sdevice" not in tool_set:
+        missing.append("inspect/extraction")
+
+    steps_only_sde = bool(steps) and all(step.get("tool") == "sde" for step in steps)
+    file_mentions_later_sdevice = contains_any(file_text, ["sdevice", "id-vg", "idvg", "inspect"])
+    if steps_only_sde and user_wants_result and (future_promise or visible_mentions_sdevice or file_mentions_later_sdevice):
+        missing.append("complete device/extraction flow")
+
+    if missing:
+        unique_missing = []
+        for item in missing:
+            if item not in unique_missing:
+                unique_missing.append(item)
+        return (
+            "Refusing to execute an incomplete Sentaurus run request: the visible reply promises future work "
+            "or final extracted data, but the JSON run request does not include the required step(s): %s. "
+            "A run request is atomic; include every required SDE/SProcess/SDevice/Inspect step now, or ask for missing assumptions without emitting a run request."
+        ) % ", ".join(unique_missing)
+
+    if future_promise and user_wants_result and "sdevice" not in tool_set and "inspect" not in tool_set and "sprocess" not in tool_set:
+        return (
+            "Refusing to execute a preliminary-only Sentaurus run request after a final-result request. "
+            "Do not promise autonomous continuation outside the JSON block; emit a complete workflow or ask for missing assumptions."
+        )
+    return None
+
+def run_request_validation_error(run_request, visible_reply, user_text):
+    return validate_run_request_against_reply(user_text, visible_reply, run_request) or ""
+
+def format_validation_rejection(error_text, visible_reply=""):
     lines = []
     if visible_reply:
         lines.append(safe_text(visible_reply, 1600))
@@ -613,11 +698,8 @@ def format_validation_rejection(error_text, visible_reply):
     lines.append("- next step: provide the missing deck/files/assumptions, or ask me to create a complete self-contained SDE/SDevice/Inspect flow.")
     return "\n".join(lines)
 
-def repair_run_request_reply(user_text, original_reply, validation_error, session_id="", current_message_id=""):
-    config = load_config()
-    if not llm_configured(config):
-        return None, {"kind": "run_request_validation_error", "llmConfigured": False}
-    repair_prompt = "\n".join([
+def build_validation_repair_prompt(user_text, original_reply, validation_error):
+    return "\n".join([
         "Repair your previous Sentaurus response before it reaches the allowlisted runner.",
         "",
         "Validation error:",
@@ -630,17 +712,24 @@ def repair_run_request_reply(user_text, original_reply, validation_error, sessio
         safe_text(original_reply, 12000),
         "",
         "Return a concise corrected answer.",
-        "If you can produce a complete self-contained executable flow, include exactly one complete <SENTAURUS_RUN_REQUEST> JSON block with every file content and all required steps.",
-        "If the flow still needs missing files, geometry, bias, or physics assumptions, do not include any run request; ask for the missing information instead.",
-        "Do not promise to run later steps unless they are included in the run request.",
+        "If you can produce a complete self-contained executable flow, include exactly one complete <SENTAURUS_RUN_REQUEST> JSON block with every file content and every required ordered step.",
+        "If the flow still needs missing files, geometry, bias, physics assumptions, simulation steps, or extraction steps, do not include any run request; ask for the missing information instead.",
+        "Do not promise to run or extract later unless those steps are included in the same run request.",
     ])
+
+def repair_run_request_reply(user_text, original_reply, validation_error, session_id="", current_message_id=""):
+    config = load_config()
+    if not llm_configured(config):
+        return None, {"kind": "run_request_validation_error", "llmConfigured": False}
+    repair_prompt = build_validation_repair_prompt(user_text, original_reply, validation_error)
     try:
         reply, meta = run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent run-request repair", call_llm, repair_prompt, config, session_id, current_message_id)
         meta["kind"] = "llm"
         meta["runRequestRepair"] = True
+        meta["validationError"] = safe_text(validation_error, 1000)
         return reply, meta
     except Exception as exc:
-        return None, {"kind": "run_request_validation_error", "llmConfigured": True, "error": safe_text(str(exc), 1000)}
+        return None, {"kind": "run_request_validation_error", "llmConfigured": True, "error": safe_text(str(exc), 1000), "validationError": safe_text(validation_error, 1000)}
 
 def extract_json_tag(reply, tag_name):
     start_tag = "<%s>" % tag_name
@@ -1315,9 +1404,9 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
         "The setup block schema is: <SIMULATION_SETUP>{\"deviceType\":\"...\",\"gateBias\":\"...\",\"drainBias\":\"...\",\"sourceBulk\":\"...\",\"geometry\":\"...\",\"dopingOrImplant\":\"...\",\"physicsModels\":\"...\",\"mesh\":\"...\",\"temperature\":\"...\",\"simulationGoals\":\"...\",\"expectedOutputs\":[\"file or curve\"],\"notes\":\"...\"}</SIMULATION_SETUP>. "
         "Populate the setup block with actual assumptions from the same browser session; omit unknown fields instead of inventing critical process/device parameters. "
         "The block schema is: <SENTAURUS_RUN_REQUEST>{\"title\":\"short-title\",\"files\":[{\"name\":\"main.cmd\",\"content\":\"...\"}],\"steps\":[{\"tool\":\"sde|sprocess|sdevice|inspect\",\"input\":\"main.cmd\"}]}</SENTAURUS_RUN_REQUEST>. "
-        "A run request is executable only when it contains every file content needed by at least one complete step chain. "
-        "Do not emit placeholder files, references to missing uploads, or an SDE-only setup while promising later SDevice/Inspect execution. Ask for missing data instead. "
-        "Never say that the agent will continue with later run steps unless those steps are included in the same run request. "
+        "A run request is atomic: the worker will execute only the JSON block you provide and will not automatically continue later based on visible text. "
+        "Never say you will continue, follow up, add SDevice later, extract data later, or send final results later unless every required file and ordered step is already present in the same run request. "
+        "For requests asking for final simulation results, Id-Vg curves, .plt/.csv data, or extraction, do not emit an SDE-only request; include SDevice and/or Inspect extraction steps, or ask for missing assumptions. "
         "Use only safe ASCII file names without spaces, and only .cmd, .des, .par, .scm, .tcl, .txt, or .dat files. "
         "If the required deck cannot be made self-contained, ask for the missing files/assumptions instead of emitting a run request. "
         "Use the installed tool paths and VM state in the snapshot. Ask for missing physics/process assumptions instead of inventing critical parameters. "
