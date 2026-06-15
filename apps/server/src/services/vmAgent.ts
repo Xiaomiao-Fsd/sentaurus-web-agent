@@ -214,7 +214,107 @@ def read_all_messages():
                 pass
     return messages
 
-def session_context(session_id, current_id="", limit=12, content_limit=900):
+def non_progress_session_message(item):
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    if meta.get("kind") == "progress":
+        return False
+    if item.get("source") == "vm-agent-progress":
+        return False
+    return True
+
+def context_lower(value, limit=8000):
+    try:
+        return safe_text(value, limit).lower()
+    except Exception:
+        return ""
+
+def context_has_important_keywords(item):
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    text = context_lower(item.get("content"), 8000) + " " + context_lower(meta.get("simulationSetupJson"), 4000)
+    keywords = [
+        "28nm", "28 nm", "mosfet", "nmos", "fdsoi", "utb", "id-vg", "idvg",
+        "vth", "ss", "dibl", "ion", "ioff", "calibrat", "target", "baseline",
+        u"目标", u"校准", u"基线", u"结果", u"曲线", u"转移特性", u"阈值", u"亚阈值",
+    ]
+    for keyword in keywords:
+        if keyword in text:
+            return True
+    return False
+
+def compact_artifact_names(value, limit=900):
+    if not value:
+        return ""
+    artifacts = None
+    try:
+        artifacts = json.loads(value) if isinstance(value, string_types) else value
+    except Exception:
+        artifacts = None
+    if isinstance(artifacts, list):
+        names = []
+        for item in artifacts[:14]:
+            if not isinstance(item, dict):
+                continue
+            path = safe_text(item.get("path"), 180)
+            size = item.get("size")
+            if path:
+                names.append("%s (%s bytes)" % (path, size if size is not None else "unknown"))
+        if len(artifacts) > 14:
+            names.append("... %s more" % (len(artifacts) - 14))
+        return safe_text(", ".join(names), limit)
+    return safe_text(value, limit).replace("\n", " | ")
+
+def compact_setup(value, limit=1100):
+    if not value:
+        return ""
+    return safe_text(value, limit).replace("\n", " | ")
+
+def session_context_line(item, content_limit=1200):
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    content = safe_text(item.get("content"), content_limit).replace("\n", " | ")
+    header = "[%s] %s kind=%s" % (item.get("createdAt") or "unknown-time", item.get("role") or "unknown-role", meta.get("kind") or "unknown")
+    run_id = meta.get("runId") or meta.get("vmRunId")
+    run_status = meta.get("runStatus") or meta.get("vmRunStatus")
+    if run_id:
+        header += " runId=%s" % safe_text(run_id, 180)
+    if run_status:
+        header += " runStatus=%s" % safe_text(run_status, 40)
+    return header + ": " + content
+
+def session_state_digest(messages, recent_messages):
+    recent_ids = {}
+    for item in recent_messages:
+        if item.get("id"):
+            recent_ids[item.get("id")] = True
+    run_messages = []
+    important_older = []
+    for item in messages:
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        if meta.get("kind") == "sentaurus_run" or meta.get("runId") or meta.get("vmRunId") or meta.get("simulationSetupJson"):
+            run_messages.append(item)
+        if item.get("id") not in recent_ids and context_has_important_keywords(item):
+            important_older.append(item)
+
+    lines = []
+    if run_messages:
+        lines.append("Latest same-session Sentaurus run state (newest last; progress events omitted):")
+        for item in run_messages[-6:]:
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            run_id = meta.get("runId") or meta.get("vmRunId") or "unknown-run"
+            run_status = meta.get("runStatus") or meta.get("vmRunStatus") or "unknown-status"
+            lines.append("- [%s] %s status=%s" % (item.get("createdAt") or "unknown-time", safe_text(run_id, 180), safe_text(run_status, 60)))
+            setup = compact_setup(meta.get("simulationSetupJson"), 1300)
+            if setup:
+                lines.append("  setup: %s" % setup)
+            artifacts = compact_artifact_names(meta.get("vmRunArtifactsJson") or meta.get("artifacts"), 1000)
+            if artifacts:
+                lines.append("  artifacts: %s" % artifacts)
+    if important_older:
+        lines.append("Important older same-session messages that may define goals/targets/results:")
+        for item in important_older[-8:]:
+            lines.append("- " + session_context_line(item, 900))
+    return "\n".join(lines)
+
+def session_context(session_id, current_id="", limit=24, content_limit=1200):
     session_id = safe_text(session_id, 160).strip()
     current_id = safe_text(current_id, 200).strip()
     if not session_id:
@@ -226,19 +326,19 @@ def session_context(session_id, current_id="", limit=12, content_limit=900):
             continue
         if current_id and item.get("id") == current_id:
             continue
+        if not non_progress_session_message(item):
+            continue
         messages.append(item)
     if not messages:
-        return "(no earlier messages in this browser session)"
+        return "(no earlier non-progress messages in this browser session)"
+    recent_messages = messages[-limit:]
     lines = []
-    for item in messages[-limit:]:
-        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        content = safe_text(item.get("content"), content_limit).replace("\n", " | ")
-        header = "[%s] %s kind=%s" % (item.get("createdAt") or "unknown-time", item.get("role") or "unknown-role", meta.get("kind") or "unknown")
-        if meta.get("runId"):
-            header += " runId=%s" % meta.get("runId")
-        if meta.get("runStatus"):
-            header += " runStatus=%s" % meta.get("runStatus")
-        lines.append(header + ": " + content)
+    digest = session_state_digest(messages, recent_messages)
+    if digest:
+        lines.append("[Same-session durable context summary]\n" + digest)
+    lines.append("[Recent non-progress same-session messages, newest last]")
+    for item in recent_messages:
+        lines.append(session_context_line(item, content_limit))
     return "\n".join(lines)
 
 def read_env_file(path):
