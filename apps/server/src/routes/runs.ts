@@ -1,9 +1,12 @@
 import type { FastifyInstance } from "fastify";
+import type { SimulationSetup } from "@sentaurus-agent/shared";
+import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
 import { prepareRemoteRun } from "../services/sentaurusRunner.js";
 import {
   appendRunLog,
   createRun,
+  deleteRun,
   getPublicRun,
   getRun,
   getRunDetail,
@@ -11,11 +14,13 @@ import {
   listRunFiles,
   readRunLog,
   resolveRunFile,
+  saveSimulationSetup,
   saveInputFile,
   setRunStatus,
   streamRunFile,
   updateRun
 } from "../services/runStore.js";
+import { syncInputFileToVmSession } from "../services/vmSessionFiles.js";
 
 type RunParams = { id: string };
 type FileParams = RunParams & { name: string };
@@ -42,6 +47,33 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
     return await getRunDetail(request.params.id);
   });
 
+  app.patch<{ Params: RunParams; Body: { title?: string } }>("/api/runs/:id", async (request) => {
+    requireAuth(request);
+    const title = request.body?.title?.trim();
+    if (!title) {
+      const error = new Error("title is required") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    if (title.length > 120) {
+      const error = new Error("title is too long") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    return { run: await updateRun(request.params.id, { title }) };
+  });
+
+  app.patch<{ Params: RunParams; Body: Partial<SimulationSetup> }>("/api/runs/:id/simulation-setup", async (request) => {
+    requireAuth(request);
+    return { run: await saveSimulationSetup(request.params.id, request.body || {}) };
+  });
+
+  app.delete<{ Params: RunParams }>("/api/runs/:id", async (request) => {
+    requireAuth(request);
+    await deleteRun(request.params.id);
+    return { ok: true };
+  });
+
   app.get<{ Params: RunParams }>("/api/runs/:id/files", async (request) => {
     requireAuth(request);
     return { files: await listRunFiles(request.params.id, "input") };
@@ -57,6 +89,14 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
     }
     const saved = await saveInputFile(request.params.id, file.filename, file.file);
     await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] uploaded input/${saved.name}`);
+    try {
+      const localPath = await resolveRunFile(request.params.id, "input", saved.name);
+      await syncInputFileToVmSession(request.params.id, saved.name, localPath);
+      await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] synced input/${saved.name} to VM output/我的输入`);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] VM input sync failed for ${saved.name}: ${detail}`);
+    }
     return { file: saved, run: await getPublicRun(request.params.id) };
   });
 
@@ -69,6 +109,12 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: RunParams }>("/api/runs/:id/artifacts", async (request) => {
     requireAuth(request);
     return { artifacts: await listRunFiles(request.params.id, "artifacts") };
+  });
+
+  app.get<{ Params: FileParams }>("/api/runs/:id/logs/:name", async (request, reply) => {
+    requireAuth(request);
+    const filePath = await resolveRunFile(request.params.id, "logs", request.params.name);
+    return reply.send(streamRunFile(filePath));
   });
 
   app.get<{ Params: FileParams }>("/api/runs/:id/artifacts/:name", async (request, reply) => {
@@ -114,6 +160,8 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
     reply.raw.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
+      "access-control-allow-origin": config.CORS_ORIGIN,
+      vary: "origin",
       connection: "keep-alive"
     });
     let offset = 0;

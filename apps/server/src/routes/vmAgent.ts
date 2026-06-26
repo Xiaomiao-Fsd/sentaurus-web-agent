@@ -1,6 +1,37 @@
 import type { FastifyInstance } from "fastify";
+import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
-import { connectVmAgent, getVmAgentStatus, sendVmAgentMessage } from "../services/vmAgent.js";
+import { connectVmAgent, downloadVmRunArtifact, getVmAgentMessages, getVmAgentStatus, sendVmAgentMessage } from "../services/vmAgent.js";
+import { contentTypeForName, downloadVmSessionFile, listVmSessionFiles } from "../services/vmSessionFiles.js";
+
+function parseCursor(value: unknown): number {
+  if (typeof value !== "string") return 0;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function parseLimit(value: unknown, fallback = 50): number {
+  if (typeof value !== "string") return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, 1000);
+}
+
+function parseSessionId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(trimmed)) {
+    const error = new Error("sessionId contains unsupported characters") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  return trimmed;
+}
+
+function contentDispositionFileName(name: string): string {
+  return name.replace(/["\\\r\n]/g, "_");
+}
 
 export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/vm/agent/status", async (request) => {
@@ -14,7 +45,17 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     return { ok: result.status.ok, ...result };
   });
 
-  app.post<{ Body: { message?: string } }>("/api/vm/agent/messages", async (request) => {
+  app.get<{ Querystring: { after?: string; limit?: string; sessionId?: string } }>("/api/vm/agent/messages", async (request) => {
+    requireAuth(request);
+    const result = await getVmAgentMessages(
+      parseCursor(request.query.after),
+      parseLimit(request.query.limit),
+      parseSessionId(request.query.sessionId)
+    );
+    return { ok: result.status.ok, ...result };
+  });
+
+  app.post<{ Body: { message?: string; sessionId?: string } }>("/api/vm/agent/messages", async (request) => {
     requireAuth(request);
     const message = request.body?.message?.trim();
     if (!message) {
@@ -27,7 +68,83 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
       error.statusCode = 400;
       throw error;
     }
-    const result = await sendVmAgentMessage(message);
+    const result = await sendVmAgentMessage(message, parseSessionId(request.body?.sessionId));
     return { ok: result.status.ok, ...result };
+  });
+
+  app.get<{ Params: { runId: string }; Querystring: { path?: string; token?: string } }>("/api/vm/agent/runs/:runId/artifacts", async (request, reply) => {
+    requireAuth(request);
+    const artifactPath = request.query.path;
+    if (!artifactPath) {
+      const error = new Error("path is required") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    const artifact = await downloadVmRunArtifact(request.params.runId, artifactPath);
+    reply.header("content-type", contentTypeForName(artifact.fileName));
+    reply.header("content-length", String(artifact.data.byteLength));
+    reply.header("x-vm-artifact-path", artifact.path);
+    reply.header("content-disposition", `attachment; filename="${contentDispositionFileName(artifact.fileName)}"`);
+    return reply.send(artifact.data);
+  });
+
+  app.get<{ Params: { sessionId: string }; Querystring: { token?: string } }>("/api/vm/agent/sessions/:sessionId/files", async (request) => {
+    requireAuth(request);
+    return listVmSessionFiles(request.params.sessionId);
+  });
+
+  app.get<{ Params: { sessionId: string }; Querystring: { category?: string; path?: string; token?: string } }>("/api/vm/agent/sessions/:sessionId/files/download", async (request, reply) => {
+    requireAuth(request);
+    if (!request.query.category || !request.query.path) {
+      const error = new Error("category and path are required") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    const file = await downloadVmSessionFile(request.params.sessionId, request.query.category, request.query.path);
+    reply.header("content-type", file.contentType);
+    reply.header("content-length", String(file.data.byteLength));
+    reply.header("x-vm-session-category", file.category);
+    reply.header("x-vm-session-path", file.path);
+    reply.header("content-disposition", `attachment; filename="${contentDispositionFileName(file.fileName)}"`);
+    return reply.send(file.data);
+  });
+
+  app.get<{ Querystring: { after?: string; token?: string } }>("/api/vm/agent/messages/stream", async (request, reply) => {
+    requireAuth(request);
+    reply.raw.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "access-control-allow-origin": config.CORS_ORIGIN,
+      vary: "origin",
+      connection: "keep-alive"
+    });
+
+    let cursor = parseCursor(request.query.after);
+    let running = false;
+    const send = (event: string, data: unknown) => {
+      reply.raw.write(`event: ${event}\n`);
+      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+    const tick = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const result = await getVmAgentMessages(cursor);
+        cursor = result.cursor;
+        if (result.messages.length > 0) {
+          send("messages", result);
+        } else {
+          send("ping", { time: new Date().toISOString(), cursor });
+        }
+      } catch (err) {
+        send("error", { message: err instanceof Error ? err.message : String(err) });
+      } finally {
+        running = false;
+      }
+    };
+
+    await tick();
+    const interval = setInterval(() => void tick(), 2000);
+    request.raw.on("close", () => clearInterval(interval));
   });
 }

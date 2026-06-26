@@ -9,7 +9,7 @@ export function requireAuth(request: FastifyRequest): void {
     : undefined;
   const provided = token || (typeof queryToken === "string" ? queryToken : undefined);
   if (!provided || provided !== config.AUTH_TOKEN) {
-    const error = new Error("Unauthorized") as Error & { statusCode?: number };
+    const error = new Error("AUTH_TOKEN is missing or incorrect. Check the value saved in the web UI against the server .env AUTH_TOKEN.") as Error & { statusCode?: number };
     error.statusCode = 401;
     throw error;
   }

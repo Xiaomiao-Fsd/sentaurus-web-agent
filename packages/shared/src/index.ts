@@ -15,6 +15,9 @@ export type VmAgentMessage = {
   role: "user" | "agent" | "system";
   content: string;
   createdAt: string;
+  vmCreatedAt?: string;
+  hostReceivedAt?: string;
+  sequence?: number;
   meta?: Record<string, string | number | boolean | null>;
 };
 
@@ -30,6 +33,24 @@ export type VmAgentStatus = {
   capabilities?: string[];
   instanceCount?: number;
   latestInstance?: string | null;
+  mailbox?: string;
+  messageCount?: number;
+  workerRunning?: boolean;
+  workerPid?: number | null;
+  llmConfigured?: boolean;
+  llmModel?: string;
+  llmModels?: string[];
+  maxAutodebugAttempts?: number;
+  manualCount?: number;
+  manualFiles?: string[];
+  queueDepth?: number;
+  sentaurusTools?: Record<string, string | null>;
+  vmTime?: string;
+  vmEpochMs?: number;
+  hostTime?: string;
+  hostEpochMs?: number;
+  clockSkewMs?: number;
+  clockSkewWarning?: boolean;
   error?: string;
   raw?: string;
 };
@@ -38,12 +59,23 @@ export type VmAgentConnectResponse = {
   ok: boolean;
   status: VmAgentStatus;
   message?: VmAgentMessage;
+  messages?: VmAgentMessage[];
+  cursor?: number;
 };
 
 export type VmAgentMessageResponse = {
   ok: boolean;
-  status?: VmAgentStatus;
+  status: VmAgentStatus;
   message: VmAgentMessage;
+  messages: VmAgentMessage[];
+  cursor: number;
+};
+
+export type VmAgentHistoryResponse = {
+  ok: boolean;
+  status: VmAgentStatus;
+  messages: VmAgentMessage[];
+  cursor: number;
 };
 
 export type ChatMessage = {
@@ -74,6 +106,44 @@ export type RunFile = {
   modifiedAt: string;
 };
 
+export type SimulationSetup = {
+  deviceType?: string;
+  gateBias?: string;
+  drainBias?: string;
+  sourceBulk?: string;
+  geometry?: string;
+  dopingOrImplant?: string;
+  physicsModels?: string;
+  mesh?: string;
+  temperature?: string;
+  simulationGoals?: string;
+  expectedOutputs?: string[];
+  notes?: string;
+  updatedAt: string;
+  updatedBy: "vm-agent" | "user" | "system";
+};
+
+export type VmRunArtifact = {
+  path: string;
+  size: number;
+};
+
+export type VmSessionOutputCategory = "我的输入" | "仿真结果文件" | "仿真日志文件" | "仿真参数文件" | "其它文件";
+
+export type VmSessionOutputFile = {
+  category: VmSessionOutputCategory;
+  path: string;
+  name: string;
+  size: number;
+  modifiedAt: string;
+  isImage: boolean;
+};
+
+export type VmSessionFilesResponse = {
+  categories: VmSessionOutputCategory[];
+  files: VmSessionOutputFile[];
+};
+
 export type RunSummary = {
   id: string;
   status: RunStatus;
@@ -84,6 +154,7 @@ export type RunSummary = {
   remoteDir?: string;
   remotePreparedAt?: string;
   lastError?: string;
+  simulationSetup?: SimulationSetup;
 };
 
 export type RunDetail = {
