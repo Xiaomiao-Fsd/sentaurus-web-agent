@@ -1,10 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { VM_SESSION_INPUT_CATEGORY, VM_SESSION_OUTPUT_CATEGORIES } from "@sentaurus-agent/shared";
 import type { VmSessionFilesResponse, VmSessionOutputCategory, VmSessionOutputFile } from "@sentaurus-agent/shared";
 import { safeFileName, safeRelativePath, safeRunId } from "../security/pathSafe.js";
 import { runSshCommandWithInput } from "./sshClient.js";
 
-export const vmSessionOutputCategories: VmSessionOutputCategory[] = ["我的输入", "仿真结果文件", "仿真日志文件", "仿真参数文件", "其它文件"];
+export const vmSessionOutputCategories: VmSessionOutputCategory[] = [...VM_SESSION_OUTPUT_CATEGORIES];
 
 const maxSessionFileBytes = 50 * 1024 * 1024;
 const allowedSessionExtensions = new Set([
@@ -253,6 +254,10 @@ def fail(message, status_code=400):
 def valid_segment(value):
     return bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._@()+, -]{0,159}$", value or ""))
 
+def ensure_dir(path):
+    if not os.path.isdir(path):
+        os.makedirs(path)
+
 try:
     req = load_request()
     session_id = req.get("sessionId") or ""
@@ -319,6 +324,10 @@ def fail(message, status_code=400):
 def valid_segment(value):
     return bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._@()+, -]{0,159}$", value or ""))
 
+def ensure_dir(path):
+    if not os.path.isdir(path):
+        os.makedirs(path)
+
 try:
     req = load_request()
     session_id = req.get("sessionId") or ""
@@ -337,7 +346,7 @@ try:
     if ext not in allowed_ext:
         fail("file extension is not allowlisted")
     category_dir = os.path.abspath(os.path.join(SESSIONS_DIR, session_id, "output", category))
-    os.makedirs(category_dir, exist_ok=True)
+    ensure_dir(category_dir)
     target = os.path.abspath(os.path.join(category_dir, filename))
     if not target.startswith(category_dir + os.sep):
         fail("file path escapes output category")
@@ -414,7 +423,7 @@ export async function syncInputFileToVmSession(sessionId: string, filename: stri
   }
   await runRemoteSessionScript(payloadScript(remoteSyncInputScript, {
     sessionId: safeSessionId,
-    category: "我的输入",
+    category: VM_SESSION_INPUT_CATEGORY,
     fileName: path.basename(safeName),
     categories: vmSessionOutputCategories,
     allowedExtensions: [...allowedSessionExtensions],

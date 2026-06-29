@@ -19,6 +19,7 @@ export type VmAgentMessage = {
   hostReceivedAt?: string;
   sequence?: number;
   meta?: Record<string, string | number | boolean | null>;
+  attachments?: VmAgentMessageAttachment[];
 };
 
 export type VmAgentStatus = {
@@ -128,7 +129,55 @@ export type VmRunArtifact = {
   size: number;
 };
 
-export type VmSessionOutputCategory = "我的输入" | "仿真结果文件" | "仿真日志文件" | "仿真参数文件" | "其它文件";
+export type VmAgentAttachmentSource = "run-input" | "vm-session-file" | "vm-run-artifact";
+
+export type VmAgentAttachmentRef = {
+  id: string;
+  source: VmAgentAttachmentSource;
+  name: string;
+  path: string;
+  size: number;
+  runId?: string;
+  category?: VmSessionOutputCategory;
+  contentType?: string;
+};
+
+export type VmAgentMessageAttachmentKind = "file" | "image";
+
+export type VmAgentMessageAttachment = {
+  id: string;
+  kind: VmAgentMessageAttachmentKind;
+  name: string;
+  size: number;
+  contentType?: string;
+  source: VmAgentAttachmentSource;
+  path: string;
+  runId?: string;
+  category?: VmSessionOutputCategory;
+  width?: number;
+  height?: number;
+  thumbnailPath?: string;
+};
+
+export type VmAgentMessageRequest = {
+  message: string;
+  sessionId?: string;
+  attachments?: VmAgentAttachmentRef[];
+  displayAttachments?: VmAgentMessageAttachment[];
+};
+
+export const VM_SESSION_OUTPUT_CATEGORIES = ["我的输入", "仿真结果文件", "仿真日志文件", "仿真参数文件", "其它文件"] as const;
+
+export type VmSessionOutputCategory = typeof VM_SESSION_OUTPUT_CATEGORIES[number];
+
+export const VM_SESSION_INPUT_CATEGORY: VmSessionOutputCategory = VM_SESSION_OUTPUT_CATEGORIES[0];
+
+export type VmSessionFileSyncStatus = {
+  ok: boolean;
+  category?: VmSessionOutputCategory;
+  path?: string;
+  error?: string;
+};
 
 export type VmSessionOutputFile = {
   category: VmSessionOutputCategory;

@@ -1,15 +1,21 @@
 {
   "name": "sentaurus-web-agent",
-  "version": "0.4.7",
+  "version": "0.5.0",
   "private": true,
   "packageManager": "npm@11.6.2",
   "description": "Browser dashboard/chat for a Sentaurus TCAD agent bridge.",
   "scripts": {
     "dev": "concurrently -n server,web -c blue,green \"npm run dev -w @sentaurus-agent/server\" \"npm run dev -w @sentaurus-agent/web\"",
+    "start:dev": "npm run dev",
+    "dev:ensure": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/web-dev-watchdog.ps1 -Mode ensure",
+    "dev:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/web-dev-watchdog.ps1 -Mode status",
+    "dev:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/web-dev-watchdog.ps1 -Mode stop",
     "dev:web": "npm run dev -w @sentaurus-agent/web",
     "dev:server": "npm run dev -w @sentaurus-agent/server",
     "build": "npm run build -w @sentaurus-agent/shared && npm run build -w @sentaurus-agent/server && npm run build -w @sentaurus-agent/web",
     "typecheck": "npm run build -w @sentaurus-agent/shared && npm run typecheck -w @sentaurus-agent/server && npm run typecheck -w @sentaurus-agent/web && npm run typecheck -w @sentaurus-agent/shared",
+    "check": "npm run typecheck",
+    "verify": "npm run typecheck && npm run build",
     "lint": "npm run lint --workspaces --if-present",
     "prepare:shared": "npm run build -w @sentaurus-agent/shared"
   },

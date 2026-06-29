@@ -1,8 +1,11 @@
 import type { FastifyInstance } from "fastify";
+import type { VmAgentAttachmentRef, VmAgentAttachmentSource, VmAgentMessageAttachment, VmAgentMessageRequest, VmSessionOutputCategory } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
+import { safeFileName, safeRelativePath, safeRunId } from "../security/pathSafe.js";
+import { isChatImageContentType, isChatImageName } from "../services/imageAttachments.js";
 import { connectVmAgent, downloadVmRunArtifact, getVmAgentMessages, getVmAgentStatus, sendVmAgentMessage } from "../services/vmAgent.js";
-import { contentTypeForName, downloadVmSessionFile, listVmSessionFiles } from "../services/vmSessionFiles.js";
+import { contentTypeForName, downloadVmSessionFile, listVmSessionFiles, vmSessionOutputCategories } from "../services/vmSessionFiles.js";
 
 function parseCursor(value: unknown): number {
   if (typeof value !== "string") return 0;
@@ -30,7 +33,133 @@ function parseSessionId(value: unknown): string | undefined {
 }
 
 function contentDispositionFileName(name: string): string {
-  return name.replace(/["\\\r\n]/g, "_");
+  const asciiName = name.replace(/["\\\r\n]/g, "_").replace(/[^\x20-\x7E]/g, "_").trim();
+  return asciiName || "download";
+}
+
+function encodedHeaderValue(value: string): string {
+  return encodeURIComponent(value.replace(/[\r\n]/g, "_"));
+}
+
+function contentDispositionAttachment(name: string): string {
+  return `attachment; filename="${contentDispositionFileName(name)}"; filename*=UTF-8''${encodedHeaderValue(name)}`;
+}
+
+const attachmentSources = new Set<VmAgentAttachmentSource>(["run-input", "vm-session-file", "vm-run-artifact"]);
+const maxContextAttachments = 8;
+const maxDisplayAttachments = 12;
+
+function parseAttachmentSize(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
+  return Math.min(Math.floor(value), 50 * 1024 * 1024);
+}
+
+function parseAttachmentCategory(value: unknown, source: VmAgentAttachmentSource): VmSessionOutputCategory | undefined {
+  if (source === "vm-run-artifact") return undefined;
+  const category = typeof value === "string" && value.trim() ? value.trim() : vmSessionOutputCategories[0];
+  if (!vmSessionOutputCategories.includes(category as VmSessionOutputCategory)) {
+    return vmSessionOutputCategories[0];
+  }
+  return category as VmSessionOutputCategory;
+}
+
+function validateAttachmentRef(value: unknown): VmAgentAttachmentRef {
+  if (!value || typeof value !== "object") {
+    const error = new Error("attachment must be an object") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  const item = value as Partial<VmAgentAttachmentRef>;
+  const source = item.source;
+  if (!source || !attachmentSources.has(source)) {
+    const error = new Error("attachment source is invalid") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  const safePath = safeRelativePath(String(item.path || ""));
+  const name = safeFileName(String(item.name || safePath.split("/").at(-1) || ""));
+  const id = typeof item.id === "string" && item.id.trim()
+    ? item.id.trim().slice(0, 180).replace(/[^A-Za-z0-9_.:-]/g, "_")
+    : `${source}:${safePath}`.slice(0, 180).replace(/[^A-Za-z0-9_.:-]/g, "_");
+  const runId = item.runId ? safeRunId(item.runId) : undefined;
+  if (source === "vm-run-artifact" && !runId) {
+    const error = new Error("vm-run-artifact attachment requires runId") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  return {
+    id,
+    source,
+    name,
+    path: safePath,
+    size: parseAttachmentSize(item.size),
+    runId,
+    category: parseAttachmentCategory(item.category, source),
+    contentType: typeof item.contentType === "string" && item.contentType.trim() ? item.contentType.trim().slice(0, 120) : undefined
+  };
+}
+
+function validateAttachments(value: unknown): VmAgentAttachmentRef[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    const error = new Error("attachments must be an array") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  if (value.length > maxContextAttachments) {
+    const error = new Error(`attachments are limited to ${maxContextAttachments} files`) as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  return value.map(validateAttachmentRef);
+}
+
+function validateDisplayAttachment(value: unknown): VmAgentMessageAttachment {
+  if (!value || typeof value !== "object") {
+    const error = new Error("display attachment must be an object") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  const item = value as Partial<VmAgentMessageAttachment>;
+  const source = item.source;
+  if (!source || !attachmentSources.has(source)) {
+    const error = new Error("display attachment source is invalid") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  const safePath = safeRelativePath(String(item.path || ""));
+  const name = safeFileName(String(item.name || safePath.split("/").at(-1) || ""));
+  const contentType = typeof item.contentType === "string" && item.contentType.trim() ? item.contentType.trim().slice(0, 120) : undefined;
+  const imageLike = isChatImageName(name) || isChatImageContentType(contentType);
+  return {
+    id: typeof item.id === "string" && item.id.trim() ? item.id.trim().slice(0, 180).replace(/[^A-Za-z0-9_.:-]/g, "_") : `${source}:${safePath}`.slice(0, 180).replace(/[^A-Za-z0-9_.:-]/g, "_"),
+    kind: imageLike ? "image" : "file",
+    name,
+    size: parseAttachmentSize(item.size),
+    contentType,
+    source,
+    path: safePath,
+    runId: item.runId ? safeRunId(item.runId) : undefined,
+    category: parseAttachmentCategory(item.category, source),
+    width: typeof item.width === "number" && Number.isFinite(item.width) ? Math.max(0, Math.floor(item.width)) : undefined,
+    height: typeof item.height === "number" && Number.isFinite(item.height) ? Math.max(0, Math.floor(item.height)) : undefined,
+    thumbnailPath: typeof item.thumbnailPath === "string" && item.thumbnailPath.trim() ? safeRelativePath(item.thumbnailPath) : undefined
+  };
+}
+
+function validateDisplayAttachments(value: unknown): VmAgentMessageAttachment[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    const error = new Error("displayAttachments must be an array") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  if (value.length > maxDisplayAttachments) {
+    const error = new Error(`displayAttachments are limited to ${maxDisplayAttachments} files`) as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  return value.map(validateDisplayAttachment);
 }
 
 export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
@@ -55,7 +184,7 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     return { ok: result.status.ok, ...result };
   });
 
-  app.post<{ Body: { message?: string; sessionId?: string } }>("/api/vm/agent/messages", async (request) => {
+  app.post<{ Body: VmAgentMessageRequest }>("/api/vm/agent/messages", async (request) => {
     requireAuth(request);
     const message = request.body?.message?.trim();
     if (!message) {
@@ -68,7 +197,12 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
       error.statusCode = 400;
       throw error;
     }
-    const result = await sendVmAgentMessage(message, parseSessionId(request.body?.sessionId));
+    const result = await sendVmAgentMessage(
+      message,
+      parseSessionId(request.body?.sessionId),
+      validateAttachments(request.body?.attachments),
+      validateDisplayAttachments(request.body?.displayAttachments)
+    );
     return { ok: result.status.ok, ...result };
   });
 
@@ -83,8 +217,8 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     const artifact = await downloadVmRunArtifact(request.params.runId, artifactPath);
     reply.header("content-type", contentTypeForName(artifact.fileName));
     reply.header("content-length", String(artifact.data.byteLength));
-    reply.header("x-vm-artifact-path", artifact.path);
-    reply.header("content-disposition", `attachment; filename="${contentDispositionFileName(artifact.fileName)}"`);
+    reply.header("x-vm-artifact-path", encodedHeaderValue(artifact.path));
+    reply.header("content-disposition", contentDispositionAttachment(artifact.fileName));
     return reply.send(artifact.data);
   });
 
@@ -103,9 +237,9 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     const file = await downloadVmSessionFile(request.params.sessionId, request.query.category, request.query.path);
     reply.header("content-type", file.contentType);
     reply.header("content-length", String(file.data.byteLength));
-    reply.header("x-vm-session-category", file.category);
-    reply.header("x-vm-session-path", file.path);
-    reply.header("content-disposition", `attachment; filename="${contentDispositionFileName(file.fileName)}"`);
+    reply.header("x-vm-session-category", encodedHeaderValue(file.category));
+    reply.header("x-vm-session-path", encodedHeaderValue(file.path));
+    reply.header("content-disposition", contentDispositionAttachment(file.fileName));
     return reply.send(file.data);
   });
 
@@ -144,7 +278,7 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     };
 
     await tick();
-    const interval = setInterval(() => void tick(), 2000);
+    const interval = setInterval(() => void tick(), 1000);
     request.raw.on("close", () => clearInterval(interval));
   });
 }

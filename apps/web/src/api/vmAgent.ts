@@ -1,6 +1,8 @@
 import type {
   VmAgentConnectResponse,
+  VmAgentAttachmentRef,
   VmAgentHistoryResponse,
+  VmAgentMessageAttachment,
   VmAgentMessageResponse,
   VmAgentStatus,
   VmSessionOutputCategory,
@@ -16,8 +18,13 @@ export async function connectVmAgent(): Promise<VmAgentConnectResponse> {
   return requestJson("/api/vm/agent/connect", { method: "POST", body: JSON.stringify({}) });
 }
 
-export async function sendVmAgentMessage(message: string, sessionId?: string): Promise<VmAgentMessageResponse> {
-  return requestJson("/api/vm/agent/messages", { method: "POST", body: JSON.stringify({ message, sessionId }) });
+export async function sendVmAgentMessage(
+  message: string,
+  sessionId?: string,
+  attachments: VmAgentAttachmentRef[] = [],
+  displayAttachments: VmAgentMessageAttachment[] = []
+): Promise<VmAgentMessageResponse> {
+  return requestJson("/api/vm/agent/messages", { method: "POST", body: JSON.stringify({ message, sessionId, attachments, displayAttachments }) });
 }
 
 export async function getVmAgentMessages(after = 0, options: { limit?: number; sessionId?: string } = {}): Promise<VmAgentHistoryResponse> {

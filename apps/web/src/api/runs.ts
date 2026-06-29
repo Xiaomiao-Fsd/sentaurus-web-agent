@@ -1,4 +1,4 @@
-import type { RunDetail, RunFile, RunSummary, SimulationSetup } from "@sentaurus-agent/shared";
+import type { RunDetail, RunFile, RunSummary, SimulationSetup, VmSessionFileSyncStatus } from "@sentaurus-agent/shared";
 import { apiUrl, requestJson, tokenQuery, uploadJson } from "./client.js";
 
 export async function listRuns(): Promise<{ runs: RunSummary[] }> {
@@ -25,7 +25,7 @@ export async function createRun(title: string): Promise<{ run: RunSummary }> {
   return requestJson("/api/runs", { method: "POST", body: JSON.stringify({ title }) });
 }
 
-export async function uploadRunFile(id: string, file: File): Promise<{ file: RunFile; run: RunSummary }> {
+export async function uploadRunFile(id: string, file: File): Promise<{ file: RunFile; run: RunSummary; vmSync: VmSessionFileSyncStatus }> {
   const form = new FormData();
   form.append("file", file);
   return uploadJson(`/api/runs/${encodeURIComponent(id)}/files`, form);

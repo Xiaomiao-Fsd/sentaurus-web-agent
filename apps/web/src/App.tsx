@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, MouseEvent } from "react";
+import { VM_SESSION_INPUT_CATEGORY, VM_SESSION_OUTPUT_CATEGORIES } from "@sentaurus-agent/shared";
 import type {
   RunDetail,
   RunFile,
   RunStatus,
   RunSummary,
   SimulationSetup,
+  VmAgentAttachmentRef,
   VmAgentHistoryResponse,
   VmAgentMessage,
+  VmAgentMessageAttachment,
   VmRunArtifact,
   VmAgentStatus,
   VmSessionFilesResponse,
@@ -37,6 +40,8 @@ import {
   vmRunArtifactDownloadUrl,
   vmSessionFileDownloadUrl
 } from "./lib/api.js";
+import { TopStatusBar } from "./app/TopStatusBar.js";
+import { useToast } from "./components/ui/Toast.js";
 import { errorMessage, formatBytes, formatCompactNumber, formatDate, formatFullDate, normalizeAuthToken, shortId } from "./utils/format.js";
 
 type PanelNotice = {
@@ -90,6 +95,7 @@ type UploadedAttachment = {
   name: string;
   size: number;
   uploadedAt: string;
+  ref?: VmAgentAttachmentRef;
 };
 
 type ImagePreview = {
@@ -98,13 +104,23 @@ type ImagePreview = {
   downloadUrl: string;
 };
 
+type PendingImagePreview = {
+  index: number;
+  url: string;
+  name: string;
+  size: number;
+};
+
 const REFERENCE_CONTEXT_TOKENS = 272_000;
 const REPLY_RETRY_INTERVAL_MS = 10_000;
 const MAX_REPLY_RETRIES = 180;
 const STREAM_RECONNECT_DELAY_MS = 3_000;
 const STREAM_FALLBACK_POLL_MS = 10_000;
 const SESSION_ORDER_KEY = "sentaurus_session_order";
-const OUTPUT_CATEGORIES: VmSessionOutputCategory[] = ["我的输入", "仿真结果文件", "仿真日志文件", "仿真参数文件", "其它文件"];
+const ATTACHMENT_ACCEPT = ".txt,.plt,.cmd,.des,.log,.out,.err,.csv,.json,.png,.jpg,.jpeg,.webp,.gif";
+const MAX_PENDING_IMAGE_ATTACHMENTS = 12;
+const OUTPUT_CATEGORIES: VmSessionOutputCategory[] = [...VM_SESSION_OUTPUT_CATEGORIES];
+const INPUT_SESSION_CATEGORY = VM_SESSION_INPUT_CATEGORY;
 const QUICK_PROMPTS: QuickPrompt[] = [
   {
     label: "Set bias",
@@ -162,6 +178,14 @@ function messageSessionId(message: VmAgentMessage): string | null {
 
 function messageBelongsToSession(message: VmAgentMessage, sessionId: string): boolean {
   return messageSessionId(message) === sessionId;
+}
+
+function isProgressMessage(message: VmAgentMessage): boolean {
+  return message.meta?.kind === "progress";
+}
+
+function isThinkingMessage(message: VmAgentMessage): boolean {
+  return message.meta?.kind === "agent_thinking" || message.meta?.kind === "agent_reasoning_summary";
 }
 
 function metaString(message: VmAgentMessage, key: string): string | null {
@@ -238,6 +262,19 @@ function isImagePath(filePath: string): boolean {
   return /\.(png|jpe?g|webp|gif)$/i.test(filePath);
 }
 
+function isImageContentType(contentType?: string): boolean {
+  if (!contentType) return false;
+  return /^image\/(png|jpe?g|webp|gif)$/i.test(contentType.split(";")[0]?.trim() || "");
+}
+
+function isImageAttachmentLike(name: string, contentType?: string): boolean {
+  return isImagePath(name) || isImageContentType(contentType);
+}
+
+function isImageFile(file: File): boolean {
+  return isImageAttachmentLike(file.name, file.type);
+}
+
 function messageRunId(message: VmAgentMessage): string | null {
   const runId = message.meta?.vmRunId || message.meta?.runId;
   return typeof runId === "string" && runId.trim() ? runId : null;
@@ -245,6 +282,17 @@ function messageRunId(message: VmAgentMessage): string | null {
 
 function vmArtifactsForMessage(message: VmAgentMessage): SessionVmArtifact[] {
   const artifacts: SessionVmArtifact[] = [];
+  for (const attachment of message.attachments || []) {
+    if (attachment.source !== "vm-run-artifact" || !attachment.runId || !attachment.path) continue;
+    artifacts.push({
+      path: attachment.path,
+      size: attachment.size,
+      runId: attachment.runId,
+      messageId: message.id,
+      createdAt: message.createdAt
+    });
+  }
+
   const attempts = parseJsonValue<unknown[]>(metaString(message, "autoDebugAttemptsJson"));
   if (Array.isArray(attempts)) {
     for (const attempt of attempts) {
@@ -362,11 +410,11 @@ function statusTone(status?: RunStatus): "neutral" | "good" | "warn" | "bad" {
 }
 
 function latestMessagePreview(messages: VmAgentMessage[], runId: string): string {
-  const scoped = messages.filter((message) => messageBelongsToSession(message, runId) && message.meta?.kind !== "progress");
+  const scoped = messages.filter((message) => messageBelongsToSession(message, runId) && !isProgressMessage(message) && !isThinkingMessage(message));
   const latest = scoped.at(-1);
   if (!latest) return "No scoped VM messages yet";
   const compact = latest.content.replace(/\s+/g, " ").trim();
-  return compact.length > 86 ? `${compact.slice(0, 86)}…` : compact;
+  return compact.length > 86 ? `${compact.slice(0, 86)}...` : compact;
 }
 
 function progressStatus(value: unknown): ProgressStatus {
@@ -396,22 +444,33 @@ function progressLabel(stage: string): string {
 function progressRowsForSession(messages: VmAgentMessage[], sessionId: string | null): ProgressRow[] {
   if (!sessionId) return [];
   return messages.flatMap((message) => {
-    if (!messageBelongsToSession(message, sessionId) || message.meta?.kind !== "progress") return [];
-    const stage = typeof message.meta.progressStage === "string" ? message.meta.progressStage : "progress";
-    const detail = typeof message.meta.progressDetail === "string" ? message.meta.progressDetail : message.content;
-    const rawProgress = typeof message.meta.progress === "number" ? message.meta.progress : null;
-    const runId = typeof message.meta.runId === "string" ? message.meta.runId : null;
+    if (!messageBelongsToSession(message, sessionId) || !isProgressMessage(message)) return [];
+    const meta = message.meta || {};
+    const stage = typeof meta.progressStage === "string" ? meta.progressStage : "progress";
+    const detail = typeof meta.progressDetail === "string" ? meta.progressDetail : message.content;
+    const rawProgress = typeof meta.progress === "number" ? meta.progress : null;
+    const runId = typeof meta.runId === "string" ? meta.runId : null;
     return [{
       id: message.id,
       createdAt: message.createdAt,
       vmCreatedAt: message.vmCreatedAt,
       stage,
-      status: progressStatus(message.meta.progressStatus),
+      status: progressStatus(meta.progressStatus),
       detail,
       progress: rawProgress === null ? null : Math.max(0, Math.min(100, rawProgress)),
       runId
     }];
   });
+}
+
+function thinkingMessagesForSession(messages: VmAgentMessage[], sessionId: string | null): VmAgentMessage[] {
+  if (!sessionId) return [];
+  return messages.filter((message) => messageBelongsToSession(message, sessionId) && isThinkingMessage(message)).slice(-8);
+}
+
+function thinkingStageLabel(message: VmAgentMessage): string {
+  const stage = metaString(message, "thinkingStage") || metaString(message, "progressStage") || "working";
+  return stage.replace(/_/g, " ");
 }
 
 function estimateContextUsage(messages: VmAgentMessage[]): ContextStats {
@@ -434,12 +493,6 @@ function newSystemMessage(content: string, sessionId: string | null): VmAgentMes
     createdAt: new Date().toISOString(),
     meta: sessionId ? { sessionId } : undefined
   };
-}
-
-function statusPillClass(ok: boolean | null | undefined, warning = false): string {
-  if (ok === true) return "status-pill good";
-  if (warning || ok === false) return "status-pill warn";
-  return "status-pill idle";
 }
 
 function messageSequence(message: VmAgentMessage): number | null {
@@ -506,7 +559,84 @@ function hasAgentReplyForSession(messages: VmAgentMessage[] | undefined, session
   });
 }
 
+function refKey(ref: VmAgentAttachmentRef): string {
+  return `${ref.source}:${ref.runId || ""}:${ref.category || ""}:${ref.path}`;
+}
+
+function attachmentStateLabel(ref?: VmAgentAttachmentRef): string {
+  if (!ref) return "uploaded";
+  const contextStatus = (ref as VmAgentAttachmentRef & { contextStatus?: string }).contextStatus;
+  if (contextStatus) return contextStatus.replace(/_/g, " ");
+  if (ref.source === "run-input") return "inline fallback";
+  if (ref.source === "vm-session-file") return "synced";
+  if (ref.source === "vm-run-artifact") return "VM artifact";
+  return "attached";
+}
+
+function displayAttachmentFromRef(ref: VmAgentAttachmentRef): VmAgentMessageAttachment {
+  return {
+    id: ref.id,
+    kind: isImageAttachmentLike(ref.name || ref.path, ref.contentType) ? "image" : "file",
+    name: ref.name,
+    size: ref.size,
+    contentType: ref.contentType,
+    source: ref.source,
+    path: ref.path,
+    runId: ref.runId,
+    category: ref.category
+  };
+}
+
+function displayAttachmentFromUploaded(file: UploadedAttachment, runId: string | null): VmAgentMessageAttachment {
+  if (file.ref) return displayAttachmentFromRef(file.ref);
+  return {
+    id: file.id,
+    kind: isImageAttachmentLike(file.name) ? "image" : "file",
+    name: file.name,
+    size: file.size,
+    source: "run-input",
+    path: file.name,
+    runId: runId || undefined
+  };
+}
+
+function imageAttachmentUrl(attachment: VmAgentMessageAttachment): string {
+  if (attachment.source === "run-input" && attachment.runId) {
+    return downloadUrl(attachment.runId, "files", attachment.path || attachment.name);
+  }
+  if (attachment.source === "vm-run-artifact" && attachment.runId) {
+    return vmRunArtifactDownloadUrl(attachment.runId, attachment.path);
+  }
+  if (attachment.source === "vm-session-file" && attachment.runId && attachment.category) {
+    return vmSessionFileDownloadUrl(attachment.runId, attachment.category, attachment.path);
+  }
+  return "";
+}
+
+function displayAttachmentKey(attachment: VmAgentMessageAttachment): string {
+  return `${attachment.source}:${attachment.runId || ""}:${attachment.category || ""}:${attachment.path}`;
+}
+
+function vmArtifactDisplayKey(file: SessionVmArtifact): string {
+  return `vm-run-artifact:${file.runId}::${file.path}`;
+}
+
+function attachmentRefFromDisplayAttachment(attachment: VmAgentMessageAttachment): VmAgentAttachmentRef | null {
+  if (!attachment.runId) return null;
+  return {
+    id: attachment.id,
+    source: attachment.source,
+    name: attachment.name || attachment.path,
+    path: attachment.path,
+    size: attachment.size,
+    runId: attachment.runId,
+    category: attachment.category,
+    contentType: attachment.contentType
+  };
+}
+
 export default function App() {
+  const { notify } = useToast();
   const savedToken = getAuthToken();
   const [authInput, setAuthInput] = useState(savedToken);
   const [authKey, setAuthKey] = useState(savedToken);
@@ -546,9 +676,11 @@ export default function App() {
   const [closingSessionMenu, setClosingSessionMenu] = useState<SessionMenuState | null>(null);
   const [renameTitle, setRenameTitle] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<File[]>([]);
+  const [pendingVmAttachments, setPendingVmAttachments] = useState<VmAgentAttachmentRef[]>([]);
   const [messageAttachments, setMessageAttachments] = useState<Record<string, UploadedAttachment[]>>({});
   const [messageDisplayOverrides, setMessageDisplayOverrides] = useState<Record<string, string>>({});
   const [imagePreview, setImagePreview] = useState<ImagePreview | null>(null);
+  const [pendingImagePreviews, setPendingImagePreviews] = useState<PendingImagePreview[]>([]);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const pendingReplySessionRef = useRef<string | null>(null);
   const pendingReplyRetryRef = useRef(0);
@@ -560,13 +692,35 @@ export default function App() {
 
   selectedRunIdRef.current = selectedRunId;
 
+  useEffect(() => {
+    const previews = pendingAttachments
+      .map((file, index) => ({ file, index }))
+      .filter(({ file }) => isImageFile(file))
+      .slice(0, MAX_PENDING_IMAGE_ATTACHMENTS)
+      .map(({ file, index }) => ({
+        index,
+        url: URL.createObjectURL(file),
+        name: file.name,
+        size: file.size
+      }));
+    setPendingImagePreviews(previews);
+    return () => {
+      previews.forEach((preview) => URL.revokeObjectURL(preview.url));
+    };
+  }, [pendingAttachments]);
+
+  useEffect(() => {
+    if (panelNotice) notify(panelNotice.kind, panelNotice.text);
+  }, [notify, panelNotice]);
+
   const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
   const visibleSessionMenu = sessionMenu || closingSessionMenu;
   const menuRun = useMemo(() => runs.find((run) => run.id === visibleSessionMenu?.runId) || null, [runs, visibleSessionMenu]);
   const currentMessages = useMemo(() => messagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
-  const visibleMessages = useMemo(() => currentMessages.filter((message) => message.meta?.kind !== "progress"), [currentMessages]);
+  const visibleMessages = useMemo(() => currentMessages.filter((message) => !isProgressMessage(message) && !isThinkingMessage(message)), [currentMessages]);
   const progressRows = useMemo(() => progressRowsForSession(vmAgentMessages, selectedRunId).slice(-12), [selectedRunId, vmAgentMessages]);
+  const thinkingMessages = useMemo(() => thinkingMessagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
   const messageSimulationSetup = useMemo(() => latestSimulationSetupFromMessages(currentMessages), [currentMessages]);
   const currentSimulationSetup = messageSimulationSetup || runDetail?.run.simulationSetup || selectedRun?.simulationSetup || null;
   const simulationRows = useMemo(() => simulationSetupRows(currentSimulationSetup), [currentSimulationSetup]);
@@ -750,7 +904,8 @@ export default function App() {
   async function handleVmAgentMessage(textOverride?: string) {
     const text = (textOverride ?? composer).trim();
     const attachments = textOverride ? [] : pendingAttachments;
-    if (!text && attachments.length === 0) return;
+    const vmAttachments = textOverride ? [] : pendingVmAttachments;
+    if (!text && attachments.length === 0 && vmAttachments.length === 0) return;
     if (!selectedRunId) {
       setPanelNotice({ kind: "error", text: "Create or select a session before sending a message." });
       return;
@@ -759,25 +914,52 @@ export default function App() {
     if (attachments.length > 0) setAttachmentUploading(true);
     setComposer("");
     setPendingAttachments([]);
+    setPendingVmAttachments([]);
     const uploadedAttachments: UploadedAttachment[] = [];
+    const attachmentRefs: VmAgentAttachmentRef[] = [...vmAttachments];
+    const displayAttachments: VmAgentMessageAttachment[] = vmAttachments.map(displayAttachmentFromRef);
     try {
       for (const file of attachments) {
-        await uploadRunFile(selectedRunId, file);
-        uploadedAttachments.push({
+        const uploaded = await uploadRunFile(selectedRunId, file);
+        const vmSync = uploaded.vmSync;
+        const ref: VmAgentAttachmentRef = {
           id: `${file.name}_${file.size}_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-          name: file.name,
-          size: file.size,
-          uploadedAt: new Date().toISOString()
+          source: vmSync?.ok ? "vm-session-file" : "run-input",
+          name: uploaded.file.name,
+          path: vmSync?.ok ? vmSync.path || uploaded.file.name : uploaded.file.name,
+          size: uploaded.file.size,
+          runId: selectedRunId,
+          category: vmSync?.ok ? vmSync.category || INPUT_SESSION_CATEGORY : undefined,
+          contentType: file.type || undefined
+        };
+        attachmentRefs.push(ref);
+        const displayRef: VmAgentAttachmentRef = {
+          ...ref,
+          source: "run-input",
+          path: uploaded.file.name,
+          category: undefined
+        };
+        displayAttachments.push(displayAttachmentFromRef(displayRef));
+        uploadedAttachments.push({
+          id: ref.id,
+          name: uploaded.file.name,
+          size: uploaded.file.size,
+          uploadedAt: new Date().toISOString(),
+          ref: displayRef
         });
+        if (!vmSync?.ok) {
+          setPanelNotice({ kind: "info", text: `${uploaded.file.name} will be provided inline because VM sync was not confirmed.` });
+        }
       }
       if (uploadedAttachments.length > 0) await refreshRunDetail(selectedRunId);
       if (uploadedAttachments.length > 0) await refreshVmSessionFiles(selectedRunId, false);
 
-      const attachmentLine = uploadedAttachments.length > 0
-        ? `\n\nAttachments uploaded to this session: ${uploadedAttachments.map((file) => file.name).join(", ")}.`
+      const allAttachmentNames = [...uploadedAttachments.map((file) => file.name), ...vmAttachments.map((file) => file.name)];
+      const attachmentLine = allAttachmentNames.length > 0
+        ? `\n\nAttachments available to the VM agent: ${allAttachmentNames.join(", ")}.`
         : "";
-      const visibleText = text || `Attached ${uploadedAttachments.length} file${uploadedAttachments.length === 1 ? "" : "s"}.`;
-      const response = await sendVmAgentMessage(`${visibleText}${attachmentLine}`, selectedRunId);
+      const visibleText = text || `Attached ${allAttachmentNames.length} file${allAttachmentNames.length === 1 ? "" : "s"}.`;
+      const response = await sendVmAgentMessage(`${visibleText}${attachmentLine}`, selectedRunId, attachmentRefs, displayAttachments);
       const messages = response.messages || [response.message];
       setVmAgent(response.status);
       setVmAgentCursorValue(response.cursor);
@@ -785,8 +967,15 @@ export default function App() {
       const userMessage = [...messages]
         .reverse()
         .find((message) => message.role === "user" && messageBelongsToSession(message, selectedRunId));
-      if (userMessage && uploadedAttachments.length > 0) {
-        setMessageAttachments((prev) => ({ ...prev, [userMessage.id]: uploadedAttachments }));
+      if (userMessage && (uploadedAttachments.length > 0 || vmAttachments.length > 0)) {
+        const vmDisplayAttachments: UploadedAttachment[] = vmAttachments.map((ref) => ({
+          id: ref.id,
+          name: ref.name,
+          size: ref.size,
+          uploadedAt: new Date().toISOString(),
+          ref
+        }));
+        setMessageAttachments((prev) => ({ ...prev, [userMessage.id]: [...uploadedAttachments, ...vmDisplayAttachments] }));
         setMessageDisplayOverrides((prev) => ({ ...prev, [userMessage.id]: visibleText }));
       }
       mergeVmAgentMessages(messages);
@@ -797,6 +986,7 @@ export default function App() {
       clearPendingAgentReply(selectedRunId);
       if (!textOverride) setComposer(text);
       setPendingAttachments((prev) => [...attachments, ...prev]);
+      setPendingVmAttachments((prev) => [...vmAttachments, ...prev]);
     } finally {
       setAttachmentUploading(false);
       setMessageSending(false);
@@ -943,11 +1133,85 @@ export default function App() {
 
   function handleSelectAttachments(fileList: FileList | null) {
     if (!fileList?.length) return;
-    setPendingAttachments((prev) => [...prev, ...Array.from(fileList)]);
+    const incoming = Array.from(fileList);
+    let remainingImageSlots = Math.max(0, MAX_PENDING_IMAGE_ATTACHMENTS - pendingAttachments.filter(isImageFile).length);
+    let skippedImages = 0;
+    const accepted = incoming.filter((file) => {
+      if (!isImageFile(file)) return true;
+      if (remainingImageSlots <= 0) {
+        skippedImages += 1;
+        return false;
+      }
+      remainingImageSlots -= 1;
+      return true;
+    });
+    if (skippedImages > 0) notify("info", `Only ${MAX_PENDING_IMAGE_ATTACHMENTS} images can be attached to one message.`);
+    if (accepted.length > 0) setPendingAttachments((prev) => [...prev, ...accepted]);
   }
 
   function removePendingAttachment(index: number) {
     setPendingAttachments((prev) => prev.filter((_, itemIndex) => itemIndex !== index));
+  }
+
+  function addPendingVmAttachment(ref: VmAgentAttachmentRef) {
+    setPendingVmAttachments((prev) => {
+      if (prev.some((item) => refKey(item) === refKey(ref))) return prev;
+      return [...prev, ref];
+    });
+    notify("info", `Added ${ref.name} to message context.`);
+  }
+
+  function removePendingVmAttachment(index: number) {
+    setPendingVmAttachments((prev) => prev.filter((_, itemIndex) => itemIndex !== index));
+  }
+
+  function vmSessionAttachmentRef(file: VmSessionOutputFile): VmAgentAttachmentRef | null {
+    if (!selectedRunId) return null;
+    return {
+      id: `session_${selectedRunId}_${file.category}_${file.path}`.replace(/[^A-Za-z0-9_.:-]/g, "_"),
+      source: "vm-session-file",
+      name: file.name || file.path,
+      path: file.path,
+      size: file.size,
+      runId: selectedRunId,
+      category: file.category
+    };
+  }
+
+  function vmArtifactAttachmentRef(file: SessionVmArtifact): VmAgentAttachmentRef {
+    const name = file.path.split("/").at(-1) || file.path;
+    return {
+      id: `artifact_${file.runId}_${file.path}`.replace(/[^A-Za-z0-9_.:-]/g, "_"),
+      source: "vm-run-artifact",
+      name,
+      path: file.path,
+      size: file.size,
+      runId: file.runId
+    };
+  }
+
+  function renderThinkingPanel() {
+    if (thinkingMessages.length === 0 && !waitingForAgentReply) return null;
+    const latest = thinkingMessages.at(-1);
+    return (
+      <details className="thinking-panel" open={waitingForAgentReply || undefined}>
+        <summary>
+          <span>{waitingForAgentReply ? "Agent working" : "Agent summary"}</span>
+          <small>{latest ? `${thinkingStageLabel(latest)} / ${metaString(latest, "thinkingStatus") || "running"}` : "waiting"}</small>
+        </summary>
+        <div className="thinking-steps">
+          {thinkingMessages.length === 0 ? (
+            <p>Waiting for the VM worker to publish progress.</p>
+          ) : thinkingMessages.map((message) => (
+            <div className={`thinking-row ${metaString(message, "thinkingStatus") || "running"}`} key={message.id}>
+              <span>{thinkingStageLabel(message)}</span>
+              <p>{message.content}</p>
+              <small>{formatDate(message.createdAt)}</small>
+            </div>
+          ))}
+        </div>
+      </details>
+    );
   }
 
   function renderArtifactList(files: RunFile[]) {
@@ -958,7 +1222,7 @@ export default function App() {
         {files.map((file) => (
           <a className="file-row" key={`${file.kind}:${file.name}`} href={downloadUrl(runDetail.run.id, "artifacts", file.name)} target="_blank" rel="noreferrer">
             <span>{file.name}</span>
-            <small>{formatBytes(file.size)} · {formatDate(file.modifiedAt)}</small>
+            <small>{formatBytes(file.size)} / {formatDate(file.modifiedAt)}</small>
           </a>
         ))}
       </div>
@@ -986,17 +1250,17 @@ export default function App() {
     return (
       <div className="file-list">
         {files.map((file) => (
-          <a
-            className="file-row"
-            href={vmRunArtifactDownloadUrl(file.runId, file.path)}
+          <div
+            className="file-row file-row-with-action"
             key={`${file.runId}:${file.path}`}
-            rel="noreferrer"
-            target="_blank"
             title={`${file.runId}/${file.path}`}
           >
-            <span>{file.path}</span>
-            <small>{formatBytes(file.size)} - {file.attempt ? `attempt ${file.attempt}` : file.status || "artifact"} - {shortId(file.runId)}</small>
-          </a>
+            <a href={vmRunArtifactDownloadUrl(file.runId, file.path)} rel="noreferrer" target="_blank">
+              <span>{file.path}</span>
+              <small>{formatBytes(file.size)} - {file.attempt ? `attempt ${file.attempt}` : file.status || "artifact"} - {shortId(file.runId)}</small>
+            </a>
+            <button className="link-button" onClick={() => addPendingVmAttachment(vmArtifactAttachmentRef(file))} type="button">Add to context</button>
+          </div>
         ))}
       </div>
     );
@@ -1016,10 +1280,16 @@ export default function App() {
       );
     }
     return (
-      <a className="file-row" href={href} key={`${file.category}:${file.path}`} rel="noreferrer" target="_blank" title={`${file.category}/${file.path}`}>
-        <span>{file.path}</span>
-        <small>{formatBytes(file.size)} - {formatDate(file.modifiedAt)}</small>
-      </a>
+      <div className="file-row file-row-with-action" key={`${file.category}:${file.path}`} title={`${file.category}/${file.path}`}>
+        <a href={href} rel="noreferrer" target="_blank">
+          <span>{file.path}</span>
+          <small>{formatBytes(file.size)} - {formatDate(file.modifiedAt)}</small>
+        </a>
+        <button className="link-button" disabled={!selectedRunId} onClick={() => {
+          const ref = vmSessionAttachmentRef(file);
+          if (ref) addPendingVmAttachment(ref);
+        }} type="button">Add to context</button>
+      </div>
     );
   }
 
@@ -1356,8 +1626,9 @@ export default function App() {
     mobileRightPanelOpen ? "mobile-right-open" : ""
   ].filter(Boolean).join(" ");
   const mobileSessionStatus = latestProgress ? `${progressLabel(latestProgress.stage)} ${latestProgress.status}` : selectedRun?.status || vmAgentStreamState;
-  const composerStatus = pendingAttachments.length
-    ? `${pendingAttachments.length} attachment${pendingAttachments.length === 1 ? "" : "s"} ready`
+  const pendingAttachmentCount = pendingAttachments.length + pendingVmAttachments.length;
+  const composerStatus = pendingAttachmentCount
+    ? `${pendingAttachmentCount} attachment${pendingAttachmentCount === 1 ? "" : "s"} ready`
     : waitingForAgentReply
       ? "Waiting for agent"
       : canSendMessage
@@ -1367,70 +1638,40 @@ export default function App() {
           : "Select a session";
   const chatComposerClassName = [
     "chat-composer",
-    composer.trim() || pendingAttachments.length ? "has-draft" : "",
+    composer.trim() || pendingAttachmentCount ? "has-draft" : "",
     mobileComposerToolsOpen ? "tools-open" : ""
   ].filter(Boolean).join(" ");
 
   return (
     <main className={shellClassName}>
-      <header className="top-status-bar">
-        <button
-          aria-controls="session-sidebar"
-          aria-expanded={!leftPanelCollapsed}
-          className="secondary desktop-panel-toggle"
-          onClick={() => setLeftPanelCollapsed((collapsed) => !collapsed)}
-          type="button"
-        >
-          {leftPanelCollapsed ? "Show sessions" : "Hide sessions"}
-        </button>
-        <button
-          aria-controls="session-sidebar"
-          aria-expanded={mobileLeftPanelOpen}
-          className="secondary mobile-panel-trigger"
-          onClick={() => {
-            setMobileRightPanelOpen(false);
-            setMobileLeftPanelOpen(true);
-          }}
-          type="button"
-        >
-          Sessions
-        </button>
-        <div className="brand-lockup">
-          <span className="brand-mark">S</span>
-          <div>
-            <strong>Sentaurus VM Agent</strong>
-            <small>VM-local LLM · SSH relay · Safe TCAD workspace</small>
-          </div>
-        </div>
-        <div className="top-status-actions">
-          <span className={statusPillClass(health.endsWith("OK"))}><i />API {health}</span>
-          <span className={statusPillClass(vmOnline, vmLoading)}><i />VM {vmLoading ? "Checking" : vm?.ok ? "Online" : vm ? "Offline" : "Unchecked"}</span>
-          <span className={statusPillClass(workerRunning)}><i />Agent {vmAgent?.workerRunning ? "Running" : vmAgent ? "Stopped" : vmAgentStreamState}</span>
-          <span className={statusPillClass(llmConfigured, vmAgent && !vmAgent.llmConfigured ? true : false)}><i />LLM {vmAgent?.llmConfigured ? "Configured" : "Pending"}</span>
-          <span className={statusPillClass(clockSkewOk, clockSkewWarning)} title={vmAgent?.vmTime ? `VM time: ${vmAgent.vmTime}` : undefined}><i />Clock {clockSkewLabel}</span>
-          <button
-            aria-controls="inspector-panel"
-            aria-expanded={!rightPanelCollapsed}
-            className="secondary desktop-panel-toggle"
-            onClick={() => setRightPanelCollapsed((collapsed) => !collapsed)}
-            type="button"
-          >
-            {rightPanelCollapsed ? "Show details" : "Hide details"}
-          </button>
-        </div>
-        <button
-          aria-controls="inspector-panel"
-          aria-expanded={mobileRightPanelOpen}
-          className="secondary mobile-panel-trigger"
-          onClick={() => {
-            setMobileLeftPanelOpen(false);
-            setMobileRightPanelOpen(true);
-          }}
-          type="button"
-        >
-          Details
-        </button>
-      </header>
+      <TopStatusBar
+        agentChecked={!!vmAgent}
+        clockSkewLabel={clockSkewLabel}
+        clockSkewOk={clockSkewOk}
+        clockSkewWarning={clockSkewWarning}
+        health={health}
+        leftPanelCollapsed={leftPanelCollapsed}
+        llmConfigured={llmConfigured}
+        mobileLeftPanelOpen={mobileLeftPanelOpen}
+        mobileRightPanelOpen={mobileRightPanelOpen}
+        onOpenMobileLeftPanel={() => {
+          setMobileRightPanelOpen(false);
+          setMobileLeftPanelOpen(true);
+        }}
+        onOpenMobileRightPanel={() => {
+          setMobileLeftPanelOpen(false);
+          setMobileRightPanelOpen(true);
+        }}
+        onToggleLeftPanel={() => setLeftPanelCollapsed((collapsed) => !collapsed)}
+        onToggleRightPanel={() => setRightPanelCollapsed((collapsed) => !collapsed)}
+        rightPanelCollapsed={rightPanelCollapsed}
+        vmAgentStreamState={vmAgentStreamState}
+        vmChecked={!!vm}
+        vmLoading={vmLoading}
+        vmOnline={vmOnline}
+        vmTime={vmAgent?.vmTime}
+        workerRunning={workerRunning}
+      />
 
       {(mobileLeftPanelOpen || mobileRightPanelOpen) && (
         <button className="drawer-backdrop" onClick={closeMobilePanels} type="button" aria-label="Close side panel" />
@@ -1457,7 +1698,7 @@ export default function App() {
         <section className="session-toolbar">
           <div>
             <h2>Sessions</h2>
-            <small>{visibleRuns.length} shown · {runs.length} total</small>
+            <small>{visibleRuns.length} shown / {runs.length} total</small>
           </div>
           <button onClick={() => void handleCreateRun()} disabled={!authKey}>New</button>
         </section>
@@ -1567,7 +1808,7 @@ export default function App() {
           <div className="progress-panel-header">
             <div>
               <p className="eyebrow">Progress</p>
-              <h2>{latestProgress ? `${progressLabel(latestProgress.stage)} · ${latestProgress.status}` : "Idle"}</h2>
+              <h2>{latestProgress ? `${progressLabel(latestProgress.stage)} / ${latestProgress.status}` : "Idle"}</h2>
             </div>
             <div className="progress-panel-controls">
               <span>{progressRows.length} event{progressRows.length === 1 ? "" : "s"}</span>
@@ -1611,6 +1852,7 @@ export default function App() {
         </section>
 
         <div className="message-list">
+          {renderThinkingPanel()}
           {visibleMessages.length === 0 && (
             <div className="empty-chat">
               <strong>{selectedRun ? "No messages in this session." : "No session selected."}</strong>
@@ -1618,51 +1860,74 @@ export default function App() {
             </div>
           )}
           {visibleMessages.map((message) => {
-            const attachments = messageAttachments[message.id] || [];
-            const messageVmArtifacts = vmArtifactsForMessage(message);
+            const optimisticAttachments = (messageAttachments[message.id] || []).map((file) => displayAttachmentFromUploaded(file, selectedRunId));
+            const allDisplayAttachments = message.attachments?.length ? message.attachments : optimisticAttachments;
+            let visibleImageAttachments = 0;
+            const displayAttachments = allDisplayAttachments.filter((attachment) => {
+              if (attachment.kind !== "image") return true;
+              visibleImageAttachments += 1;
+              return visibleImageAttachments <= MAX_PENDING_IMAGE_ATTACHMENTS;
+            });
+            const hiddenDisplayAttachmentCount = Math.max(0, allDisplayAttachments.length - displayAttachments.length);
+            const displayAttachmentKeys = new Set(displayAttachments.map(displayAttachmentKey));
+            const messageVmArtifacts = vmArtifactsForMessage(message).filter((file) => !displayAttachmentKeys.has(vmArtifactDisplayKey(file)));
             const visibleVmArtifacts = messageVmArtifacts.slice(0, 16);
+            const hiddenVmArtifactCount = Math.max(0, messageVmArtifacts.length - visibleVmArtifacts.length);
             const content = messageDisplayOverrides[message.id] ?? message.content;
             return (
               <article className={`message-row ${message.role}`} key={message.id}>
                 <div className="avatar">{message.role === "agent" ? "VM" : message.role === "user" ? "You" : "Sys"}</div>
                 <div className="message-bubble">
                   <div className="message-content">{content}</div>
-                  {(attachments.length > 0 || messageVmArtifacts.length > 0) && (
+                  {(displayAttachments.length > 0 || messageVmArtifacts.length > 0) && (
                     <div className="message-attachments">
-                      {attachments.map((file) => (
-                        isImagePath(file.name) && selectedRunId ? (
-                          <span className="chat-image-with-link" key={file.id}>
-                            {renderImagePreview(downloadUrl(selectedRunId, "files", file.name), file.name, downloadUrl(selectedRunId, "files", file.name))}
+                      {displayAttachments.map((attachment) => {
+                        const href = imageAttachmentUrl(attachment);
+                        const ref = attachmentRefFromDisplayAttachment(attachment);
+                        if (attachment.kind === "image" && href) {
+                          return (
+                            <span className="chat-image-with-link" key={`${displayAttachmentKey(attachment)}:${attachment.id}`}>
+                              {renderImagePreview(href, attachment.name || attachment.path, href)}
+                              {ref && <button className="link-button image-context-action" onClick={() => addPendingVmAttachment(ref)} type="button">Add to context</button>}
+                            </span>
+                          );
+                        }
+                        return (
+                          <span className="attachment-chip" key={`${displayAttachmentKey(attachment)}:${attachment.id}`}>
+                            {href ? (
+                              <a href={href} rel="noreferrer" target="_blank">
+                                <span>{attachment.name || attachment.path}</span>
+                                <small>{attachmentStateLabel(ref || undefined)} / {formatBytes(attachment.size)}</small>
+                              </a>
+                            ) : (
+                              <>
+                                <span>{attachment.name || attachment.path}</span>
+                                <small>{attachmentStateLabel(ref || undefined)} / {formatBytes(attachment.size)}</small>
+                              </>
+                            )}
+                            {ref && <button type="button" onClick={() => addPendingVmAttachment(ref)}>Add</button>}
                           </span>
-                        ) : (
-                          <span className="attachment-chip" key={file.id}>
-                            <span>{file.name}</span>
-                            <small>{formatBytes(file.size)}</small>
-                          </span>
-                        )
-                      ))}
+                        );
+                      })}
                       {visibleVmArtifacts.map((file) => (
                         isImagePath(file.path) ? (
                           <span className="chat-image-with-link" key={`${file.runId}:${file.path}`}>
                             {renderImagePreview(vmRunArtifactDownloadUrl(file.runId, file.path), file.path, vmRunArtifactDownloadUrl(file.runId, file.path))}
+                            <button className="link-button image-context-action" onClick={() => addPendingVmAttachment(vmArtifactAttachmentRef(file))} type="button">Add to context</button>
                           </span>
                         ) : (
-                          <a
-                            className="attachment-chip artifact-chip"
-                            href={vmRunArtifactDownloadUrl(file.runId, file.path)}
-                            key={`${file.runId}:${file.path}`}
-                            rel="noreferrer"
-                            target="_blank"
-                            title={`${file.runId}/${file.path}`}
-                          >
-                            <span>{file.path}</span>
-                            <small>{file.attempt ? `try ${file.attempt} / ${formatBytes(file.size)}` : formatBytes(file.size)}</small>
-                          </a>
+                          <span className="attachment-chip artifact-chip" key={`${file.runId}:${file.path}`} title={`${file.runId}/${file.path}`}>
+                            <a href={vmRunArtifactDownloadUrl(file.runId, file.path)} rel="noreferrer" target="_blank">
+                              <span>{file.path}</span>
+                              <small>{file.attempt ? `try ${file.attempt} / ${formatBytes(file.size)}` : formatBytes(file.size)}</small>
+                            </a>
+                            <button type="button" onClick={() => addPendingVmAttachment(vmArtifactAttachmentRef(file))}>Add to context</button>
+                          </span>
                         )
                       ))}
-                      {messageVmArtifacts.length > visibleVmArtifacts.length && (
+                      {(hiddenDisplayAttachmentCount > 0 || hiddenVmArtifactCount > 0) && (
                         <span className="attachment-chip muted-chip">
-                          <span>+{messageVmArtifacts.length - visibleVmArtifacts.length} more</span>
+                          <span>+{hiddenDisplayAttachmentCount + hiddenVmArtifactCount} more</span>
                         </span>
                       )}
                     </div>
@@ -1704,7 +1969,7 @@ export default function App() {
           <div className="mobile-attach-row">
             <label className="attach-button">
               Attach files
-              <input type="file" multiple disabled={!authKey || !selectedRunId || messageSending || attachmentUploading} onChange={(event) => {
+              <input accept={ATTACHMENT_ACCEPT} type="file" multiple disabled={!authKey || !selectedRunId || messageSending || attachmentUploading} onChange={(event) => {
                 handleSelectAttachments(event.target.files);
                 event.currentTarget.value = "";
               }} />
@@ -1712,11 +1977,42 @@ export default function App() {
           </div>
           {pendingAttachments.length > 0 && (
             <div className="pending-attachments">
-              {pendingAttachments.map((file, index) => (
-                <span className="attachment-chip" key={`${file.name}-${file.size}-${index}`}>
+              {pendingAttachments.map((file, index) => {
+                const preview = pendingImagePreviews.find((item) => item.index === index);
+                if (preview) {
+                  return (
+                    <span className="pending-image-card" key={`${file.name}-${file.size}-${index}`}>
+                      <button
+                        className="image-thumb-button"
+                        onClick={() => setImagePreview({ src: preview.url, title: preview.name, downloadUrl: preview.url })}
+                        title={preview.name}
+                        type="button"
+                      >
+                        <img alt={preview.name} loading="lazy" src={preview.url} />
+                      </button>
+                      <span>{preview.name}</span>
+                      <small>{formatBytes(preview.size)}</small>
+                      <button type="button" onClick={() => removePendingAttachment(index)} disabled={messageSending || attachmentUploading}>x</button>
+                    </span>
+                  );
+                }
+                return (
+                  <span className="attachment-chip" key={`${file.name}-${file.size}-${index}`}>
+                    <span>{file.name}</span>
+                    <small>{formatBytes(file.size)}</small>
+                    <button type="button" onClick={() => removePendingAttachment(index)} disabled={messageSending || attachmentUploading}>x</button>
+                  </span>
+                );
+              })}
+            </div>
+          )}
+          {pendingVmAttachments.length > 0 && (
+            <div className="pending-attachments">
+              {pendingVmAttachments.map((file, index) => (
+                <span className="attachment-chip" key={refKey(file)}>
                   {file.name}
-                  <small>{formatBytes(file.size)}</small>
-                  <button type="button" onClick={() => removePendingAttachment(index)} disabled={messageSending || attachmentUploading}>×</button>
+                  <small>{attachmentStateLabel(file)} / {formatBytes(file.size)}</small>
+                  <button type="button" onClick={() => removePendingVmAttachment(index)} disabled={messageSending || attachmentUploading}>x</button>
                 </span>
               ))}
             </div>
@@ -1732,18 +2028,18 @@ export default function App() {
                   void handleVmAgentMessage();
                 }
               }}
-              placeholder="Message the VM agent…"
+              placeholder="Message the VM agent..."
               rows={3}
             />
             <div className="composer-actions">
               <label className="attach-button">
                 Attach
-                <input type="file" multiple disabled={!authKey || !selectedRunId || messageSending || attachmentUploading} onChange={(event) => {
+                <input accept={ATTACHMENT_ACCEPT} type="file" multiple disabled={!authKey || !selectedRunId || messageSending || attachmentUploading} onChange={(event) => {
                   handleSelectAttachments(event.target.files);
                   event.currentTarget.value = "";
                 }} />
               </label>
-              <button disabled={!canSendMessage || (!composer.trim() && pendingAttachments.length === 0)}>
+              <button disabled={!canSendMessage || (!composer.trim() && pendingAttachmentCount === 0)}>
                 {attachmentUploading ? "Uploading" : messageSending ? "Sending" : "Send"}
               </button>
             </div>
@@ -1781,7 +2077,7 @@ export default function App() {
             <dt>VM</dt><dd>{vmOnline === true ? "online" : vmOnline === false ? "offline" : "unchecked"}</dd>
             <dt>Agent</dt><dd>{workerRunning ? "running" : vmAgent ? "stopped" : vmAgentStreamState}</dd>
             <dt>LLM</dt><dd>{vmAgent?.llmConfigured ? "configured" : "pending"}</dd>
-            <dt>Models</dt><dd>{vmAgent?.llmModels?.join(" → ") || vmAgent?.llmModel || "not configured"}</dd>
+            <dt>Models</dt><dd>{vmAgent?.llmModels?.join(" -> ") || vmAgent?.llmModel || "not configured"}</dd>
             <dt>Manuals</dt><dd>{vmAgent?.manualCount ? `${vmAgent.manualCount} installed` : "none installed"}</dd>
             <dt>Messages</dt><dd>{vmAgent?.messageCount ?? currentMessages.length}</dd>
             <dt>Queue</dt><dd>{vmAgent?.queueDepth ?? 0}</dd>
@@ -1827,7 +2123,7 @@ export default function App() {
           <section className="inspector-card">
             <h2>Global Agent Events</h2>
             <div className="global-events">
-              {globalMessages.map((message) => <p key={message.id}>{formatDate(message.createdAt)} · {message.content}</p>)}
+              {globalMessages.map((message) => <p key={message.id}>{formatDate(message.createdAt)} / {message.content}</p>)}
             </div>
           </section>
         )}

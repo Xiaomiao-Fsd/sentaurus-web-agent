@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
-import type { SimulationSetup } from "@sentaurus-agent/shared";
+import { VM_SESSION_INPUT_CATEGORY } from "@sentaurus-agent/shared";
+import type { RunFile, RunSummary, SimulationSetup, VmSessionFileSyncStatus } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
 import { prepareRemoteRun } from "../services/sentaurusRunner.js";
@@ -20,10 +21,15 @@ import {
   streamRunFile,
   updateRun
 } from "../services/runStore.js";
-import { syncInputFileToVmSession } from "../services/vmSessionFiles.js";
+import { contentTypeForName, syncInputFileToVmSession } from "../services/vmSessionFiles.js";
 
 type RunParams = { id: string };
 type FileParams = RunParams & { name: string };
+type UploadRunFileResponse = {
+  file: RunFile;
+  run: RunSummary;
+  vmSync: VmSessionFileSyncStatus;
+};
 
 function authTokenFromQuery(query: unknown): string | undefined {
   if (!query || typeof query !== "object") return undefined;
@@ -79,7 +85,7 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
     return { files: await listRunFiles(request.params.id, "input") };
   });
 
-  app.post<{ Params: RunParams }>("/api/runs/:id/files", async (request) => {
+  app.post<{ Params: RunParams; Reply: UploadRunFileResponse }>("/api/runs/:id/files", async (request) => {
     requireAuth(request);
     const file = await request.file();
     if (!file) {
@@ -89,20 +95,24 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
     }
     const saved = await saveInputFile(request.params.id, file.filename, file.file);
     await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] uploaded input/${saved.name}`);
+    let vmSync: VmSessionFileSyncStatus = { ok: false };
     try {
       const localPath = await resolveRunFile(request.params.id, "input", saved.name);
       await syncInputFileToVmSession(request.params.id, saved.name, localPath);
+      vmSync = { ok: true, category: VM_SESSION_INPUT_CATEGORY, path: saved.name };
       await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] synced input/${saved.name} to VM output/我的输入`);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
+      vmSync = { ok: false, error: detail };
       await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] VM input sync failed for ${saved.name}: ${detail}`);
     }
-    return { file: saved, run: await getPublicRun(request.params.id) };
+    return { file: saved, run: await getPublicRun(request.params.id), vmSync };
   });
 
   app.get<{ Params: FileParams }>("/api/runs/:id/files/:name", async (request, reply) => {
     requireAuth(request);
     const filePath = await resolveRunFile(request.params.id, "input", request.params.name);
+    reply.header("content-type", contentTypeForName(request.params.name));
     return reply.send(streamRunFile(filePath));
   });
 

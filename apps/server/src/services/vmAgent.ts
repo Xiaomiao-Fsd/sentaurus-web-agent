@@ -1,7 +1,11 @@
-import type { VmAgentMessage, VmAgentStatus } from "@sentaurus-agent/shared";
+import fs from "node:fs/promises";
+import path from "node:path";
+import type { VmAgentAttachmentRef, VmAgentMessage, VmAgentMessageAttachment, VmAgentStatus } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
 import { safeRelativePath, safeRunId } from "../security/pathSafe.js";
+import { resolveRunFile } from "./runStore.js";
 import { runSshCommandWithInput } from "./sshClient.js";
+import { downloadVmSessionFile } from "./vmSessionFiles.js";
 
 type VmAgentOperation = "status" | "start" | "send" | "history";
 
@@ -9,6 +13,8 @@ type RemoteAgentRequest = {
   operation: VmAgentOperation;
   message?: string;
   sessionId?: string;
+  attachments?: VmAgentAttachmentRef[];
+  displayAttachments?: VmAgentMessageAttachment[];
   after?: number;
   limit?: number;
 };
@@ -47,9 +53,39 @@ type RemoteAgentPayload = {
   raw?: string;
 };
 
+type EnrichedVmAgentAttachmentRef = VmAgentAttachmentRef & {
+  contextStatus?: "inline" | "vm_path" | "metadata_only" | "not_found" | "too_large" | "unsupported" | "error";
+  inlineText?: string;
+  inlineTextTruncated?: boolean;
+  vmPath?: string;
+  inlineError?: string;
+};
+
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.4.7";
+const agentVersion = "0.5.0";
 const maxVmArtifactBytes = 50 * 1024 * 1024;
+const maxInlineAttachmentBytes = 512 * 1024;
+const maxInlineAttachmentTotalChars = 300_000;
+const readableAttachmentExtensions = new Set([
+  ".txt",
+  ".md",
+  ".yaml",
+  ".yml",
+  ".rst",
+  ".log",
+  ".out",
+  ".err",
+  ".csv",
+  ".json",
+  ".cmd",
+  ".des",
+  ".par",
+  ".scm",
+  ".tcl",
+  ".sde",
+  ".dat",
+  ".plt"
+]);
 const vmArtifactExtensions = new Set([
   ".log",
   ".out",
@@ -101,7 +137,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.7"
+AGENT_VERSION = "0.5.0"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -168,7 +204,7 @@ def run_with_timeout(seconds, label, fn, *args):
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
 
-def append_message(role, content, source, meta=None, id_prefix=None):
+def append_message(role, content, source, meta=None, id_prefix=None, display_attachments=None):
     message = {
         "id": message_id(id_prefix or ("vm" if role == "agent" else "web")),
         "role": role,
@@ -177,6 +213,8 @@ def append_message(role, content, source, meta=None, id_prefix=None):
         "createdAt": now_iso(),
         "meta": meta or {},
     }
+    if isinstance(display_attachments, list) and display_attachments:
+        message["attachments"] = display_attachments[:12]
     append_jsonl(MESSAGES_PATH, message)
     audit("message", {"id": message.get("id"), "role": role, "source": source, "kind": (meta or {}).get("kind")})
     return message
@@ -199,6 +237,18 @@ def append_progress(session_id, stage, status, detail, progress=None, run_id="")
     content = "Progress: %s %s - %s" % (stage, status, detail)
     return append_message("system", content, "vm-agent-progress", meta, "progress")
 
+def append_thinking(session_id, request_message_id, stage, detail, status="running", collapsed=False):
+    meta = {
+        "kind": "agent_thinking",
+        "sessionId": safe_text(session_id, 160),
+        "requestMessageId": safe_text(request_message_id, 180),
+        "thinkingStage": safe_text(stage, 80),
+        "thinkingStatus": safe_text(status, 40),
+        "collapsedByDefault": bool(collapsed),
+    }
+    content = "%s: %s" % (safe_text(stage, 80), safe_text(detail, 900))
+    return append_message("system", content, "vm-agent-thinking", meta, "thinking")
+
 def read_all_messages():
     messages = []
     if not os.path.exists(MESSAGES_PATH):
@@ -216,9 +266,11 @@ def read_all_messages():
 
 def non_progress_session_message(item):
     meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-    if meta.get("kind") == "progress":
+    if meta.get("kind") in ["progress", "agent_thinking", "agent_reasoning_summary"]:
         return False
     if item.get("source") == "vm-agent-progress":
+        return False
+    if item.get("source") == "vm-agent-thinking":
         return False
     return True
 
@@ -589,6 +641,241 @@ def safe_artifact_rel_parts(rel_path):
     if not clean:
         raise ValueError("empty artifact path")
     return clean
+
+READABLE_ATTACHMENT_EXTENSIONS = set([".txt", ".md", ".rst", ".log", ".out", ".err", ".csv", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".sde", ".dat", ".plt"])
+BINARY_ATTACHMENT_EXTENSIONS = set([".tdr", ".grd", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".bnd", ".sat"])
+MAX_ATTACHMENT_READ_BYTES = 256 * 1024
+MAX_ATTACHMENT_CONTEXT_CHARS = 600000
+IMAGE_EXTENSIONS = set([".png", ".jpg", ".jpeg", ".webp", ".gif"])
+
+def content_type_for_ext(ext):
+    if ext == ".png":
+        return "image/png"
+    if ext in [".jpg", ".jpeg"]:
+        return "image/jpeg"
+    if ext == ".webp":
+        return "image/webp"
+    if ext == ".gif":
+        return "image/gif"
+    return "application/octet-stream"
+
+def display_attachments_for_artifacts(run_id, artifacts, limit=12):
+    result = []
+    run_id = safe_text(run_id, 180).strip()
+    for item in artifacts or []:
+        rel = safe_text(item.get("path"), 500).replace("\\", "/")
+        ext = os.path.splitext(rel)[1].lower()
+        if ext not in IMAGE_EXTENSIONS:
+            continue
+        name = os.path.basename(rel)
+        result.append({
+            "id": safe_text(("artifact_%s_%s" % (run_id, rel)).replace("/", "_"), 180),
+            "kind": "image",
+            "name": name,
+            "size": int(item.get("size") or 0),
+            "contentType": content_type_for_ext(ext),
+            "source": "vm-run-artifact",
+            "path": rel,
+            "runId": run_id,
+        })
+    return result[:limit]
+
+def extract_vm_session_files(reply):
+    start_tag = "<VM_SESSION_FILE>"
+    end_tag = "</VM_SESSION_FILE>"
+    specs = []
+    visible = safe_text(reply, 20000)
+    while True:
+        start = visible.find(start_tag)
+        end = visible.find(end_tag, start + len(start_tag)) if start >= 0 else -1
+        if start < 0 or end < 0:
+            break
+        body = visible[start + len(start_tag):end].strip()
+        try:
+            payload = json.loads(body)
+            if isinstance(payload, dict):
+                specs.append(payload)
+        except Exception as exc:
+            audit("vm_session_file_parse_failed", {"error": safe_text(str(exc), 400), "body": safe_text(body, 500)})
+        visible = (visible[:start] + visible[end + len(end_tag):]).strip()
+    return specs, visible
+
+def normalize_session_file_category(value):
+    raw = safe_text(value, 120).strip()
+    lowered = raw.lower()
+    aliases = {
+        "device structure": OUTPUT_CATEGORY_RESULTS,
+        "structure": OUTPUT_CATEGORY_RESULTS,
+        "structure image": OUTPUT_CATEGORY_RESULTS,
+        "simulation image": OUTPUT_CATEGORY_RESULTS,
+        "image": OUTPUT_CATEGORY_RESULTS,
+        "plot": OUTPUT_CATEGORY_RESULTS,
+        "result": OUTPUT_CATEGORY_RESULTS,
+        "results": OUTPUT_CATEGORY_RESULTS,
+        "png": OUTPUT_CATEGORY_RESULTS,
+        "jpg": OUTPUT_CATEGORY_RESULTS,
+        "jpeg": OUTPUT_CATEGORY_RESULTS,
+        "webp": OUTPUT_CATEGORY_RESULTS,
+        "gif": OUTPUT_CATEGORY_RESULTS,
+    }
+    categories = [OUTPUT_CATEGORY_INPUT, OUTPUT_CATEGORY_RESULTS, OUTPUT_CATEGORY_LOGS, OUTPUT_CATEGORY_PARAMS, OUTPUT_CATEGORY_OTHER]
+    if raw in categories:
+        return raw
+    return aliases.get(lowered) or aliases.get(raw) or OUTPUT_CATEGORY_RESULTS
+
+def safe_source_image_path(path):
+    path = safe_text(path, 1200).strip()
+    if not path:
+        raise ValueError("sourcePath is required")
+    source = os.path.abspath(os.path.expanduser(path))
+    stdb_root = os.path.abspath(os.path.join(HOME, "STDB"))
+    if source != stdb_root and not source.startswith(stdb_root + os.sep):
+        raise ValueError("sourcePath must stay under ~/STDB")
+    if not os.path.isfile(source):
+        raise ValueError("sourcePath does not exist")
+    ext = os.path.splitext(source)[1].lower()
+    if ext not in IMAGE_EXTENSIONS:
+        raise ValueError("VM_SESSION_FILE only supports image files for chat preview")
+    return source
+
+def publish_vm_session_file(session_id, spec):
+    session_id = safe_text(session_id, 180).strip()
+    if not session_id or not re.match(r"^run_[A-Za-z0-9_-]+$", session_id):
+        raise ValueError("sessionId is required to publish a VM session file")
+    source = safe_source_image_path(spec.get("sourcePath") or spec.get("path") or "")
+    name = safe_file_name(spec.get("name") or os.path.basename(source))
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in IMAGE_EXTENSIONS:
+        raise ValueError("published file name must be an image")
+    category = normalize_session_file_category(spec.get("category"))
+    category_dir = os.path.abspath(os.path.join(SESSION_OUTPUT_ROOT, session_id, "output", category))
+    ensure_dir(category_dir)
+    target = os.path.abspath(os.path.join(category_dir, name))
+    if target == category_dir or not target.startswith(category_dir + os.sep):
+        raise ValueError("published file escapes output category")
+    shutil.copy2(source, target)
+    size = os.path.getsize(target)
+    return {
+        "id": safe_text(("vm_session_%s_%s_%s" % (session_id, category, name)).replace("/", "_").replace(" ", "_"), 180),
+        "kind": "image",
+        "name": name,
+        "size": size,
+        "contentType": content_type_for_ext(ext),
+        "source": "vm-session-file",
+        "path": name,
+        "runId": session_id,
+        "category": category,
+    }
+
+def safe_attachment_rel_parts(rel_path):
+    parts = safe_text(rel_path, 500).replace("\\", "/").split("/")
+    clean = []
+    for part in parts:
+        part = safe_text(part, 180).strip()
+        if not part or part in [".", ".."] or part.startswith(".") or ".." in part:
+            raise ValueError("invalid attachment path")
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._@()+, -]{0,159}$", part):
+            raise ValueError("attachment path contains unsupported characters")
+        clean.append(part)
+    if not clean:
+        raise ValueError("empty attachment path")
+    return clean
+
+def attachment_abs_path(session_id, ref):
+    source = safe_text(ref.get("source"), 60).strip()
+    rel_path = safe_text(ref.get("path"), 500).replace("\\", "/")
+    parts = safe_attachment_rel_parts(rel_path)
+    if source in ["vm-session-file", "run-input"]:
+        category = safe_text(ref.get("category") or OUTPUT_CATEGORY_INPUT, 180).strip()
+        if category not in [OUTPUT_CATEGORY_INPUT, OUTPUT_CATEGORY_RESULTS, OUTPUT_CATEGORY_LOGS, OUTPUT_CATEGORY_PARAMS, OUTPUT_CATEGORY_OTHER]:
+            raise ValueError("unsupported session output category")
+        if not session_id or not re.match(r"^run_[A-Za-z0-9_-]+$", session_id):
+            raise ValueError("invalid session id for session attachment")
+        base = os.path.abspath(os.path.join(SESSION_OUTPUT_ROOT, session_id, "output", category))
+        target = os.path.abspath(os.path.join(base, *parts))
+        if target != base and target.startswith(base + os.sep):
+            return target
+        raise ValueError("attachment path escapes session output category")
+    if source == "vm-run-artifact":
+        run_id = safe_text(ref.get("runId"), 180).strip()
+        if not re.match(r"^run_[A-Za-z0-9_-]+$", run_id):
+            raise ValueError("invalid artifact run id")
+        base = os.path.abspath(os.path.join(RUNS_DIR, run_id))
+        target = os.path.abspath(os.path.join(base, *parts))
+        if target != base and target.startswith(base + os.sep):
+            return target
+        raise ValueError("attachment path escapes run artifact directory")
+    raise ValueError("unsupported attachment source")
+
+def read_attachment_text(path):
+    ext = os.path.splitext(path)[1].lower()
+    size = os.path.getsize(path)
+    if ext in BINARY_ATTACHMENT_EXTENSIONS:
+        return "", {"binary": True, "size": size, "ext": ext}
+    if ext not in READABLE_ATTACHMENT_EXTENSIONS:
+        return "", {"skipped": "extension not readable", "size": size, "ext": ext}
+    with open(path, "rb") as handle:
+        raw = handle.read(min(size, MAX_ATTACHMENT_READ_BYTES))
+    text = raw.decode("utf-8", "replace") if sys.version_info[0] >= 3 else raw.decode("utf-8", "replace")
+    if size > MAX_ATTACHMENT_READ_BYTES:
+        text += "\n[truncated after %s bytes]" % MAX_ATTACHMENT_READ_BYTES
+    return text, {"binary": False, "size": size, "ext": ext}
+
+def attachment_context(session_id, attachments):
+    if not isinstance(attachments, list) or not attachments:
+        return "", []
+    chunks = []
+    summaries = []
+    used = 0
+    for index, ref in enumerate(attachments[:8], 1):
+        if not isinstance(ref, dict):
+            continue
+        name = safe_text(ref.get("name") or ref.get("path") or ("attachment-%s" % index), 180)
+        source = safe_text(ref.get("source"), 60)
+        status = safe_text(ref.get("contextStatus") or "vm_path", 80)
+        inline_text = safe_text(ref.get("inlineText"), MAX_ATTACHMENT_CONTEXT_CHARS)
+        if inline_text:
+            truncated = bool(ref.get("inlineTextTruncated"))
+            summaries.append({
+                "name": name,
+                "path": safe_text(ref.get("path"), 500),
+                "source": source,
+                "contextStatus": status or "inline",
+                "inline": True,
+                "size": len(inline_text),
+                "truncated": truncated,
+            })
+            if used < MAX_ATTACHMENT_CONTEXT_CHARS:
+                remaining = MAX_ATTACHMENT_CONTEXT_CHARS - used
+                clipped = inline_text[:remaining]
+                used += len(clipped)
+                chunks.append("### %s\nsource: %s\nstatus: %s\ntruncated: %s\n\n--- begin attachment text ---\n%s\n--- end attachment text ---" % (name, source, status or "inline", "true" if truncated else "false", clipped))
+            continue
+        try:
+            vm_path = safe_text(ref.get("vmPath"), 800)
+            path = vm_path if vm_path else attachment_abs_path(session_id, ref)
+            if not os.path.isfile(path):
+                raise ValueError("file not found")
+            text, info = read_attachment_text(path)
+            rel = safe_text(ref.get("path"), 500)
+            file_status = "vm_path" if text else "metadata_only"
+            summaries.append({"name": name, "path": rel, "source": source, "contextStatus": file_status, "size": info.get("size"), "binary": bool(info.get("binary")), "skipped": info.get("skipped"), "synced": bool(text)})
+            if text and used < MAX_ATTACHMENT_CONTEXT_CHARS:
+                remaining = MAX_ATTACHMENT_CONTEXT_CHARS - used
+                clipped = text[:remaining]
+                used += len(clipped)
+                chunks.append("### %s\nsource: %s\nstatus: vm_path\npath: %s\ntruncated: %s\n\n--- begin attachment text ---\n%s\n--- end attachment text ---" % (name, source, rel, "true" if len(text) > len(clipped) else "false", clipped))
+        except Exception as exc:
+            summaries.append({
+                "name": name,
+                "path": safe_text(ref.get("path"), 500),
+                "source": source,
+                "contextStatus": safe_text(ref.get("contextStatus") or "not_found", 80),
+                "error": safe_text(ref.get("inlineError") or str(exc), 300),
+            })
+    if not chunks and summaries:
+        chunks.append("### Attachment diagnostics\n--- begin attachment diagnostics json ---\n%s\n--- end attachment diagnostics json ---" % json.dumps(summaries, ensure_ascii=True, sort_keys=True))
+    return "[Attachment context]\n\n" + "\n\n".join(chunks), summaries
 
 def sync_run_artifacts_to_session_output(session_id, run_id, run_dir, artifacts):
     session_id = safe_text(session_id, 180).strip()
@@ -1452,7 +1739,7 @@ def call_llm_model(user_text, config, model, system):
         request = urllib2.Request(responses_url(config.get("api_base")), body, {
             "content-type": "application/json",
             "authorization": "Bearer %s" % config.get("api_key"),
-            "user-agent": "sentaurus-vm-agent/0.4.7",
+            "user-agent": "sentaurus-vm-agent/0.5.0",
         })
         response = urllib2.urlopen(request, timeout=90).read()
         try:
@@ -1476,7 +1763,7 @@ def call_llm_model(user_text, config, model, system):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.4.7",
+        "user-agent": "sentaurus-vm-agent/0.5.0",
     })
     response = urllib2.urlopen(request, timeout=90).read()
     try:
@@ -1512,6 +1799,7 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
         "Use the installed tool paths and VM state in the snapshot. Ask for missing physics/process assumptions instead of inventing critical parameters. "
         "Before saying previous files, run directories, decks, or results are unavailable, inspect the recent browser-session context below. "
         "If the user says 'continue', 'that project', or similar, resolve it from the same-session context whenever possible. "
+        "When you need to publish an existing VM image file into the browser chat, include a <VM_SESSION_FILE>{\"category\":\"simulation image\",\"name\":\"safe-name.png\",\"sourcePath\":\"/home/TCAD2022/STDB/.../safe-name.png\"}</VM_SESSION_FILE> block; use it only for real .png, .jpg, .jpeg, .webp, or .gif files under ~/STDB. "
         "The browser and host backend only relay messages; API credentials stay inside this VM. "
         "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True) + "\n\n" +
         "Durable SDE/SDevice generation guardrails:\n" + deck_generation_guardrails() + "\n\n" +
@@ -1560,25 +1848,52 @@ def process_queue_file(path):
     try:
         with open(path, "r") as handle:
             item = json.load(handle)
-        text = safe_text(item.get("content"), 4000)
+        user_text = safe_text(item.get("content"), 4000)
+        text = user_text
         incoming_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         session_id = safe_text(incoming_meta.get("sessionId"), 160).strip()
+        request_message_id = item.get("id") or ""
+        attachments = item.get("contextAttachments") if isinstance(item.get("contextAttachments"), list) else item.get("attachments") if isinstance(item.get("attachments"), list) else []
+        display_attachments = []
         audit("queue_processing_started", {"file": os.path.basename(path), "sessionId": session_id})
         append_progress(session_id, "received", "running", "Worker picked up queued request", 5)
+        append_thinking(session_id, request_message_id, "received", "Queued request is now being processed inside the VM.")
+        if attachments:
+            append_thinking(session_id, request_message_id, "attachments", "Resolving %s attachment reference(s), including inline fallback content when provided." % len(attachments))
+            attachment_text, attachment_summaries = attachment_context(session_id, attachments)
+            incoming_meta["attachmentsJson"] = json.dumps(attachment_summaries, ensure_ascii=True, sort_keys=True)
+            if attachment_text:
+                text = user_text + "\n\n" + safe_text(attachment_text, MAX_ATTACHMENT_CONTEXT_CHARS)
+            append_thinking(session_id, request_message_id, "attachments", "Attachment context ready: %s readable/meta item(s)." % len(attachment_summaries))
         if wants_skill_reply(text):
             append_progress(session_id, "skill", "running", "Handling local slash-command skill", 20)
+            append_thinking(session_id, request_message_id, "skill", "Handling this request with a local VM skill.")
         else:
             append_progress(session_id, "llm_context", "running", "Building session history and manual context", 12)
-        reply, meta = reply_for(text, session_id, item.get("id") or "")
+            append_thinking(session_id, request_message_id, "context", "Building same-session context and Sentaurus manual context for the model.")
+        append_thinking(session_id, request_message_id, "llm", "Calling the VM-local configured model; credentials stay inside CentOS.")
+        reply, meta = reply_for(text, session_id, request_message_id)
+        published_file_specs, reply_without_session_files = extract_vm_session_files(reply)
+        published_display_attachments = []
+        for spec in published_file_specs:
+            try:
+                published_display_attachments.append(publish_vm_session_file(session_id, spec))
+                append_progress(session_id, "attachment_publish", "completed", "Published image %s to session output" % safe_text(spec.get("name") or os.path.basename(safe_text(spec.get("sourcePath"), 500)), 180), 100)
+            except Exception as exc:
+                append_progress(session_id, "attachment_publish", "failed", "Failed to publish image: %s" % safe_text(str(exc), 300), 100)
+                audit("vm_session_file_publish_failed", {"sessionId": session_id, "error": safe_text(str(exc), 500), "spec": spec})
+        reply = reply_without_session_files
         simulation_setup, setup_visible_reply = extract_json_tag(reply, "SIMULATION_SETUP")
         if simulation_setup:
             simulation_setup = normalize_simulation_setup(simulation_setup)
             meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
         run_request, visible_reply = extract_run_request(setup_visible_reply)
+        append_thinking(session_id, request_message_id, "validation", "Checking whether the model returned a safe Sentaurus run request.")
         validation_error = run_request_validation_error(run_request, visible_reply, text)
         if validation_error:
             append_progress(session_id, "run_validation", "failed", validation_error, 100)
-            repaired_reply, repaired_meta = repair_run_request_reply(text, reply, validation_error, session_id, item.get("id") or "")
+            append_thinking(session_id, request_message_id, "validation", "Run request needed repair before execution.", "running")
+            repaired_reply, repaired_meta = repair_run_request_reply(text, reply, validation_error, session_id, request_message_id)
             meta = repaired_meta
             if repaired_reply:
                 repaired_setup, repaired_visible_reply = extract_json_tag(repaired_reply, "SIMULATION_SETUP")
@@ -1606,8 +1921,10 @@ def process_queue_file(path):
         else:
             append_progress(session_id, "llm", "completed", "LLM produced %s" % ("a Sentaurus run request" if run_request else "a chat reply"), 35)
         if run_request:
-            reply, result, attempts, simulation_setup, stop_reason = run_with_autodebug(text, run_request, visible_reply, session_id, item.get("id") or "", simulation_setup)
+            append_thinking(session_id, request_message_id, "execution", "Executing the validated Sentaurus request and collecting artifacts.")
+            reply, result, attempts, simulation_setup, stop_reason = run_with_autodebug(text, run_request, visible_reply, session_id, request_message_id, simulation_setup)
             artifacts = result.get("artifacts") or []
+            display_attachments = display_attachments_for_artifacts(result.get("id") or "", artifacts)
             meta["kind"] = "sentaurus_run"
             meta["runId"] = result.get("id")
             meta["vmRunId"] = result.get("id")
@@ -1624,11 +1941,16 @@ def process_queue_file(path):
                 meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
         elif meta.get("kind") != "llm_error":
             append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
+            reply = visible_reply or reply
+        display_attachments = (published_display_attachments + display_attachments)[:12]
+        if display_attachments and not safe_text(reply, 4000).strip():
+            reply = "Generated image attachment."
         if session_id:
             meta["sessionId"] = session_id
             if simulation_setup:
                 sync_session_setup_to_output(session_id, simulation_setup)
-        append_message("agent", reply, "vm-agent-worker", meta)
+        append_thinking(session_id, request_message_id, "complete", "Final response is ready.", "completed", True)
+        append_message("agent", reply, "vm-agent-worker", meta, None, display_attachments)
         shutil.move(path, os.path.join(DONE_DIR, os.path.basename(path)))
         audit("queue_processed", {"file": os.path.basename(path), "replyKind": meta.get("kind")})
     except Exception as exc:
@@ -1674,7 +1996,7 @@ import time
 import uuid
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.4.7"
+AGENT_VERSION = "0.5.0"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 
@@ -1698,6 +2020,7 @@ CONFIG_PATH = os.path.join(ROOT, "config.json")
 ENV_PATH = os.path.join(ROOT, ".env")
 MANUALS_DIR = os.path.join(ROOT, "manuals")
 STOP_PATH = os.path.join(ROOT, "stop")
+MAX_ATTACHMENT_CONTEXT_CHARS = 600000
 
 def now_iso():
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -1732,7 +2055,7 @@ def append_jsonl(path, payload):
 def audit(event, detail):
     append_jsonl(AUDIT_PATH, {"at": now_iso(), "agent": AGENT_NAME, "event": event, "detail": detail})
 
-def append_message(role, content, source, meta=None, id_prefix=None):
+def append_message(role, content, source, meta=None, id_prefix=None, display_attachments=None):
     message = {
         "id": message_id(id_prefix or ("vm" if role == "agent" else "web")),
         "role": role,
@@ -1741,6 +2064,8 @@ def append_message(role, content, source, meta=None, id_prefix=None):
         "createdAt": now_iso(),
         "meta": meta or {},
     }
+    if isinstance(display_attachments, list) and display_attachments:
+        message["attachments"] = display_attachments[:12]
     append_jsonl(MESSAGES_PATH, message)
     audit("message", {"id": message.get("id"), "role": role, "source": source, "kind": (meta or {}).get("kind")})
     return message
@@ -1830,6 +2155,104 @@ def list_manuals():
 def queue_depth():
     ensure_dir(QUEUE_DIR)
     return len(glob.glob(os.path.join(QUEUE_DIR, "*.json")))
+
+def normalize_attachment_ref(value):
+    if not isinstance(value, dict):
+        return None
+    source = safe_text(value.get("source"), 60).strip()
+    if source not in ["run-input", "vm-session-file", "vm-run-artifact"]:
+        return None
+    ref = {
+        "id": safe_text(value.get("id") or "%s:%s" % (source, value.get("path") or ""), 180),
+        "source": source,
+        "name": safe_text(value.get("name") or value.get("path") or "attachment", 180),
+        "path": safe_text(value.get("path"), 500).replace("\\", "/"),
+        "size": int(value.get("size") or 0),
+    }
+    if value.get("runId"):
+        ref["runId"] = safe_text(value.get("runId"), 180)
+    if value.get("category"):
+        ref["category"] = safe_text(value.get("category"), 180)
+    if value.get("contentType"):
+        ref["contentType"] = safe_text(value.get("contentType"), 120)
+    if value.get("inlineText"):
+        ref["inlineText"] = safe_text(value.get("inlineText"), MAX_ATTACHMENT_CONTEXT_CHARS)
+    if value.get("inlineTextTruncated"):
+        ref["inlineTextTruncated"] = bool(value.get("inlineTextTruncated"))
+    if value.get("contextStatus"):
+        ref["contextStatus"] = safe_text(value.get("contextStatus"), 80)
+    if value.get("vmPath"):
+        ref["vmPath"] = safe_text(value.get("vmPath"), 800)
+    if value.get("inlineError"):
+        ref["inlineError"] = safe_text(value.get("inlineError"), 300)
+    return ref
+
+def normalize_attachment_refs(values):
+    if not isinstance(values, list):
+        return []
+    refs = []
+    for value in values[:8]:
+        ref = normalize_attachment_ref(value)
+        if ref:
+            refs.append(ref)
+    return refs
+
+def attachment_diag(ref):
+    item = {
+        "id": safe_text(ref.get("id"), 180),
+        "source": safe_text(ref.get("source"), 60),
+        "name": safe_text(ref.get("name"), 180),
+        "path": safe_text(ref.get("path"), 500),
+        "size": int(ref.get("size") or 0),
+    }
+    if ref.get("runId"):
+        item["runId"] = safe_text(ref.get("runId"), 180)
+    if ref.get("category"):
+        item["category"] = safe_text(ref.get("category"), 180)
+    if ref.get("inlineText"):
+        item["inline"] = True
+        item["inlineSize"] = len(safe_text(ref.get("inlineText"), MAX_ATTACHMENT_CONTEXT_CHARS))
+    if ref.get("contextStatus"):
+        item["contextStatus"] = safe_text(ref.get("contextStatus"), 80)
+    if ref.get("vmPath"):
+        item["vmPath"] = safe_text(ref.get("vmPath"), 800)
+    if ref.get("inlineTextTruncated"):
+        item["truncated"] = True
+    if ref.get("inlineError"):
+        item["error"] = safe_text(ref.get("inlineError"), 300)
+    return item
+
+def normalize_display_attachment(value):
+    if not isinstance(value, dict):
+        return None
+    source = safe_text(value.get("source"), 60).strip()
+    if source not in ["run-input", "vm-session-file", "vm-run-artifact"]:
+        return None
+    item = {
+        "id": safe_text(value.get("id") or "%s:%s" % (source, value.get("path") or ""), 180),
+        "kind": "image" if value.get("kind") == "image" else "file",
+        "name": safe_text(value.get("name") or value.get("path") or "attachment", 180),
+        "size": int(value.get("size") or 0),
+        "source": source,
+        "path": safe_text(value.get("path"), 500).replace("\\", "/"),
+    }
+    if value.get("contentType"):
+        item["contentType"] = safe_text(value.get("contentType"), 120)
+    if value.get("runId"):
+        item["runId"] = safe_text(value.get("runId"), 180)
+    if value.get("category"):
+        item["category"] = safe_text(value.get("category"), 180)
+    return item
+
+def normalize_display_attachments(values):
+    if not isinstance(values, list):
+        return []
+    result = []
+    for value in values[:12]:
+        item = normalize_display_attachment(value)
+        if item:
+            result.append(item)
+    return result
 
 def read_env_file(path):
     data = {}
@@ -2016,17 +2439,24 @@ def build_status():
         "vmEpochMs": int(time.time() * 1000),
     }
 
-def enqueue_message(content, session_id=None):
+def enqueue_message(content, session_id=None, attachments=None, display_attachments=None):
     ensure_dir(QUEUE_DIR)
     meta = {"kind": "web_message", "queuedFor": "vm-agent-worker"}
     session_id = safe_text(session_id, 160).strip()
     if session_id:
         meta["sessionId"] = session_id
-    message = append_message("user", content, "web", meta, "web")
+    attachment_refs = normalize_attachment_refs(attachments)
+    if attachment_refs:
+        meta["attachmentCount"] = len(attachment_refs)
+        meta["attachmentsJson"] = json.dumps([attachment_diag(ref) for ref in attachment_refs], ensure_ascii=True, sort_keys=True)
+    display_refs = normalize_display_attachments(display_attachments)
+    message = append_message("user", content, "web", meta, "web", display_refs)
+    if attachment_refs:
+        message["contextAttachments"] = attachment_refs
     queue_path = os.path.join(QUEUE_DIR, message["id"] + ".json")
     with open(queue_path, "w") as handle:
         handle.write(json.dumps(message, ensure_ascii=True, sort_keys=True) + "\n")
-    audit("message_queued", {"id": message.get("id"), "queueFile": os.path.basename(queue_path)})
+    audit("message_queued", {"id": message.get("id"), "queueFile": os.path.basename(queue_path), "attachmentCount": len(attachment_refs)})
     return message
 
 def handle(request):
@@ -2045,7 +2475,7 @@ def handle(request):
         if not incoming.strip():
             raise ValueError("message is required")
         start_worker()
-        messages = [enqueue_message(incoming, session_id)]
+        messages = [enqueue_message(incoming, session_id, request.get("attachments"), request.get("displayAttachments"))]
     elif operation == "history":
         messages, _cursor = read_messages(after, limit, session_id)
     elif operation == "status":
@@ -2062,6 +2492,7 @@ def handle(request):
 
 try:
     print(json.dumps(handle(load_json_b64(REQUEST_B64)), ensure_ascii=True, sort_keys=True))
+    print("REMOTE_AGENT_DONE")
 except Exception as exc:
     error_payload = {
         "ok": False,
@@ -2072,6 +2503,7 @@ except Exception as exc:
         "cursor": 0,
     }
     print(json.dumps(error_payload, ensure_ascii=True, sort_keys=True))
+    print("REMOTE_AGENT_DONE")
     sys.exit(0)
 `;
 
@@ -2095,6 +2527,7 @@ except NameError:
 
 def respond(payload):
     print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+    print("REMOTE_ARTIFACT_DONE")
 
 def fail(message, status_code=400):
     respond({"ok": False, "error": message, "statusCode": status_code})
@@ -2216,6 +2649,90 @@ function artifactExtension(artifactPath: string): string {
   return dotIndex >= 0 ? name.slice(dotIndex).toLowerCase() : "";
 }
 
+function localAttachmentExtension(filePath: string): string {
+  const extension = path.extname(filePath).toLowerCase();
+  return extension || artifactExtension(filePath);
+}
+
+function metadataOnlyAttachment(ref: VmAgentAttachmentRef, status: EnrichedVmAgentAttachmentRef["contextStatus"], reason: string): EnrichedVmAgentAttachmentRef {
+  return { ...ref, contextStatus: status, inlineError: reason };
+}
+
+function inlineTextAttachment(ref: VmAgentAttachmentRef, data: Buffer, remainingChars: number): EnrichedVmAgentAttachmentRef {
+  const extension = localAttachmentExtension(ref.path || ref.name);
+  if (!readableAttachmentExtensions.has(extension)) {
+    return metadataOnlyAttachment(ref, "metadata_only", "extension is not readable text");
+  }
+  if (remainingChars <= 0) {
+    return metadataOnlyAttachment(ref, "too_large", "inline attachment character budget exhausted");
+  }
+  const byteLimit = Math.min(maxInlineAttachmentBytes, data.byteLength, Math.max(0, remainingChars * 4));
+  const rawText = data.subarray(0, byteLimit).toString("utf8");
+  const inlineText = rawText.slice(0, remainingChars);
+  return {
+    ...ref,
+    contextStatus: "inline",
+    inlineText,
+    inlineTextTruncated: data.byteLength > byteLimit || rawText.length > remainingChars,
+    size: data.byteLength
+  };
+}
+
+async function enrichRunInputAttachment(ref: VmAgentAttachmentRef, remainingChars: number): Promise<EnrichedVmAgentAttachmentRef> {
+  const enriched: EnrichedVmAgentAttachmentRef = { ...ref };
+  if (!ref.runId) return { ...enriched, contextStatus: "error", inlineError: "run-input attachment requires runId" };
+  const safeRun = safeRunId(ref.runId);
+  const safePath = safeRelativePath(ref.path);
+  try {
+    const localPath = await resolveRunFile(safeRun, "input", safePath);
+    const data = await fs.readFile(localPath);
+    return inlineTextAttachment({ ...enriched, path: safePath, runId: safeRun }, data, remainingChars);
+  } catch (err) {
+    return { ...enriched, contextStatus: "not_found", inlineError: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function enrichVmSessionAttachment(ref: VmAgentAttachmentRef, remainingChars: number): Promise<EnrichedVmAgentAttachmentRef> {
+  if (!ref.runId) return { ...ref, contextStatus: "error", inlineError: "vm-session-file attachment requires runId" };
+  if (!ref.category) return { ...ref, contextStatus: "error", inlineError: "vm-session-file attachment requires category" };
+  try {
+    const file = await downloadVmSessionFile(ref.runId, ref.category, ref.path);
+    return inlineTextAttachment({ ...ref, path: file.path, name: file.fileName, size: file.size }, file.data, remainingChars);
+  } catch (err) {
+    return { ...ref, contextStatus: "not_found", inlineError: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function enrichVmRunArtifactAttachment(ref: VmAgentAttachmentRef, remainingChars: number): Promise<EnrichedVmAgentAttachmentRef> {
+  if (!ref.runId) return { ...ref, contextStatus: "error", inlineError: "vm-run-artifact attachment requires runId" };
+  try {
+    const artifact = await downloadVmRunArtifact(ref.runId, ref.path);
+    return inlineTextAttachment({ ...ref, path: artifact.path, name: artifact.fileName, size: artifact.size }, artifact.data, remainingChars);
+  } catch (err) {
+    return { ...ref, contextStatus: "not_found", inlineError: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function enrichAttachmentsForVm(attachments: VmAgentAttachmentRef[]): Promise<EnrichedVmAgentAttachmentRef[]> {
+  const enriched: EnrichedVmAgentAttachmentRef[] = [];
+  let remainingChars = maxInlineAttachmentTotalChars;
+  for (const ref of attachments.slice(0, 8)) {
+    let item: EnrichedVmAgentAttachmentRef;
+    if (ref.source === "run-input") {
+      item = await enrichRunInputAttachment(ref, remainingChars);
+    } else if (ref.source === "vm-session-file") {
+      item = await enrichVmSessionAttachment(ref, remainingChars);
+    } else if (ref.source === "vm-run-artifact") {
+      item = await enrichVmRunArtifactAttachment(ref, remainingChars);
+    } else {
+      item = { ...ref, contextStatus: "unsupported", inlineError: "unsupported attachment source" };
+    }
+    if (item.inlineText) remainingChars = Math.max(0, remainingChars - item.inlineText.length);
+    enriched.push(item);
+  }
+  return enriched;
+}
+
 function validateVmArtifactRequest(runId: string, artifactPath: string): { runId: string; artifactPath: string } {
   try {
     const safeRun = safeRunId(runId);
@@ -2262,6 +2779,32 @@ function adjustedTimestamp(value: unknown, clockSkewMs: number | undefined, fall
   return typeof value === "string" && value.trim() ? value : fallback;
 }
 
+function normalizeDisplayAttachments(value: unknown): VmAgentMessageAttachment[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const attachments = value.flatMap((item): VmAgentMessageAttachment[] => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Partial<VmAgentMessageAttachment>;
+    if (record.source !== "run-input" && record.source !== "vm-session-file" && record.source !== "vm-run-artifact") return [];
+    if (record.kind !== "image" && record.kind !== "file") return [];
+    if (typeof record.path !== "string" || typeof record.name !== "string") return [];
+    return [{
+      id: typeof record.id === "string" ? record.id : `${record.source}:${record.path}`,
+      kind: record.kind,
+      name: record.name,
+      size: typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0,
+      contentType: typeof record.contentType === "string" ? record.contentType : undefined,
+      source: record.source,
+      path: record.path,
+      runId: typeof record.runId === "string" ? record.runId : undefined,
+      category: record.category,
+      width: typeof record.width === "number" ? record.width : undefined,
+      height: typeof record.height === "number" ? record.height : undefined,
+      thumbnailPath: typeof record.thumbnailPath === "string" ? record.thumbnailPath : undefined
+    }];
+  });
+  return attachments.length ? attachments : undefined;
+}
+
 function normalizeMessages(messages: unknown[] | undefined, payload: RemoteAgentPayload): VmAgentMessage[] {
   if (!Array.isArray(messages)) return [];
   const hostReceivedAt = payload.hostReceivedAt || new Date().toISOString();
@@ -2279,7 +2822,8 @@ function normalizeMessages(messages: unknown[] | undefined, payload: RemoteAgent
       vmCreatedAt,
       hostReceivedAt,
       sequence,
-      meta: item.meta
+      meta: item.meta,
+      attachments: normalizeDisplayAttachments(item.attachments)
     }];
   });
 }
@@ -2343,7 +2887,7 @@ function fallbackAgentMessage(content: string): VmAgentMessage {
 }
 
 async function callVmAgent(request: RemoteAgentRequest): Promise<RemoteAgentPayload> {
-  const result = await runSshCommandWithInput("python -", remoteAgentScript(request), 20_000);
+  const result = await runSshCommandWithInput("python", remoteAgentScript(request), 20_000);
   const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
   const hostEpochMs = Date.now();
   if (!result.ok) {
@@ -2358,7 +2902,7 @@ async function callVmAgent(request: RemoteAgentRequest): Promise<RemoteAgentPayl
 
 export async function downloadVmRunArtifact(runId: string, artifactPath: string): Promise<VmRunArtifactDownload> {
   const safe = validateVmArtifactRequest(runId, artifactPath);
-  const result = await runSshCommandWithInput("python -", remoteArtifactScript(safe.runId, safe.artifactPath), 90_000);
+  const result = await runSshCommandWithInput("python", remoteArtifactScript(safe.runId, safe.artifactPath), 90_000);
   const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
   if (!result.ok) {
     throw httpError(502, result.error || result.stderr || "VM artifact SSH download failed");
@@ -2399,8 +2943,9 @@ export async function getVmAgentMessages(after = 0, limit = 50, sessionId?: stri
   return { status, messages: normalizeMessages(payload.messages, payload), cursor: payload.cursor || after };
 }
 
-export async function sendVmAgentMessage(message: string, sessionId?: string): Promise<{ status: VmAgentStatus; message: VmAgentMessage; messages: VmAgentMessage[]; cursor: number }> {
-  const payload = await callVmAgent({ operation: "send", message, sessionId });
+export async function sendVmAgentMessage(message: string, sessionId?: string, attachments: VmAgentAttachmentRef[] = [], displayAttachments: VmAgentMessageAttachment[] = []): Promise<{ status: VmAgentStatus; message: VmAgentMessage; messages: VmAgentMessage[]; cursor: number }> {
+  const enrichedAttachments = await enrichAttachmentsForVm(attachments);
+  const payload = await callVmAgent({ operation: "send", message, sessionId, attachments: enrichedAttachments, displayAttachments });
   const status = payload.ok === false ? errorStatus(payload.error || "VM agent message failed", payload.raw) : toStatus(payload);
   const messages = normalizeMessages(payload.messages, payload);
   const representative = [...messages].reverse().find((item) => item.role === "agent") || messages[0] || fallbackAgentMessage("Message queued for the CentOS VM agent.");

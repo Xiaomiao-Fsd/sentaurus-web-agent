@@ -30,6 +30,14 @@ If you prefer SSH remotes, configure your Windows GitHub SSH key and switch the 
 
 ## Quick start on the Windows host
 
+Double-click:
+
+```text
+start-dev.bat
+```
+
+Or run manually:
+
 ```powershell
 npm install
 Copy-Item .env.example .env
@@ -39,8 +47,8 @@ npm run dev
 
 Open:
 
-- Web UI: <http://localhost:5174>
-- Backend health: <http://localhost:5175/api/health>
+- Web UI: <http://10.6.22.1:5174>
+- Backend health: <http://10.6.22.1:5175/api/health>
 
 The web UI asks for the `AUTH_TOKEN` from `.env` before calling protected APIs.
 

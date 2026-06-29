@@ -1,11 +1,17 @@
-import "dotenv/config";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import dotenv from "dotenv";
 import { z } from "zod";
+
+const serverDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRootEnv = path.resolve(serverDir, "../../../.env");
+dotenv.config({ path: repoRootEnv });
+dotenv.config();
 
 const schema = z.object({
   PORT: z.coerce.number().int().positive().default(5175),
-  HOST: z.string().default("127.0.0.1"),
-  CORS_ORIGIN: z.string().default("http://localhost:5174"),
+  HOST: z.string().default("10.6.22.1"),
+  CORS_ORIGIN: z.string().default("http://10.6.22.1:5174"),
   AUTH_TOKEN: z.string().min(8).default("change-me-local-only"),
   LLM_API_BASE: z.string().url().optional(),
   LLM_API_KEY: z.string().optional(),

@@ -3,20 +3,41 @@ import { config } from "../config.js";
 import { runSshCommand } from "./sshClient.js";
 
 function parseTool(lines: string[], name: string): string | null {
-  const prefix = `TOOL:${name}=`;
-  return lines.find((line) => line.startsWith(prefix))?.slice(prefix.length) || null;
+  const marker = `TOOL:${name}`;
+  const index = lines.indexOf(marker);
+  if (index < 0) return null;
+  const value = lines[index + 1]?.trim();
+  return value && value.startsWith("/") ? value : null;
+}
+
+function parseNextLine(lines: string[], marker: string): string | undefined {
+  const index = lines.indexOf(marker);
+  return index >= 0 ? lines[index + 1]?.trim() || undefined : undefined;
 }
 
 export async function getVmStatus(): Promise<VmStatus> {
   const command = [
-    "set -e",
     "echo SSH_OK",
-    "echo HOSTNAME=$(hostname)",
-    "echo USER=$(whoami)",
-    "for t in sde sdevice sprocess swb inspect svisual; do p=$(command -v $t || true); echo TOOL:$t=$p; done",
+    "echo HOSTNAME",
+    "hostname",
+    "echo USER",
+    "whoami",
+    "echo TOOL:sde",
+    "which sde",
+    "echo TOOL:sdevice",
+    "which sdevice",
+    "echo TOOL:sprocess",
+    "which sprocess",
+    "echo TOOL:swb",
+    "which swb",
+    "echo TOOL:inspect",
+    "which inspect",
+    "echo TOOL:svisual",
+    "which svisual",
     "echo SENTAURUS_VERSION_START",
-    "sdevice -v 2>&1 | head -8 || true",
-    "echo SENTAURUS_VERSION_END"
+    "timeout 5s sdevice -v | head -8",
+    "echo SENTAURUS_VERSION_END",
+    "echo VM_STATUS_DONE"
   ].join("; ");
   const result = await runSshCommand(command, 20_000);
   const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
@@ -32,8 +53,8 @@ export async function getVmStatus(): Promise<VmStatus> {
     ok,
     checkedAt: new Date().toISOString(),
     sshTarget: config.SENTAURUS_SSH_TARGET,
-    hostname: lines.find((line) => line.startsWith("HOSTNAME="))?.slice("HOSTNAME=".length),
-    user: lines.find((line) => line.startsWith("USER="))?.slice("USER=".length),
+    hostname: parseNextLine(lines, "HOSTNAME"),
+    user: parseNextLine(lines, "USER"),
     sentaurusVersion: version,
     tools: {
       sde: parseTool(lines, "sde"),

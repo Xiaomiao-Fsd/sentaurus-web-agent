@@ -22,6 +22,8 @@ data/*
 !data/.gitkeep
 !data/runs/.gitkeep
 !data/uploads/.gitkeep
+apps/server/data/
+.tools/
 
 # logs
 *.log
