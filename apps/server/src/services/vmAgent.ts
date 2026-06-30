@@ -1875,12 +1875,14 @@ def process_queue_file(path):
         reply, meta = reply_for(text, session_id, request_message_id)
         published_file_specs, reply_without_session_files = extract_vm_session_files(reply)
         published_display_attachments = []
+        publish_errors = []
         for spec in published_file_specs:
             try:
                 published_display_attachments.append(publish_vm_session_file(session_id, spec))
                 append_progress(session_id, "attachment_publish", "completed", "Published image %s to session output" % safe_text(spec.get("name") or os.path.basename(safe_text(spec.get("sourcePath"), 500)), 180), 100)
             except Exception as exc:
                 append_progress(session_id, "attachment_publish", "failed", "Failed to publish image: %s" % safe_text(str(exc), 300), 100)
+                publish_errors.append(safe_text(str(exc), 300))
                 audit("vm_session_file_publish_failed", {"sessionId": session_id, "error": safe_text(str(exc), 500), "spec": spec})
         reply = reply_without_session_files
         simulation_setup, setup_visible_reply = extract_json_tag(reply, "SIMULATION_SETUP")
@@ -1943,14 +1945,48 @@ def process_queue_file(path):
             append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
             reply = visible_reply or reply
         display_attachments = (published_display_attachments + display_attachments)[:12]
-        if display_attachments and not safe_text(reply, 4000).strip():
-            reply = "Generated image attachment."
+        if published_display_attachments:
+            session_files_meta = []
+            for item in published_display_attachments:
+                session_files_meta.append({
+                    "category": item.get("category"),
+                    "path": item.get("path"),
+                    "name": item.get("name"),
+                    "size": item.get("size"),
+                    "contentType": item.get("contentType"),
+                    "isImage": item.get("kind") == "image",
+                })
+            meta["vmSessionFilesJson"] = json.dumps(session_files_meta, ensure_ascii=True, sort_keys=True)
         if session_id:
             meta["sessionId"] = session_id
             if simulation_setup:
                 sync_session_setup_to_output(session_id, simulation_setup)
         append_thinking(session_id, request_message_id, "complete", "Final response is ready.", "completed", True)
-        append_message("agent", reply, "vm-agent-worker", meta, None, display_attachments)
+        has_reply_text = bool(safe_text(reply, 4000).strip())
+        publish_error_text = ""
+        if publish_errors:
+            publish_error_text = "Failed to publish %s image attachment%s: %s" % (len(publish_errors), "" if len(publish_errors) == 1 else "s", "; ".join(publish_errors[:3]))
+        if display_attachments:
+            text_meta = meta.copy()
+            text_meta["suppressAttachmentPreview"] = True
+            if has_reply_text:
+                append_message("agent", reply, "vm-agent-worker", text_meta)
+            if publish_error_text:
+                publish_meta = {"kind": "vm_agent_attachment_publish_error"}
+                if session_id:
+                    publish_meta["sessionId"] = session_id
+                append_message("agent", publish_error_text, "vm-agent-worker", publish_meta)
+            attachment_meta = meta.copy()
+            attachment_meta["kind"] = "vm_agent_attachments"
+            append_message("agent", "Generated image attachment.", "vm-agent-worker", attachment_meta, "attach", display_attachments)
+        else:
+            if has_reply_text or not publish_error_text:
+                append_message("agent", reply, "vm-agent-worker", meta)
+            if publish_error_text:
+                publish_meta = {"kind": "vm_agent_attachment_publish_error"}
+                if session_id:
+                    publish_meta["sessionId"] = session_id
+                append_message("agent", publish_error_text, "vm-agent-worker", publish_meta)
         shutil.move(path, os.path.join(DONE_DIR, os.path.basename(path)))
         audit("queue_processed", {"file": os.path.basename(path), "replyKind": meta.get("kind")})
     except Exception as exc:
@@ -2779,24 +2815,26 @@ function adjustedTimestamp(value: unknown, clockSkewMs: number | undefined, fall
   return typeof value === "string" && value.trim() ? value : fallback;
 }
 
-function normalizeDisplayAttachments(value: unknown): VmAgentMessageAttachment[] | undefined {
+function normalizeDisplayAttachments(value: unknown): VmAgentMessage["attachments"] {
   if (!Array.isArray(value)) return undefined;
-  const attachments = value.flatMap((item): VmAgentMessageAttachment[] => {
+  const attachments = value.flatMap((item): NonNullable<VmAgentMessage["attachments"]> => {
     if (!item || typeof item !== "object") return [];
-    const record = item as Partial<VmAgentMessageAttachment>;
-    if (record.source !== "run-input" && record.source !== "vm-session-file" && record.source !== "vm-run-artifact") return [];
-    if (record.kind !== "image" && record.kind !== "file") return [];
-    if (typeof record.path !== "string" || typeof record.name !== "string") return [];
+    const record = item as Record<string, unknown>;
+    const source = typeof record.source === "string" && record.source.trim() ? record.source.trim() : undefined;
+    const kind = typeof record.kind === "string" && record.kind.trim() ? record.kind.trim() : undefined;
+    const path = typeof record.path === "string" && record.path.trim() ? record.path.trim().replace(/\\/g, "/") : undefined;
+    const name = typeof record.name === "string" && record.name.trim() ? record.name.trim() : path?.split("/").at(-1);
+    if (!path && !name) return [];
     return [{
-      id: typeof record.id === "string" ? record.id : `${record.source}:${record.path}`,
-      kind: record.kind,
-      name: record.name,
-      size: typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0,
+      id: typeof record.id === "string" && record.id.trim() ? record.id.trim() : source && path ? `${source}:${path}` : undefined,
+      kind,
+      name,
+      size: typeof record.size === "number" && Number.isFinite(record.size) ? record.size : undefined,
       contentType: typeof record.contentType === "string" ? record.contentType : undefined,
-      source: record.source,
-      path: record.path,
+      source,
+      path,
       runId: typeof record.runId === "string" ? record.runId : undefined,
-      category: record.category,
+      category: typeof record.category === "string" ? record.category : undefined,
       width: typeof record.width === "number" ? record.width : undefined,
       height: typeof record.height === "number" ? record.height : undefined,
       thumbnailPath: typeof record.thumbnailPath === "string" ? record.thumbnailPath : undefined

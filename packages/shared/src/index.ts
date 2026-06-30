@@ -19,7 +19,7 @@ export type VmAgentMessage = {
   hostReceivedAt?: string;
   sequence?: number;
   meta?: Record<string, string | number | boolean | null>;
-  attachments?: VmAgentMessageAttachment[];
+  attachments?: VmAgentAttachment[];
 };
 
 export type VmAgentStatus = {
@@ -143,6 +143,21 @@ export type VmAgentAttachmentRef = {
 };
 
 export type VmAgentMessageAttachmentKind = "file" | "image";
+
+export type VmAgentAttachment = {
+  id?: string;
+  kind?: VmAgentMessageAttachmentKind | string;
+  name?: string;
+  size?: number;
+  contentType?: string;
+  source?: VmAgentAttachmentSource | string;
+  path?: string;
+  runId?: string;
+  category?: VmSessionOutputCategory | string;
+  width?: number;
+  height?: number;
+  thumbnailPath?: string;
+};
 
 export type VmAgentMessageAttachment = {
   id: string;

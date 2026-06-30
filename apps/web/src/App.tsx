@@ -83,6 +83,18 @@ type SessionVmArtifact = VmRunArtifact & {
   createdAt: string;
 };
 
+type MessageVmSessionFile = {
+  runId: string;
+  category: VmSessionOutputCategory;
+  path: string;
+  name: string;
+  size: number;
+  contentType?: string;
+  isImage: boolean;
+  messageId: string;
+  createdAt: string;
+};
+
 type SessionMenuState = {
   runId: string;
   x: number;
@@ -188,6 +200,10 @@ function isThinkingMessage(message: VmAgentMessage): boolean {
   return message.meta?.kind === "agent_thinking" || message.meta?.kind === "agent_reasoning_summary";
 }
 
+function suppressAttachmentPreview(message: VmAgentMessage): boolean {
+  return message.meta?.suppressAttachmentPreview === true;
+}
+
 function metaString(message: VmAgentMessage, key: string): string | null {
   const value = message.meta?.[key];
   return typeof value === "string" && value.trim() ? value : null;
@@ -280,14 +296,22 @@ function messageRunId(message: VmAgentMessage): string | null {
   return typeof runId === "string" && runId.trim() ? runId : null;
 }
 
+function normalizeOutputCategory(value: unknown): VmSessionOutputCategory {
+  return OUTPUT_CATEGORIES.includes(value as VmSessionOutputCategory) ? value as VmSessionOutputCategory : OUTPUT_CATEGORIES[1];
+}
+
 function vmArtifactsForMessage(message: VmAgentMessage): SessionVmArtifact[] {
+  if (suppressAttachmentPreview(message)) return [];
   const artifacts: SessionVmArtifact[] = [];
   for (const attachment of message.attachments || []) {
-    if (attachment.source !== "vm-run-artifact" || !attachment.runId || !attachment.path) continue;
+    if (attachment.source !== "vm-run-artifact") continue;
+    const runId = setupText(attachment.runId) || messageRunId(message);
+    const artifactPath = setupText(attachment.path);
+    if (!runId || !artifactPath) continue;
     artifacts.push({
-      path: attachment.path,
-      size: attachment.size,
-      runId: attachment.runId,
+      path: artifactPath,
+      size: typeof attachment.size === "number" && Number.isFinite(attachment.size) ? attachment.size : 0,
+      runId,
       messageId: message.id,
       createdAt: message.createdAt
     });
@@ -329,6 +353,59 @@ function vmArtifactsForMessage(message: VmAgentMessage): SessionVmArtifact[] {
 
   const byKey = new Map<string, SessionVmArtifact>();
   for (const artifact of artifacts) byKey.set(`${artifact.runId}:${artifact.path}`, artifact);
+  return [...byKey.values()];
+}
+
+function vmSessionFilesForMessage(message: VmAgentMessage): MessageVmSessionFile[] {
+  if (suppressAttachmentPreview(message)) return [];
+  const runId = messageRunId(message);
+  const files: MessageVmSessionFile[] = [];
+
+  for (const attachment of message.attachments || []) {
+    if (attachment.source !== "vm-session-file") continue;
+    const fileRunId = setupText(attachment.runId) || runId;
+    const filePath = setupText(attachment.path);
+    const name = setupText(attachment.name) || filePath?.split("/").at(-1) || filePath;
+    if (!fileRunId || !filePath || !name) continue;
+    files.push({
+      runId: fileRunId,
+      category: normalizeOutputCategory(attachment.category),
+      path: filePath,
+      name,
+      size: typeof attachment.size === "number" && Number.isFinite(attachment.size) ? attachment.size : 0,
+      contentType: setupText(attachment.contentType),
+      isImage: isImageAttachmentLike(name || filePath, setupText(attachment.contentType)),
+      messageId: message.id,
+      createdAt: message.createdAt
+    });
+  }
+
+  const parsed = parseJsonValue<unknown[]>(metaString(message, "vmSessionFilesJson"));
+  if (runId && Array.isArray(parsed)) {
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      const filePath = setupText(record.path);
+      const name = setupText(record.name) || filePath?.split("/").at(-1) || filePath;
+      if (!filePath || !name) continue;
+      const contentType = setupText(record.contentType);
+      const isImage = typeof record.isImage === "boolean" ? record.isImage : isImageAttachmentLike(name || filePath, contentType);
+      files.push({
+        runId,
+        category: normalizeOutputCategory(record.category),
+        path: filePath,
+        name,
+        size: typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0,
+        contentType,
+        isImage,
+        messageId: message.id,
+        createdAt: message.createdAt
+      });
+    }
+  }
+
+  const byKey = new Map<string, MessageVmSessionFile>();
+  for (const file of files) byKey.set(`${file.runId}:${file.category}:${file.path}`, file);
   return [...byKey.values()];
 }
 
@@ -573,6 +650,10 @@ function attachmentStateLabel(ref?: VmAgentAttachmentRef): string {
   return "attached";
 }
 
+function normalizeAttachmentSource(value: unknown): VmAgentMessageAttachment["source"] | null {
+  return value === "run-input" || value === "vm-session-file" || value === "vm-run-artifact" ? value : null;
+}
+
 function displayAttachmentFromRef(ref: VmAgentAttachmentRef): VmAgentMessageAttachment {
   return {
     id: ref.id,
@@ -584,6 +665,30 @@ function displayAttachmentFromRef(ref: VmAgentAttachmentRef): VmAgentMessageAtta
     path: ref.path,
     runId: ref.runId,
     category: ref.category
+  };
+}
+
+function displayAttachmentFromMessage(attachment: NonNullable<VmAgentMessage["attachments"]>[number], message: VmAgentMessage): VmAgentMessageAttachment | null {
+  const source = normalizeAttachmentSource(attachment.source);
+  const path = setupText(attachment.path);
+  const name = setupText(attachment.name) || path?.split("/").at(-1);
+  if (!source || !path || !name) return null;
+  const contentType = setupText(attachment.contentType);
+  const category = source === "vm-session-file" ? normalizeOutputCategory(attachment.category) : undefined;
+  const runId = setupText(attachment.runId) || (source !== "run-input" ? messageRunId(message) || undefined : undefined);
+  return {
+    id: setupText(attachment.id) || `${source}:${runId || ""}:${category || ""}:${path}`.replace(/[^A-Za-z0-9_.:-]/g, "_"),
+    kind: attachment.kind === "image" || attachment.kind === "file" ? attachment.kind : isImageAttachmentLike(name || path, contentType) ? "image" : "file",
+    name,
+    size: typeof attachment.size === "number" && Number.isFinite(attachment.size) ? attachment.size : 0,
+    contentType,
+    source,
+    path,
+    runId,
+    category,
+    width: typeof attachment.width === "number" ? attachment.width : undefined,
+    height: typeof attachment.height === "number" ? attachment.height : undefined,
+    thumbnailPath: setupText(attachment.thumbnailPath)
   };
 }
 
@@ -619,6 +724,23 @@ function displayAttachmentKey(attachment: VmAgentMessageAttachment): string {
 
 function vmArtifactDisplayKey(file: SessionVmArtifact): string {
   return `vm-run-artifact:${file.runId}::${file.path}`;
+}
+
+function vmSessionFileDisplayKey(file: MessageVmSessionFile): string {
+  return `vm-session-file:${file.runId}:${file.category}:${file.path}`;
+}
+
+function vmSessionFileAttachmentRef(file: MessageVmSessionFile): VmAgentAttachmentRef {
+  return {
+    id: `session_${file.runId}_${file.category}_${file.path}`.replace(/[^A-Za-z0-9_.:-]/g, "_"),
+    source: "vm-session-file",
+    name: file.name || file.path,
+    path: file.path,
+    size: file.size,
+    runId: file.runId,
+    category: file.category,
+    contentType: file.contentType
+  };
 }
 
 function attachmentRefFromDisplayAttachment(attachment: VmAgentMessageAttachment): VmAgentAttachmentRef | null {
@@ -1861,7 +1983,11 @@ export default function App() {
           )}
           {visibleMessages.map((message) => {
             const optimisticAttachments = (messageAttachments[message.id] || []).map((file) => displayAttachmentFromUploaded(file, selectedRunId));
-            const allDisplayAttachments = message.attachments?.length ? message.attachments : optimisticAttachments;
+            const messageDisplayAttachments = (message.attachments || []).flatMap((attachment) => {
+              const displayAttachment = displayAttachmentFromMessage(attachment, message);
+              return displayAttachment ? [displayAttachment] : [];
+            });
+            const allDisplayAttachments = messageDisplayAttachments.length ? messageDisplayAttachments : optimisticAttachments;
             let visibleImageAttachments = 0;
             const displayAttachments = allDisplayAttachments.filter((attachment) => {
               if (attachment.kind !== "image") return true;
@@ -1871,15 +1997,19 @@ export default function App() {
             const hiddenDisplayAttachmentCount = Math.max(0, allDisplayAttachments.length - displayAttachments.length);
             const displayAttachmentKeys = new Set(displayAttachments.map(displayAttachmentKey));
             const messageVmArtifacts = vmArtifactsForMessage(message).filter((file) => !displayAttachmentKeys.has(vmArtifactDisplayKey(file)));
+            const messageVmSessionFiles = vmSessionFilesForMessage(message).filter((file) => !displayAttachmentKeys.has(vmSessionFileDisplayKey(file)));
             const visibleVmArtifacts = messageVmArtifacts.slice(0, 16);
+            const visibleVmSessionFiles = messageVmSessionFiles.slice(0, 16);
             const hiddenVmArtifactCount = Math.max(0, messageVmArtifacts.length - visibleVmArtifacts.length);
+            const hiddenVmSessionFileCount = Math.max(0, messageVmSessionFiles.length - visibleVmSessionFiles.length);
             const content = messageDisplayOverrides[message.id] ?? message.content;
+            const hasMessageAttachments = displayAttachments.length > 0 || messageVmArtifacts.length > 0 || messageVmSessionFiles.length > 0;
             return (
               <article className={`message-row ${message.role}`} key={message.id}>
                 <div className="avatar">{message.role === "agent" ? "VM" : message.role === "user" ? "You" : "Sys"}</div>
-                <div className="message-bubble">
-                  <div className="message-content">{content}</div>
-                  {(displayAttachments.length > 0 || messageVmArtifacts.length > 0) && (
+                <div className={`message-bubble ${hasMessageAttachments ? "has-attachments" : ""}`}>
+                  {content && <div className="message-content">{content}</div>}
+                  {hasMessageAttachments && (
                     <div className="message-attachments">
                       {displayAttachments.map((attachment) => {
                         const href = imageAttachmentUrl(attachment);
@@ -1925,9 +2055,26 @@ export default function App() {
                           </span>
                         )
                       ))}
-                      {(hiddenDisplayAttachmentCount > 0 || hiddenVmArtifactCount > 0) && (
+                      {visibleVmSessionFiles.map((file) => {
+                        const href = vmSessionFileDownloadUrl(file.runId, file.category, file.path);
+                        return file.isImage ? (
+                          <span className="chat-image-with-link" key={`${file.runId}:${file.category}:${file.path}`}>
+                            {renderImagePreview(href, file.name || file.path, href)}
+                            <button className="link-button image-context-action" onClick={() => addPendingVmAttachment(vmSessionFileAttachmentRef(file))} type="button">Add to context</button>
+                          </span>
+                        ) : (
+                          <span className="attachment-chip artifact-chip" key={`${file.runId}:${file.category}:${file.path}`} title={`${file.category}/${file.path}`}>
+                            <a href={href} rel="noreferrer" target="_blank">
+                              <span>{file.path}</span>
+                              <small>{file.category} / {formatBytes(file.size)}</small>
+                            </a>
+                            <button type="button" onClick={() => addPendingVmAttachment(vmSessionFileAttachmentRef(file))}>Add to context</button>
+                          </span>
+                        );
+                      })}
+                      {(hiddenDisplayAttachmentCount > 0 || hiddenVmArtifactCount > 0 || hiddenVmSessionFileCount > 0) && (
                         <span className="attachment-chip muted-chip">
-                          <span>+{hiddenDisplayAttachmentCount + hiddenVmArtifactCount} more</span>
+                          <span>+{hiddenDisplayAttachmentCount + hiddenVmArtifactCount + hiddenVmSessionFileCount} more</span>
                         </span>
                       )}
                     </div>

@@ -832,6 +832,12 @@ code {
   justify-content: center;
 }
 
+.message-row.agent + .message-row.agent,
+.message-row.trace + .message-row.agent,
+.message-row.agent + .message-row.trace {
+  margin-top: -0.45rem;
+}
+
 .avatar {
   display: inline-grid;
   width: 38px;
@@ -847,6 +853,10 @@ code {
 .message-row.agent .avatar {
   background: var(--color-primary);
   color: #ffffff;
+}
+
+.message-row.agent + .message-row.agent .avatar {
+  opacity: 0;
 }
 
 .message-row.user .avatar {
@@ -882,6 +892,15 @@ code {
 .message-row.agent .message-bubble {
   border-color: #d9e8e4;
   background: #fbfefd;
+}
+
+.message-row.agent + .message-row.agent .message-bubble {
+  border-top-left-radius: 9px;
+}
+
+.message-row.agent .message-bubble.has-attachments {
+  border-color: rgba(20, 184, 166, 0.32);
+  background: #f7fffd;
 }
 
 .message-row.system .message-bubble {
