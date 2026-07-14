@@ -16,7 +16,7 @@
     "migrate:runs": "node scripts/migrate-local-runs.mjs --apply",
     "test:session-history": "node --import tsx --import ./apps/server/test/setup.ts --test apps/server/test/sessionHistory.test.ts apps/web/test/sessionHistoryState.test.ts apps/web/test/vmSessionFilesState.test.ts",
     "test:plt-extraction": "node --import tsx --import ./apps/server/test/setup.ts --test apps/server/test/dfiseIdvgExtract.test.ts apps/server/test/pltIntegration.test.ts apps/web/test/vmSessionFilesState.test.ts",
-    "test:codex-features": "node --import tsx --import ./apps/server/test/codexFeaturesSetup.ts --test apps/server/test/vmAgentInstructions.test.ts apps/server/test/vmWorkerCommands.test.ts apps/web/test/slashCommands.test.ts",
+    "test:codex-features": "node --import tsx --import ./apps/server/test/codexFeaturesSetup.ts --test apps/server/test/vmAgentInstructions.test.ts apps/server/test/vmAgentModels.test.ts apps/server/test/vmWorkerCommands.test.ts apps/web/test/slashCommands.test.ts",
     "build": "npm run build -w @sentaurus-agent/shared && npm run build -w @sentaurus-agent/server && npm run build -w @sentaurus-agent/web",
     "typecheck": "npm run build -w @sentaurus-agent/shared && npm run typecheck -w @sentaurus-agent/server && npm run typecheck -w @sentaurus-agent/web && npm run typecheck -w @sentaurus-agent/shared",
     "check": "npm run typecheck",

@@ -9,6 +9,8 @@ import type {
   VmAgentHistoryErrorCode,
   VmAgentMessage,
   VmAgentMessageAttachment,
+  VmAgentModelId,
+  VmAgentModelsResponse,
   VmAgentStatus
 } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
@@ -16,6 +18,15 @@ import { safeRelativePath, safeRunId } from "../security/pathSafe.js";
 import { resolveRunFile } from "./runStore.js";
 import { runSshCommandWithInput, runSshCommandWithInputDownload, runSshCommandWithInputFast } from "./sshClient.js";
 import { downloadVmSessionFile } from "./vmSessionFiles.js";
+import {
+  isVmAgentModelId,
+  parseVmAgentModelId,
+  remoteVmAgentModelConfigScript,
+  VM_AGENT_MODEL_IDS,
+  VM_AGENT_REASONING_EFFORT,
+  vmAgentContextWindowTokens,
+  vmAgentModelCatalog
+} from "./vmAgentModels.js";
 
 type VmAgentOperation = "status" | "start" | "send" | "history";
 
@@ -52,6 +63,11 @@ export type RemoteAgentPayload = {
   llmConfigured?: boolean;
   llmModel?: string;
   llmModels?: string[];
+  llmReasoningEffort?: "max";
+  llmContextWindowTokens?: number;
+  llmContextTargetTokens?: number;
+  llmContextHardTokens?: number;
+  llmTimeoutSeconds?: number;
   maxAutodebugAttempts?: number;
   manualCount?: number;
   manualFiles?: string[];
@@ -117,7 +133,7 @@ type EnrichedVmAgentAttachmentRef = VmAgentAttachmentRef & {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.6.0";
+const agentVersion = "0.7.0";
 const dfiseExtractorSource = readFileSync(new URL("../../remote/dfise_idvg_extract.py", import.meta.url), "utf8");
 const dfiseExtractorSha256 = createHash("sha256").update(dfiseExtractorSource, "utf8").digest("hex");
 const localWorkerSource = readFileSync(new URL("../../../../agent_worker.py", import.meta.url), "utf8");
@@ -180,7 +196,7 @@ import socket
 import time
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.6.0"
+AGENT_VERSION = "0.7.0"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -189,6 +205,7 @@ PID_PATH = os.path.join(ROOT, "agent_worker.pid")
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 ENV_PATH = os.path.join(ROOT, ".env")
 MANUALS_DIR = os.path.join(ROOT, "manuals")
+ALLOWED_MODELS = ["gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
 
 def read_env_file(path):
     data = {}
@@ -215,8 +232,10 @@ def config_list(value):
     return items
 
 def model_candidates(primary_model, configured_models):
-    models = config_list(configured_models)
+    models = [item for item in config_list(configured_models) if item in ALLOWED_MODELS]
     primary = str(primary_model or "").strip()
+    if primary not in ALLOWED_MODELS:
+        primary = "gpt-5.5"
     if primary and primary not in models:
         models.insert(0, primary)
     return models or ["gpt-5.5"]
@@ -243,12 +262,21 @@ def load_config():
         except Exception:
             file_config = {}
     primary_model = env.get("LLM_MODEL") or file_config.get("llmModel") or file_config.get("LLM_MODEL") or "gpt-5.5"
+    if primary_model not in ALLOWED_MODELS:
+        primary_model = "gpt-5.5"
     raw_models = env.get("LLM_MODELS") or file_config.get("llmModels") or file_config.get("LLM_MODELS")
+    context_window = 353000 if primary_model.startswith("gpt-5.6-") else 272000
     return {
         "api_base": env.get("LLM_API_BASE") or file_config.get("llmApiBase") or file_config.get("LLM_API_BASE") or "",
         "api_key": env.get("LLM_API_KEY") or file_config.get("llmApiKey") or file_config.get("LLM_API_KEY") or "",
         "model": primary_model,
         "models": model_candidates(primary_model, raw_models),
+        "api_style": env.get("LLM_API_STYLE") or file_config.get("llmApiStyle") or file_config.get("LLM_API_STYLE") or "chat-completions",
+        "reasoning_effort": "max",
+        "context_window_tokens": context_window,
+        "context_target_tokens": (context_window * 85) // 100,
+        "context_hard_tokens": (context_window * 95) // 100,
+        "llm_timeout_seconds": config_int(env, file_config, "VM_AGENT_LLM_TIMEOUT_SECONDS", "vmAgentLlmTimeoutSeconds", 600, 30, 1800),
         "max_autodebug_attempts": config_int(env, file_config, "VM_AGENT_MAX_AUTODEBUG_ATTEMPTS", "vmAgentMaxAutodebugAttempts", 5, 1, 8),
     }
 
@@ -306,7 +334,7 @@ payload = {
     "version": AGENT_VERSION,
     "hostname": socket.gethostname(),
     "user": getpass.getuser(),
-    "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "sentaurus_session_output"],
+    "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "vm_model_switching", "sentaurus_session_output"],
     "mailbox": "~/.sentaurus-web-agent/vm-agent",
     "messageCount": message_count(),
     "workerRunning": running,
@@ -314,6 +342,11 @@ payload = {
     "llmConfigured": bool(config.get("api_base") and config.get("api_key")),
     "llmModel": config.get("model"),
     "llmModels": config.get("models"),
+    "llmReasoningEffort": config.get("reasoning_effort"),
+    "llmContextWindowTokens": config.get("context_window_tokens"),
+    "llmContextTargetTokens": config.get("context_target_tokens"),
+    "llmContextHardTokens": config.get("context_hard_tokens"),
+    "llmTimeoutSeconds": config.get("llm_timeout_seconds"),
     "maxAutodebugAttempts": config.get("max_autodebug_attempts"),
     "manualCount": len(manuals),
     "manualFiles": manuals[:20],
@@ -371,7 +404,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.6.0"
+AGENT_VERSION = "0.7.0"
 DFISE_EXTRACTOR_VERSION = "dfise-idvg-extract/1"
 DFISE_METRIC_PROFILE = "tcad-idvg-v1"
 DFISE_MIN_SS_WINDOW_POINTS = 7
@@ -2998,7 +3031,7 @@ import uuid
 import zlib
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.6.0"
+AGENT_VERSION = "0.7.0"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 DFISE_EXTRACTOR_SOURCE_B64 = "__DFISE_EXTRACTOR_SOURCE_B64__"
@@ -3025,6 +3058,7 @@ CONFIG_EXAMPLE_PATH = os.path.join(ROOT, "config.example.json")
 ENV_EXAMPLE_PATH = os.path.join(ROOT, ".env.example")
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 ENV_PATH = os.path.join(ROOT, ".env")
+ALLOWED_MODELS = ["gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
 MANUALS_DIR = os.path.join(ROOT, "manuals")
 STOP_PATH = os.path.join(ROOT, "stop")
 MAX_ATTACHMENT_CONTEXT_CHARS = 600000
@@ -3583,8 +3617,10 @@ def config_list(value):
     return items
 
 def model_candidates(primary_model, configured_models):
-    models = config_list(configured_models)
+    models = [item for item in config_list(configured_models) if item in ALLOWED_MODELS]
     primary = safe_text(primary_model, 160).strip()
+    if primary not in ALLOWED_MODELS:
+        primary = "gpt-5.5"
     if primary and primary not in models:
         models.insert(0, primary)
     if not models:
@@ -3613,13 +3649,21 @@ def load_config():
         except Exception:
             file_config = {}
     primary_model = env.get("LLM_MODEL") or file_config.get("llmModel") or file_config.get("LLM_MODEL") or "gpt-5.5"
+    if primary_model not in ALLOWED_MODELS:
+        primary_model = "gpt-5.5"
     raw_models = env.get("LLM_MODELS") or file_config.get("llmModels") or file_config.get("LLM_MODELS")
+    context_window = 353000 if primary_model.startswith("gpt-5.6-") else 272000
     return {
         "api_base": env.get("LLM_API_BASE") or file_config.get("llmApiBase") or file_config.get("LLM_API_BASE") or "",
         "api_key": env.get("LLM_API_KEY") or file_config.get("llmApiKey") or file_config.get("LLM_API_KEY") or "",
         "model": primary_model,
         "models": model_candidates(primary_model, raw_models),
         "api_style": env.get("LLM_API_STYLE") or file_config.get("llmApiStyle") or file_config.get("LLM_API_STYLE") or "chat-completions",
+        "reasoning_effort": "max",
+        "context_window_tokens": context_window,
+        "context_target_tokens": (context_window * 85) // 100,
+        "context_hard_tokens": (context_window * 95) // 100,
+        "llm_timeout_seconds": config_int(env, file_config, "VM_AGENT_LLM_TIMEOUT_SECONDS", "vmAgentLlmTimeoutSeconds", 600, 30, 1800),
         "max_autodebug_attempts": config_int(env, file_config, "VM_AGENT_MAX_AUTODEBUG_ATTEMPTS", "vmAgentMaxAutodebugAttempts", 5, 1, 8),
     }
 
@@ -3691,13 +3735,15 @@ def write_worker_files():
                 "llmApiBase": "https://your-openai-compatible-base/v1",
                 "llmApiKey": "put-real-key-here-inside-vm-only",
                 "llmModel": "gpt-5.5",
-                "llmModels": ["gpt-5.5", "gpt-5.4"],
-                "llmApiStyle": "chat-completions",
+                "llmModels": ["gpt-5.5"],
+                "llmApiStyle": "openai-responses",
+                "llmReasoningEffort": "max",
+                "vmAgentLlmTimeoutSeconds": 600,
                 "vmAgentMaxAutodebugAttempts": 5
             }, indent=2, sort_keys=True) + "\n")
     if not os.path.exists(ENV_EXAMPLE_PATH):
         with open(ENV_EXAMPLE_PATH, "w") as handle:
-            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_MODELS=gpt-5.5,gpt-5.4\nLLM_API_STYLE=chat-completions\nVM_AGENT_MAX_AUTODEBUG_ATTEMPTS=5\n")
+            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_MODELS=gpt-5.5\nLLM_API_STYLE=openai-responses\nLLM_REASONING_EFFORT=max\nVM_AGENT_LLM_TIMEOUT_SECONDS=600\nVM_AGENT_MAX_AUTODEBUG_ATTEMPTS=5\n")
 
 def stop_worker(pid):
     if not pid:
@@ -3748,7 +3794,7 @@ def build_status(message_count_value=None):
         "version": AGENT_VERSION,
         "hostname": socket.gethostname(),
         "user": getpass.getuser(),
-        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "sentaurus_skills", "sentaurus_run_request", "sentaurus_autodebug", "sentaurus_session_output"],
+        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "vm_model_switching", "sentaurus_skills", "sentaurus_run_request", "sentaurus_autodebug", "sentaurus_session_output"],
         "instanceCount": len(instances),
         "latestInstance": instances[-1] if instances else None,
         "mailbox": "~/.sentaurus-web-agent/vm-agent",
@@ -3758,6 +3804,11 @@ def build_status(message_count_value=None):
         "llmConfigured": bool(llm_config.get("api_base") and llm_config.get("api_key")),
         "llmModel": llm_config.get("model"),
         "llmModels": llm_config.get("models"),
+        "llmReasoningEffort": llm_config.get("reasoning_effort"),
+        "llmContextWindowTokens": llm_config.get("context_window_tokens"),
+        "llmContextTargetTokens": llm_config.get("context_target_tokens"),
+        "llmContextHardTokens": llm_config.get("context_hard_tokens"),
+        "llmTimeoutSeconds": llm_config.get("llm_timeout_seconds"),
         "maxAutodebugAttempts": llm_config.get("max_autodebug_attempts"),
         "manualCount": len(manuals),
         "manualFiles": manuals[:20],
@@ -4480,6 +4531,11 @@ function toStatus(payload: RemoteAgentPayload): VmAgentStatus {
     llmConfigured: payload.llmConfigured,
     llmModel: payload.llmModel,
     llmModels: payload.llmModels,
+    llmReasoningEffort: payload.llmReasoningEffort,
+    llmContextWindowTokens: payload.llmContextWindowTokens,
+    llmContextTargetTokens: payload.llmContextTargetTokens,
+    llmContextHardTokens: payload.llmContextHardTokens,
+    llmTimeoutSeconds: payload.llmTimeoutSeconds,
     maxAutodebugAttempts: payload.maxAutodebugAttempts,
     manualCount: payload.manualCount,
     manualFiles: payload.manualFiles,
@@ -4672,11 +4728,56 @@ export async function getVmAgentStatus(): Promise<VmAgentStatus> {
   return payload.ok === false ? errorStatus(payload.error || "VM agent status check failed", payload.raw) : toStatus(payload);
 }
 
-export async function connectVmAgent(): Promise<{ status: VmAgentStatus; messages: VmAgentMessage[]; message?: VmAgentMessage; cursor: number }> {
-  const payload = await callVmAgent({ operation: "start", includeFolded: true, protocolVersion: 2 });
+export async function connectVmAgent(signal?: AbortSignal): Promise<{ status: VmAgentStatus; messages: VmAgentMessage[]; message?: VmAgentMessage; cursor: number }> {
+  const payload = await callVmAgent({ operation: "start", includeFolded: true, protocolVersion: 2 }, signal);
   const status = payload.ok === false ? errorStatus(payload.error || "VM agent connect failed", payload.raw) : toStatus(payload);
   const messages = normalizeMessages(payload.messages, payload);
   return { status, messages, message: messages.find((item) => item.role === "agent"), cursor: payload.cursor || 0 };
+}
+
+function vmAgentModelsResponse(status: VmAgentStatus): VmAgentModelsResponse {
+  const currentModel: VmAgentModelId = isVmAgentModelId(status.llmModel) ? status.llmModel : "gpt-5.5";
+  return {
+    ok: status.ok,
+    currentModel,
+    activeModels: (status.llmModels || [currentModel]).filter(isVmAgentModelId),
+    reasoningEffort: VM_AGENT_REASONING_EFFORT,
+    contextWindowTokens: vmAgentContextWindowTokens(currentModel),
+    models: vmAgentModelCatalog(),
+    status
+  };
+}
+
+export async function getVmAgentModels(): Promise<VmAgentModelsResponse> {
+  return vmAgentModelsResponse(await getVmAgentStatus());
+}
+
+async function writeVmAgentModelConfig(model: VmAgentModelId, signal?: AbortSignal): Promise<void> {
+  const result = await runSshCommandWithInput("python", remoteVmAgentModelConfigScript(model), 20_000, {
+    lane: "interactive",
+    queueDeadlineMs: 10_000,
+    dedupeKey: `vm-agent-model:${model}`,
+    signal
+  });
+  const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  if (!result.ok) throw httpError(502, result.error || result.stderr || "VM model configuration failed");
+  const jsonLine = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).reverse()
+    .find((line) => line.startsWith("{") && line.endsWith("}"));
+  if (!jsonLine) throw httpError(502, `VM model configuration returned invalid output: ${raw.slice(0, 300)}`);
+  const payload = JSON.parse(jsonLine) as { ok?: boolean; model?: string; error?: string };
+  if (payload.ok !== true || payload.model !== model) {
+    throw httpError(502, payload.error || "VM model configuration was not applied");
+  }
+}
+
+export async function setVmAgentModel(modelValue: unknown, signal?: AbortSignal): Promise<VmAgentModelsResponse> {
+  const model = parseVmAgentModelId(modelValue);
+  await writeVmAgentModelConfig(model, signal);
+  const connected = await connectVmAgent(signal);
+  if (!connected.status.ok || connected.status.llmModel !== model) {
+    throw httpError(502, connected.status.error || `VM worker restarted but did not activate ${model}`);
+  }
+  return vmAgentModelsResponse(connected.status);
 }
 
 let lastKnownHistoryCursor = 0;

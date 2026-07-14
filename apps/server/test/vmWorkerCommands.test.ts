@@ -24,6 +24,79 @@ test("standalone VM worker source matches the embedded worker source", async () 
   assert.equal(standaloneWorkerSource, embeddedWorkerSource());
 });
 
+test("VM worker enforces the model library, max reasoning, and context windows", async () => {
+  const temporaryHome = await mkdtemp(path.join(os.tmpdir(), "sentaurus-worker-model-test-"));
+  const scriptPath = path.join(temporaryHome, "worker_model_test.py");
+  const harness = String.raw`
+ensure_dir(ROOT)
+with open(ENV_PATH, "w") as handle:
+    handle.write("LLM_API_BASE=https://example.invalid/v1\n")
+    handle.write("LLM_API_KEY=test-key\n")
+    handle.write("LLM_MODEL=gpt-5.4\n")
+    handle.write("LLM_MODELS=gpt-5.4,gpt-5.6-unknown\n")
+    handle.write("LLM_API_STYLE=openai-responses\n")
+config_54 = load_config()
+
+with open(ENV_PATH, "w") as handle:
+    handle.write("LLM_API_BASE=https://example.invalid/v1\n")
+    handle.write("LLM_API_KEY=test-key\n")
+    handle.write("LLM_MODEL=gpt-5.6-sol\n")
+    handle.write("LLM_MODELS=gpt-5.6-sol\n")
+    handle.write("LLM_API_STYLE=openai-responses\n")
+config_56 = load_config()
+payload = responses_request_payload("user", config_56, config_56.get("model"), "system")
+
+print("WORKER_MODEL_RESULT=" + json.dumps({
+    "allowedModels": ALLOWED_MODELS,
+    "model54": config_54.get("model"),
+    "models54": config_54.get("models"),
+    "window54": config_54.get("context_window_tokens"),
+    "target54": config_54.get("context_target_tokens"),
+    "hard54": config_54.get("context_hard_tokens"),
+    "model56": config_56.get("model"),
+    "models56": config_56.get("models"),
+    "window56": config_56.get("context_window_tokens"),
+    "target56": config_56.get("context_target_tokens"),
+    "hard56": config_56.get("context_hard_tokens"),
+    "reasoning": payload.get("reasoning", {}).get("effort"),
+    "timeout": config_56.get("llm_timeout_seconds"),
+}, ensure_ascii=True, sort_keys=True))
+`;
+
+  try {
+    await writeFile(scriptPath, `${embeddedWorkerSource()}\n${harness}`, "utf8");
+    const { stdout } = await execFileAsync(process.env.PYTHON || "python", [scriptPath], {
+      env: {
+        ...process.env,
+        HOME: temporaryHome,
+        USERPROFILE: temporaryHome,
+        SENTAURUS_VM_AGENT_IMPORT_ONLY: "1"
+      },
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 20_000
+    });
+    const line = stdout.split(/\r?\n/).find((item) => item.startsWith("WORKER_MODEL_RESULT="));
+    assert.ok(line, `worker model harness did not return its result: ${stdout.slice(0, 500)}`);
+    assert.deepEqual(JSON.parse(line.slice("WORKER_MODEL_RESULT=".length)), {
+      allowedModels: ["gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+      hard54: 258400,
+      hard56: 335350,
+      model54: "gpt-5.4",
+      model56: "gpt-5.6-sol",
+      models54: ["gpt-5.4"],
+      models56: ["gpt-5.6-sol"],
+      reasoning: "max",
+      target54: 231200,
+      target56: 300050,
+      timeout: 600,
+      window54: 272000,
+      window56: 353000
+    });
+  } finally {
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
 test("VM worker commands persist goals and isolate side context", async () => {
   const temporaryHome = await mkdtemp(path.join(os.tmpdir(), "sentaurus-worker-command-test-"));
   const scriptPath = path.join(temporaryHome, "worker_test.py");

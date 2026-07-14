@@ -5,6 +5,7 @@ import type {
   VmAgentAttachmentSource,
   VmAgentMessageAttachment,
   VmAgentMessageRequest,
+  VmAgentModelUpdateRequest,
   VmSessionOutputCategory
 } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
@@ -16,12 +17,15 @@ import {
   downloadVmRunArtifact,
   getVmAgentAgentsMd,
   getVmAgentMessages,
+  getVmAgentModels,
   getVmAgentStatus,
   isVmAgentHistoryError,
   saveVmAgentAgentsMd,
+  setVmAgentModel,
   sendVmAgentMessage
 } from "../services/vmAgent.js";
 import { validateVmAgentInstructionsContent } from "../services/vmAgentInstructions.js";
+import { parseVmAgentModelId } from "../services/vmAgentModels.js";
 import { contentTypeForName, downloadVmSessionFile, listVmSessionFiles, vmSessionOutputCategories } from "../services/vmSessionFiles.js";
 
 function parseCursor(value: unknown): number {
@@ -73,6 +77,8 @@ export type VmAgentRouteOptions = {
   getVmAgentMessages?: typeof getVmAgentMessages;
   getVmAgentAgentsMd?: typeof getVmAgentAgentsMd;
   saveVmAgentAgentsMd?: typeof saveVmAgentAgentsMd;
+  getVmAgentModels?: typeof getVmAgentModels;
+  setVmAgentModel?: typeof setVmAgentModel;
 };
 
 function clientAbortSignal(request: FastifyRequest, reply: FastifyReply): { signal: AbortSignal; cleanup: () => void } {
@@ -206,9 +212,27 @@ export async function vmAgentRoutes(app: FastifyInstance, options: VmAgentRouteO
   const loadVmAgentMessages = options.getVmAgentMessages ?? getVmAgentMessages;
   const loadVmAgentAgentsMd = options.getVmAgentAgentsMd ?? getVmAgentAgentsMd;
   const persistVmAgentAgentsMd = options.saveVmAgentAgentsMd ?? saveVmAgentAgentsMd;
+  const loadVmAgentModels = options.getVmAgentModels ?? getVmAgentModels;
+  const persistVmAgentModel = options.setVmAgentModel ?? setVmAgentModel;
   app.get("/api/vm/agent/status", async (request) => {
     requireAuth(request);
     return getVmAgentStatus();
+  });
+
+  app.get("/api/vm/agent/models", async (request) => {
+    requireAuth(request);
+    return loadVmAgentModels();
+  });
+
+  app.put<{ Body: VmAgentModelUpdateRequest }>("/api/vm/agent/model", async (request, reply) => {
+    requireAuth(request);
+    const model = parseVmAgentModelId(request.body?.model);
+    const client = clientAbortSignal(request, reply);
+    try {
+      return await persistVmAgentModel(model, client.signal);
+    } finally {
+      client.cleanup();
+    }
   });
 
   app.get("/api/vm/agent/agents-md", async (request, reply) => {

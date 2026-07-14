@@ -28,7 +28,7 @@ except ImportError:
     fcntl = None
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.6.0"
+AGENT_VERSION = "0.7.0"
 DFISE_EXTRACTOR_VERSION = "dfise-idvg-extract/1"
 DFISE_METRIC_PROFILE = "tcad-idvg-v1"
 DFISE_MIN_SS_WINDOW_POINTS = 7
@@ -47,10 +47,12 @@ ENV_PATH = os.path.join(ROOT, ".env")
 MANUALS_DIR = os.path.join(ROOT, "manuals")
 GOALS_DIR = os.path.join(ROOT, "goals")
 GLOBAL_AGENTS_PATH = os.path.join(ROOT, "AGENTS.md")
-LLM_HARD_TIMEOUT_SECONDS = 120
-VM_CONTEXT_WINDOW_TOKENS = 1000000
-VM_CONTEXT_TARGET_TOKENS = 850000
-VM_CONTEXT_HARD_TOKENS = 950000
+ALLOWED_MODELS = ["gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
+DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_REASONING_EFFORT = "max"
+DEFAULT_LLM_TIMEOUT_SECONDS = 600
+NON_GPT_56_CONTEXT_WINDOW_TOKENS = 272000
+GPT_56_CONTEXT_WINDOW_TOKENS = 353000
 
 class HardTimeout(Exception):
     pass
@@ -521,13 +523,19 @@ def config_list(value):
     return items
 
 def model_candidates(primary_model, configured_models):
-    models = config_list(configured_models)
+    models = [item for item in config_list(configured_models) if item in ALLOWED_MODELS]
     primary = safe_text(primary_model, 160).strip()
+    if primary not in ALLOWED_MODELS:
+        primary = DEFAULT_MODEL
     if primary and primary not in models:
         models.insert(0, primary)
     if not models:
-        models = ["gpt-5.5"]
+        models = [DEFAULT_MODEL]
     return models
+
+def model_context_window_tokens(model):
+    model = safe_text(model, 160).strip()
+    return GPT_56_CONTEXT_WINDOW_TOKENS if model.startswith("gpt-5.6-") else NON_GPT_56_CONTEXT_WINDOW_TOKENS
 
 def config_int(env, file_config, env_key, file_key, fallback, minimum, maximum):
     raw = env.get(env_key)
@@ -550,14 +558,22 @@ def load_config():
                 file_config = json.load(handle)
         except Exception:
             file_config = {}
-    primary_model = env.get("LLM_MODEL") or file_config.get("llmModel") or file_config.get("LLM_MODEL") or "gpt-5.5"
+    primary_model = env.get("LLM_MODEL") or file_config.get("llmModel") or file_config.get("LLM_MODEL") or DEFAULT_MODEL
+    if primary_model not in ALLOWED_MODELS:
+        primary_model = DEFAULT_MODEL
     raw_models = env.get("LLM_MODELS") or file_config.get("llmModels") or file_config.get("LLM_MODELS")
+    context_window = model_context_window_tokens(primary_model)
     return {
         "api_base": env.get("LLM_API_BASE") or file_config.get("llmApiBase") or file_config.get("LLM_API_BASE") or "",
         "api_key": env.get("LLM_API_KEY") or file_config.get("llmApiKey") or file_config.get("LLM_API_KEY") or "",
         "model": primary_model,
         "models": model_candidates(primary_model, raw_models),
         "api_style": env.get("LLM_API_STYLE") or file_config.get("llmApiStyle") or file_config.get("LLM_API_STYLE") or "chat-completions",
+        "reasoning_effort": DEFAULT_REASONING_EFFORT,
+        "context_window_tokens": context_window,
+        "context_target_tokens": (context_window * 85) // 100,
+        "context_hard_tokens": (context_window * 95) // 100,
+        "llm_timeout_seconds": config_int(env, file_config, "VM_AGENT_LLM_TIMEOUT_SECONDS", "vmAgentLlmTimeoutSeconds", DEFAULT_LLM_TIMEOUT_SECONDS, 30, 1800),
         "max_autodebug_attempts": config_int(env, file_config, "VM_AGENT_MAX_AUTODEBUG_ATTEMPTS", "vmAgentMaxAutodebugAttempts", 5, 1, 8),
     }
 
@@ -1653,7 +1669,7 @@ def repair_run_request_reply(user_text, original_reply, validation_error, sessio
         return None, {"kind": "run_request_validation_error", "llmConfigured": False}
     repair_prompt = build_validation_repair_prompt(user_text, original_reply, validation_error)
     try:
-        reply, meta = run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent run-request repair", call_llm, repair_prompt, config, session_id, current_message_id)
+        reply, meta = run_with_timeout(llm_hard_timeout_seconds(config), "VM agent run-request repair", call_llm, repair_prompt, config, session_id, current_message_id)
         meta["kind"] = "llm"
         meta["runRequestRepair"] = True
         meta["validationError"] = safe_text(validation_error, 1000)
@@ -2196,7 +2212,7 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
         append_worklog(session_id, turn_id_value, "debug", "Run attempt failed; reading failed-step logs and trying to generate a safe repair deck.", result.get("id"))
         repair_prompt = build_repair_prompt(original_user_text, run_request, result, attempts)
         try:
-            repair_reply, _repair_meta = run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent auto-debug repair LLM call", call_llm, repair_prompt, config, session_id, current_message_id)
+            repair_reply, _repair_meta = run_with_timeout(llm_hard_timeout_seconds(config), "VM agent auto-debug repair LLM call", call_llm, repair_prompt, config, session_id, current_message_id)
             repair_setup, repair_without_setup = extract_json_tag(repair_reply, "SIMULATION_SETUP")
             if repair_setup:
                 latest_setup = normalize_simulation_setup(repair_setup)
@@ -2458,26 +2474,33 @@ def parse_responses_text(data):
             parts.append(text)
     return "\n".join(parts).strip()
 
+def responses_request_payload(user_text, config, model, system):
+    return {
+        "model": model,
+        "reasoning": {"effort": config.get("reasoning_effort") or DEFAULT_REASONING_EFFORT},
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ],
+    }
+
+def llm_hard_timeout_seconds(config):
+    return int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS) + 15
+
 def call_llm_model(user_text, config, model, system):
     user_text = unicode_text(user_text, 1000000)
     system = unicode_text(system, 1000000)
     model = safe_text(model, 200)
     api_style = (config.get("api_style") or "chat-completions").lower()
     if api_style in ["openai-responses", "responses"]:
-        payload = {
-            "model": model,
-            "input": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_text},
-            ],
-        }
+        payload = responses_request_payload(user_text, config, model, system)
         body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         request = urllib2.Request(responses_url(config.get("api_base")), body, {
             "content-type": "application/json",
             "authorization": "Bearer %s" % config.get("api_key"),
-            "user-agent": "sentaurus-vm-agent/0.6.0",
+            "user-agent": "sentaurus-vm-agent/0.7.0",
         })
-        response = urllib2.urlopen(request, timeout=90).read()
+        response = urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS)).read()
         try:
             text = response.decode("utf-8", "replace")
         except AttributeError:
@@ -2499,9 +2522,9 @@ def call_llm_model(user_text, config, model, system):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.6.0",
+        "user-agent": "sentaurus-vm-agent/0.7.0",
     })
-    response = urllib2.urlopen(request, timeout=90).read()
+    response = urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS)).read()
     try:
         text = response.decode("utf-8", "replace")
     except AttributeError:
@@ -2555,18 +2578,22 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
     agents_context = read_global_agents_context()
     system = build_llm_system_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context)
     context_tokens = estimate_context_tokens(system) + estimate_context_tokens(user_text)
-    if context_tokens > VM_CONTEXT_TARGET_TOKENS:
+    context_window = int(config.get("context_window_tokens") or model_context_window_tokens(config.get("model")))
+    context_target = int(config.get("context_target_tokens") or ((context_window * 85) // 100))
+    context_hard = int(config.get("context_hard_tokens") or ((context_window * 95) // 100))
+    if context_tokens > context_target:
         user_tokens = estimate_context_tokens(user_text)
-        available = max(80000, VM_CONTEXT_TARGET_TOKENS - user_tokens - 60000)
+        reserve = max(16000, (context_window * 6) // 100)
+        available = max(40000, context_target - user_tokens - reserve)
         session_budget = int(available * 0.56)
         manual_budget = int(available * 0.2)
         agents_budget = int(available * 0.16)
-        recent_session_context = fit_text_to_token_budget(recent_session_context, session_budget, u"\n\n[Same-session context compressed to fit the 1.0M-token model window.]")
-        manual_context = fit_text_to_token_budget(manual_context, manual_budget, u"\n\n[Manual context compressed to fit the 1.0M-token model window.]")
-        agents_context = fit_text_to_token_budget(agents_context, agents_budget, u"\n\n[VM-root AGENTS.md context compressed to fit the 1.0M-token model window.]")
+        recent_session_context = fit_text_to_token_budget(recent_session_context, session_budget, u"\n\n[Same-session context compressed to fit the configured model window.]")
+        manual_context = fit_text_to_token_budget(manual_context, manual_budget, u"\n\n[Manual context compressed to fit the configured model window.]")
+        agents_context = fit_text_to_token_budget(agents_context, agents_budget, u"\n\n[VM-root AGENTS.md context compressed to fit the configured model window.]")
         system = build_llm_system_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context)
-        if estimate_context_tokens(system) + user_tokens > VM_CONTEXT_HARD_TOKENS:
-            system = fit_text_to_token_budget(system, max(40000, VM_CONTEXT_HARD_TOKENS - user_tokens - 5000), u"\n\n[System prompt hard-truncated to protect the 1.0M-token model window.]")
+        if estimate_context_tokens(system) + user_tokens > context_hard:
+            system = fit_text_to_token_budget(system, max(20000, context_hard - user_tokens - 8000), u"\n\n[System prompt hard-truncated to protect the configured model window.]")
     models = config.get("models") or [config.get("model") or "gpt-5.5"]
     errors = []
     for index, model in enumerate(models):
@@ -2578,6 +2605,8 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
                 "model": model,
                 "apiStyle": config.get("api_style"),
                 "modelCandidates": ",".join(models),
+                "reasoningEffort": config.get("reasoning_effort"),
+                "contextWindowTokens": context_window,
             }
             if index > 0:
                 meta["fallbackFrom"] = ",".join(models[:index])
@@ -2609,6 +2638,18 @@ def side_investigation_reply(side_prompt, config, session_id="", current_message
     current_goal = session_goal_text(session_id)
     agents_context = read_global_agents_context()
     system = build_side_investigation_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context)
+    context_window = int(config.get("context_window_tokens") or model_context_window_tokens(config.get("model")))
+    context_target = int(config.get("context_target_tokens") or ((context_window * 85) // 100))
+    context_hard = int(config.get("context_hard_tokens") or ((context_window * 95) // 100))
+    question_tokens = estimate_context_tokens(question)
+    if estimate_context_tokens(system) + question_tokens > context_target:
+        available = max(30000, context_target - question_tokens - max(12000, (context_window * 5) // 100))
+        recent_session_context = fit_text_to_token_budget(recent_session_context, int(available * 0.58), u"\n\n[Side-session context compressed to fit the configured model window.]")
+        manual_context = fit_text_to_token_budget(manual_context, int(available * 0.22), u"\n\n[Side manual context compressed to fit the configured model window.]")
+        agents_context = fit_text_to_token_budget(agents_context, int(available * 0.15), u"\n\n[Side AGENTS.md context compressed to fit the configured model window.]")
+        system = build_side_investigation_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context)
+        if estimate_context_tokens(system) + question_tokens > context_hard:
+            system = fit_text_to_token_budget(system, max(16000, context_hard - question_tokens - 8000), u"\n\n[Side system prompt hard-truncated to protect the configured model window.]")
     models = config.get("models") or [config.get("model") or "gpt-5.5"]
     errors = []
     for index, model in enumerate(models):
@@ -2620,6 +2661,8 @@ def side_investigation_reply(side_prompt, config, session_id="", current_message
                 "model": model,
                 "apiStyle": config.get("api_style"),
                 "modelCandidates": ",".join(models),
+                "reasoningEffort": config.get("reasoning_effort"),
+                "contextWindowTokens": context_window,
             }
             if index > 0:
                 meta["fallbackFrom"] = ",".join(models[:index])
@@ -2644,7 +2687,7 @@ def handle_local_command(text, config, session_id="", current_message_id=""):
     if name == "goal":
         return local_goal_reply(session_id, args)
     if name == "side":
-        return run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent side investigation", side_investigation_reply, args, config, session_id, current_message_id)
+        return run_with_timeout(llm_hard_timeout_seconds(config), "VM agent side investigation", side_investigation_reply, args, config, session_id, current_message_id)
     return local_help_reply(), {"kind": "local_help", "llmConfigured": llm_configured(config)}
 
 def reply_for(text, session_id="", current_message_id=""):
@@ -2662,7 +2705,7 @@ def reply_for(text, session_id="", current_message_id=""):
             "or config.json. Sentaurus safe skills are already available; ask for status/tools to test them."
         ), {"kind": "config_required", "llmConfigured": False}
     try:
-        return run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent LLM call", call_llm, text, config, session_id, current_message_id)
+        return run_with_timeout(llm_hard_timeout_seconds(config), "VM agent LLM call", call_llm, text, config, session_id, current_message_id)
     except Exception as exc:
         return "VM agent LLM call failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": True, "modelCandidates": ",".join(config.get("models") or [])}
 

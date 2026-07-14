@@ -86,6 +86,11 @@ export type VmAgentStatus = {
   llmConfigured?: boolean;
   llmModel?: string;
   llmModels?: string[];
+  llmReasoningEffort?: "max";
+  llmContextWindowTokens?: number;
+  llmContextTargetTokens?: number;
+  llmContextHardTokens?: number;
+  llmTimeoutSeconds?: number;
   maxAutodebugAttempts?: number;
   manualCount?: number;
   manualFiles?: string[];
@@ -115,6 +120,32 @@ export type VmAgentMessageResponse = {
   message: VmAgentMessage;
   messages: VmAgentMessage[];
   cursor: number;
+};
+
+export type VmAgentModelId =
+  | "gpt-5.4"
+  | "gpt-5.5"
+  | "gpt-5.6-luna"
+  | "gpt-5.6-terra"
+  | "gpt-5.6-sol";
+
+export type VmAgentModelOption = {
+  id: VmAgentModelId;
+  contextWindowTokens: 272000 | 353000;
+};
+
+export type VmAgentModelsResponse = {
+  ok: boolean;
+  currentModel: VmAgentModelId;
+  activeModels: string[];
+  reasoningEffort: "max";
+  contextWindowTokens: 272000 | 353000;
+  models: VmAgentModelOption[];
+  status: VmAgentStatus;
+};
+
+export type VmAgentModelUpdateRequest = {
+  model: VmAgentModelId;
 };
 
 export type VmAgentHistoryErrorCode =

@@ -223,6 +223,8 @@ POST /api/runs/:id/jobs
 POST /api/runs/:id/cancel
 GET  /api/runs/:id/logs/stream
 GET  /api/vm/agent/status
+GET  /api/vm/agent/models
+PUT  /api/vm/agent/model
 POST /api/vm/agent/connect
 GET  /api/vm/agent/messages
 POST /api/vm/agent/messages
