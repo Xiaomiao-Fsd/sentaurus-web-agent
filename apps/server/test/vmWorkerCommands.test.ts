@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -15,6 +15,14 @@ function embeddedWorkerSource(): string {
   assert.ok(encoded, "remote control script should contain the encoded worker source");
   return Buffer.from(encoded, "base64").toString("utf8");
 }
+
+test("standalone VM worker source matches the embedded worker source", async () => {
+  const standaloneWorkerSource = await readFile(
+    new URL("../../../vm-worker/agent_worker.py", import.meta.url),
+    "utf8"
+  );
+  assert.equal(standaloneWorkerSource, embeddedWorkerSource());
+});
 
 test("VM worker commands persist goals and isolate side context", async () => {
   const temporaryHome = await mkdtemp(path.join(os.tmpdir(), "sentaurus-worker-command-test-"));
