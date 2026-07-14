@@ -55,6 +55,7 @@ import {
   assertHistoryResponse,
   completedSessionHistoryState,
   failedSessionHistoryState,
+  filterConcurrentWorkerArtifacts,
   historyErrorDetails,
   IDLE_SESSION_HISTORY,
   isCurrentHistoryRequest,
@@ -786,12 +787,13 @@ function mergeMessageList(prev: VmAgentMessage[], next: VmAgentMessage[] | undef
     const existing = byId.get(message.id);
     byId.set(message.id, existing ? { ...existing, ...message, meta: { ...existing.meta, ...message.meta } } : message);
   }
-  return [...byId.values()].sort((a, b) => {
+  const sorted = [...byId.values()].sort((a, b) => {
     const aSequence = messageSequence(a);
     const bSequence = messageSequence(b);
     if (aSequence !== null && bSequence !== null && aSequence !== bSequence) return aSequence - bSequence;
     return messageTime(a) - messageTime(b);
   });
+  return filterConcurrentWorkerArtifacts(sorted);
 }
 
 function formatClockSkew(value?: number): string {

@@ -104,3 +104,75 @@ print("WORKER_COMMAND_RESULT=" + json.dumps({
     await rm(temporaryHome, { recursive: true, force: true });
   }
 });
+
+test("VM worker silently skips queue files claimed by another worker", async () => {
+  const temporaryHome = await mkdtemp(path.join(os.tmpdir(), "sentaurus-worker-queue-test-"));
+  const scriptPath = path.join(temporaryHome, "worker_queue_test.py");
+  const harness = String.raw`
+ensure_dir(QUEUE_DIR)
+captured_messages = []
+
+def capture_message(*args, **kwargs):
+    captured_messages.append({"args": args, "kwargs": kwargs})
+    return {}
+
+append_message = capture_message
+missing_path = os.path.join(QUEUE_DIR, "missing.json")
+missing_result = process_queue_file(missing_path)
+
+queue_path = os.path.join(QUEUE_DIR, "queued.json")
+with open(queue_path, "w") as handle:
+    handle.write(json.dumps({"id": "queued", "content": "test", "meta": {}}))
+
+class BusyFileLock(object):
+    LOCK_EX = 1
+    LOCK_NB = 2
+
+    @staticmethod
+    def flock(_fd, _operation):
+        raise IOError(errno.EAGAIN, "already claimed")
+
+previous_fcntl = fcntl
+fcntl = BusyFileLock()
+busy_result = process_queue_file(queue_path)
+fcntl = previous_fcntl
+
+claimed_handle = open_queue_file_for_processing(queue_path)
+claimed_payload = json.load(claimed_handle) if claimed_handle is not None else None
+if claimed_handle is not None:
+    claimed_handle.close()
+
+print("WORKER_QUEUE_RESULT=" + json.dumps({
+    "missingResult": missing_result,
+    "busyResult": busy_result,
+    "capturedMessageCount": len(captured_messages),
+    "queueStillExists": os.path.exists(queue_path),
+    "claimedId": claimed_payload.get("id") if claimed_payload else None,
+}, ensure_ascii=True, sort_keys=True))
+`;
+
+  try {
+    await writeFile(scriptPath, `${embeddedWorkerSource()}\n${harness}`, "utf8");
+    const { stdout } = await execFileAsync(process.env.PYTHON || "python", [scriptPath], {
+      env: {
+        ...process.env,
+        HOME: temporaryHome,
+        USERPROFILE: temporaryHome,
+        SENTAURUS_VM_AGENT_IMPORT_ONLY: "1"
+      },
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 20_000
+    });
+    const line = stdout.split(/\r?\n/).find((item) => item.startsWith("WORKER_QUEUE_RESULT="));
+    assert.ok(line, `worker harness did not return its result: ${stdout.slice(0, 500)}`);
+    assert.deepEqual(JSON.parse(line.slice("WORKER_QUEUE_RESULT=".length)), {
+      busyResult: false,
+      capturedMessageCount: 0,
+      claimedId: "queued",
+      missingResult: false,
+      queueStillExists: true
+    });
+  } finally {
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});

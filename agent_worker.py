@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import base64
 import datetime
+import errno
 import glob
 import getpass
 import hashlib
@@ -20,6 +21,11 @@ try:
     import urllib2
 except ImportError:
     import urllib.request as urllib2
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 AGENT_NAME = "sentaurus-vm-agent"
 AGENT_VERSION = "0.6.0"
@@ -2660,11 +2666,32 @@ def reply_for(text, session_id="", current_message_id=""):
     except Exception as exc:
         return "VM agent LLM call failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": True, "modelCandidates": ",".join(config.get("models") or [])}
 
+def open_queue_file_for_processing(path):
+    try:
+        handle = open(path, "r")
+    except (IOError, OSError) as exc:
+        if getattr(exc, "errno", None) == errno.ENOENT:
+            return None
+        raise
+    if fcntl is None:
+        return handle
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError) as exc:
+        handle.close()
+        if getattr(exc, "errno", None) in [errno.EACCES, errno.EAGAIN]:
+            return None
+        raise
+    return handle
+
 def process_queue_file(path):
     session_id = ""
+    queue_handle = None
     try:
-        with open(path, "r") as handle:
-            item = json.load(handle)
+        queue_handle = open_queue_file_for_processing(path)
+        if queue_handle is None:
+            return False
+        item = json.load(queue_handle)
         user_text = unicode_text(item.get("content"), 4000)
         text = user_text
         incoming_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
@@ -2674,7 +2701,7 @@ def process_queue_file(path):
         request_message_id = item.get("id") or ""
         attachments = item.get("contextAttachments") if isinstance(item.get("contextAttachments"), list) else item.get("attachments") if isinstance(item.get("attachments"), list) else []
         display_attachments = []
-        audit("queue_processing_started", {"file": os.path.basename(path), "sessionId": session_id})
+        audit("queue_processing_started", {"file": os.path.basename(path), "sessionId": session_id, "workerPid": os.getpid()})
         append_progress(session_id, "received", "running", "Worker picked up queued request", 5)
         append_worklog(session_id, request_turn_id, "planning", "Received this request; preparing context and attachments before deciding whether Sentaurus execution is needed.")
         if attachments:
@@ -2829,7 +2856,8 @@ def process_queue_file(path):
                     publish_meta["sessionId"] = session_id
                 append_run_diagnostic(session_id, request_turn_id, publish_error_text, result.get("id") if run_request else "")
         shutil.move(path, os.path.join(DONE_DIR, os.path.basename(path)))
-        audit("queue_processed", {"file": os.path.basename(path), "replyKind": meta.get("kind")})
+        audit("queue_processed", {"file": os.path.basename(path), "replyKind": meta.get("kind"), "workerPid": os.getpid()})
+        return True
     except Exception as exc:
         error_meta = {"kind": "worker_error"}
         if session_id:
@@ -2840,6 +2868,13 @@ def process_queue_file(path):
             shutil.move(path, os.path.join(DONE_DIR, "failed_" + os.path.basename(path)))
         except Exception:
             pass
+        return False
+    finally:
+        if queue_handle is not None:
+            try:
+                queue_handle.close()
+            except Exception:
+                pass
 
 def main():
     for path in [ROOT, QUEUE_DIR, DONE_DIR, MANUALS_DIR, GOALS_DIR]:

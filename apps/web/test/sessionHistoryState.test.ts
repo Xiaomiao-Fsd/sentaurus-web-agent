@@ -6,6 +6,7 @@ import {
   assertHistoryResponse,
   completedSessionHistoryState,
   failedSessionHistoryState,
+  filterConcurrentWorkerArtifacts,
   historyErrorDetails,
   isCurrentHistoryRequest,
   isHistoryBootstrapSettled,
@@ -107,6 +108,28 @@ test("only a successful empty response becomes the empty state", () => {
     retryable: true,
     status: failedResponse.status
   });
+});
+
+test("concurrent worker artifacts collapse to one final without hiding unrelated errors or attachments", () => {
+  const turnId = "turn-race";
+  const messages = [
+    { id: "web-1", role: "user", content: "question", createdAt: "2026-07-14T08:36:21Z", meta: { turnId } },
+    { id: "worklog-1", role: "agent", content: "Calling model", createdAt: "2026-07-14T08:36:21Z", meta: { kind: "worklog_summary", turnId, phase: "planning" } },
+    { id: "worklog-2", role: "agent", content: "Calling model", createdAt: "2026-07-14T08:36:22Z", meta: { kind: "worklog_summary", turnId, phase: "planning" } },
+    { id: "final_1", role: "agent", content: "first accepted reply", createdAt: "2026-07-14T08:37:46Z", meta: { kind: "llm", turnId } },
+    { id: "final_2", role: "agent", content: "second raced reply", createdAt: "2026-07-14T08:37:48Z", meta: { kind: "llm", turnId } },
+    { id: "attach-1", role: "agent", content: "Published attachment", createdAt: "2026-07-14T08:37:48Z", meta: { kind: "vm_agent_attachments", turnId } },
+    { id: "race-error", role: "system", content: "VM agent worker failed to process a message: [Errno 2] No such file or directory: '/home/user/.sentaurus-web-agent/vm-agent/queue/web_test.json'", createdAt: "2026-07-14T08:37:48Z", meta: { kind: "worker_error", sessionId: "run-a" } },
+    { id: "real-error", role: "system", content: "VM agent worker failed to process a message: provider unavailable", createdAt: "2026-07-14T08:38:00Z", meta: { kind: "worker_error", sessionId: "run-a" } }
+  ] as Parameters<typeof filterConcurrentWorkerArtifacts>[0];
+
+  assert.deepEqual(filterConcurrentWorkerArtifacts(messages).map((message) => message.id), [
+    "web-1",
+    "worklog-1",
+    "final_1",
+    "attach-1",
+    "real-error"
+  ]);
 });
 
 

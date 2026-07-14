@@ -1,4 +1,4 @@
-import type { VmAgentHistoryResponse, VmAgentStatus } from "@sentaurus-agent/shared";
+import type { VmAgentHistoryResponse, VmAgentMessage, VmAgentStatus } from "@sentaurus-agent/shared";
 
 export type SessionHistoryPhase = "idle" | "loading" | "ready" | "empty" | "failed" | "truncated";
 
@@ -18,6 +18,59 @@ export type SessionHistoryErrorDetails = {
 };
 
 export const IDLE_SESSION_HISTORY: SessionHistoryState = { phase: "idle" };
+
+const CONCURRENT_WORKLOG_KINDS = new Set([
+  "worklog_summary",
+  "file_operation",
+  "tool_run",
+  "run_progress",
+  "run_diagnostic",
+  "progress"
+]);
+
+function messageMetaText(message: VmAgentMessage, key: string): string {
+  const value = message.meta?.[key];
+  return typeof value === "string" ? value : "";
+}
+
+function isQueueClaimRaceError(message: VmAgentMessage): boolean {
+  return message.role === "system"
+    && message.meta?.kind === "worker_error"
+    && message.content.includes("No such file or directory")
+    && /[/\\]queue[/\\]web_[^'\"]+\.json/.test(message.content);
+}
+
+export function filterConcurrentWorkerArtifacts(messages: VmAgentMessage[]): VmAgentMessage[] {
+  const finalTurns = new Set<string>();
+  const worklogKeys = new Set<string>();
+
+  return messages.filter((message) => {
+    if (isQueueClaimRaceError(message)) return false;
+    const turnId = messageMetaText(message, "turnId");
+    if (!turnId) return true;
+
+    if (message.id.startsWith("final_")) {
+      if (finalTurns.has(turnId)) return false;
+      finalTurns.add(turnId);
+      return true;
+    }
+
+    const kind = messageMetaText(message, "kind");
+    if (message.meta?.foldable !== true && !CONCURRENT_WORKLOG_KINDS.has(kind)) return true;
+    const key = [
+      turnId,
+      message.role,
+      kind,
+      messageMetaText(message, "phase"),
+      messageMetaText(message, "progressStage"),
+      messageMetaText(message, "progressStatus"),
+      message.content
+    ].join("\u0000");
+    if (worklogKeys.has(key)) return false;
+    worklogKeys.add(key);
+    return true;
+  });
+}
 
 export function isHistoryBootstrapSettled(
   runsHydrated: boolean,
