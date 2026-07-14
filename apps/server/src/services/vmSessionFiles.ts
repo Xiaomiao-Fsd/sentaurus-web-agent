@@ -1,13 +1,17 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { VM_SESSION_INPUT_CATEGORY, VM_SESSION_OUTPUT_CATEGORIES } from "@sentaurus-agent/shared";
 import type { VmSessionFilesResponse, VmSessionOutputCategory, VmSessionOutputFile } from "@sentaurus-agent/shared";
 import { safeFileName, safeRelativePath, safeRunId } from "../security/pathSafe.js";
 import { runSshCommandWithInput } from "./sshClient.js";
+import type { SshRunOptions } from "./sshClient.js";
 
 export const vmSessionOutputCategories: VmSessionOutputCategory[] = [...VM_SESSION_OUTPUT_CATEGORIES];
 
 const maxSessionFileBytes = 50 * 1024 * 1024;
+const sessionFilesCacheTtlMs = 5_000;
+const sessionFilesCache = new Map<string, { expiresAt: number; response: VmSessionFilesResponse }>();
 const allowedSessionExtensions = new Set([
   ".log",
   ".out",
@@ -23,6 +27,7 @@ const allowedSessionExtensions = new Set([
   ".jpeg",
   ".webp",
   ".gif",
+  ".svg",
   ".json",
   ".cmd",
   ".des",
@@ -37,7 +42,7 @@ const allowedSessionExtensions = new Set([
   ".pdf"
 ]);
 
-const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"]);
 
 type RemoteSessionFilesPayload = {
   ok?: boolean;
@@ -51,6 +56,8 @@ type RemoteSessionFilesPayload = {
   size?: number;
   modifiedAt?: string;
   contentB64?: string;
+  sha256?: string;
+  deduplicated?: boolean;
 };
 
 export type VmSessionDownloadedFile = {
@@ -134,6 +141,7 @@ export function contentTypeForName(name: string): string {
     case ".jpeg": return "image/jpeg";
     case ".webp": return "image/webp";
     case ".gif": return "image/gif";
+    case ".svg": return "image/svg+xml";
     case ".pdf": return "application/pdf";
     case ".json": return "application/json; charset=utf-8";
     case ".csv": return "text/csv; charset=utf-8";
@@ -149,6 +157,8 @@ export function contentTypeForName(name: string): string {
     case ".md":
     case ".rst":
     case ".sde":
+    case ".dat":
+    case ".plt":
       return "text/plain; charset=utf-8";
     default:
       return "application/octet-stream";
@@ -234,6 +244,7 @@ except Exception as exc:
 
 const remoteDownloadScript = String.raw`# -*- coding: utf-8 -*-
 import base64
+import hashlib
 import json
 import os
 import re
@@ -256,7 +267,11 @@ def valid_segment(value):
 
 def ensure_dir(path):
     if not os.path.isdir(path):
-        os.makedirs(path)
+        try:
+            os.makedirs(path)
+        except OSError:
+            if not os.path.isdir(path):
+                raise
 
 try:
     req = load_request()
@@ -304,6 +319,7 @@ except Exception as exc:
 
 const remoteSyncInputScript = String.raw`# -*- coding: utf-8 -*-
 import base64
+import hashlib
 import json
 import os
 import re
@@ -326,7 +342,11 @@ def valid_segment(value):
 
 def ensure_dir(path):
     if not os.path.isdir(path):
-        os.makedirs(path)
+        try:
+            os.makedirs(path)
+        except OSError:
+            if not os.path.isdir(path):
+                raise
 
 try:
     req = load_request()
@@ -350,17 +370,32 @@ try:
     target = os.path.abspath(os.path.join(category_dir, filename))
     if not target.startswith(category_dir + os.sep):
         fail("file path escapes output category")
+    data = base64.b64decode(content_b64)
+    digest = hashlib.sha256(data).hexdigest()
+    if ext == ".txt":
+        canonical_name = os.path.splitext(filename)[0] + ".plt"
+        canonical = os.path.abspath(os.path.join(category_dir, canonical_name))
+        if canonical.startswith(category_dir + os.sep) and os.path.isfile(canonical):
+            with open(canonical, "rb") as handle:
+                canonical_digest = hashlib.sha256(handle.read()).hexdigest()
+            if canonical_digest == digest:
+                print(json.dumps({"ok": True, "category": category, "path": canonical_name, "fileName": canonical_name, "size": os.path.getsize(canonical), "sha256": digest, "deduplicated": True}, ensure_ascii=True, sort_keys=True))
+                sys.exit(0)
     with open(target, "wb") as handle:
-        handle.write(base64.b64decode(content_b64))
-    print(json.dumps({"ok": True, "category": category, "path": filename, "fileName": filename, "size": os.path.getsize(target)}, ensure_ascii=True, sort_keys=True))
+        handle.write(data)
+    with open(target, "rb") as handle:
+        written_digest = hashlib.sha256(handle.read()).hexdigest()
+    if written_digest != digest:
+        fail("uploaded file hash mismatch", 502)
+    print(json.dumps({"ok": True, "category": category, "path": filename, "fileName": filename, "size": os.path.getsize(target), "sha256": digest, "deduplicated": False}, ensure_ascii=True, sort_keys=True))
 except SystemExit:
     raise
 except Exception as exc:
     fail(str(exc), 500)
 `;
 
-async function runRemoteSessionScript(script: string): Promise<RemoteSessionFilesPayload> {
-  const result = await runSshCommandWithInput("python -", script, 90_000);
+async function runRemoteSessionScript(script: string, options: SshRunOptions = {}): Promise<RemoteSessionFilesPayload> {
+  const result = await runSshCommandWithInput("python", script, 90_000, options);
   const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
   if (!result.ok) {
     throw httpError(502, result.error || result.stderr || "VM session file SSH command failed");
@@ -372,21 +407,30 @@ async function runRemoteSessionScript(script: string): Promise<RemoteSessionFile
   return payload;
 }
 
-export async function listVmSessionFiles(sessionId: string): Promise<VmSessionFilesResponse> {
+export async function listVmSessionFiles(sessionId: string, signal?: AbortSignal): Promise<VmSessionFilesResponse> {
   const safeSessionId = checkedSessionId(sessionId);
+  const cached = sessionFilesCache.get(safeSessionId);
+  if (cached && cached.expiresAt > Date.now()) return cached.response;
   const payload = await runRemoteSessionScript(payloadScript(remoteListScript, {
     sessionId: safeSessionId,
     categories: vmSessionOutputCategories,
     allowedExtensions: [...allowedSessionExtensions],
     imageExtensions: [...imageExtensions]
-  }));
-  return {
+  }), {
+    lane: "files",
+    queueDeadlineMs: 10_000,
+    dedupeKey: `session-files:${safeSessionId}`,
+    signal
+  });
+  const response = {
     categories: payload.categories || vmSessionOutputCategories,
     files: Array.isArray(payload.files) ? payload.files : []
   };
+  sessionFilesCache.set(safeSessionId, { expiresAt: Date.now() + sessionFilesCacheTtlMs, response });
+  return response;
 }
 
-export async function downloadVmSessionFile(sessionId: string, category: string, filePath: string): Promise<VmSessionDownloadedFile> {
+export async function downloadVmSessionFile(sessionId: string, category: string, filePath: string, signal?: AbortSignal): Promise<VmSessionDownloadedFile> {
   const safeSessionId = checkedSessionId(sessionId);
   const safeOutputCategory = safeCategory(category);
   const safePath = checkedRelativePath(filePath);
@@ -398,7 +442,12 @@ export async function downloadVmSessionFile(sessionId: string, category: string,
     categories: vmSessionOutputCategories,
     allowedExtensions: [...allowedSessionExtensions],
     maxBytes: maxSessionFileBytes
-  }));
+  }), {
+    lane: "files",
+    queueDeadlineMs: 20_000,
+    dedupeKey: `session-file:${safeSessionId}:${safeOutputCategory}:${safePath}`,
+    signal
+  });
   if (typeof payload.contentB64 !== "string" || typeof payload.path !== "string" || typeof payload.fileName !== "string" || !payload.category) {
     throw httpError(502, "VM session file response was incomplete");
   }
@@ -413,7 +462,11 @@ export async function downloadVmSessionFile(sessionId: string, category: string,
   };
 }
 
-export async function syncInputFileToVmSession(sessionId: string, filename: string, localPath: string): Promise<void> {
+export async function syncInputFileToVmSession(
+  sessionId: string,
+  filename: string,
+  localPath: string
+): Promise<{ path: string; size: number; sha256: string; deduplicated: boolean }> {
   const safeSessionId = checkedSessionId(sessionId);
   const safeName = checkedFileName(filename);
   assertAllowedExtension(safeName);
@@ -421,12 +474,30 @@ export async function syncInputFileToVmSession(sessionId: string, filename: stri
   if (data.byteLength > maxSessionFileBytes) {
     throw httpError(413, "File is too large to sync into the VM session output folder");
   }
-  await runRemoteSessionScript(payloadScript(remoteSyncInputScript, {
+  const expectedSha256 = createHash("sha256").update(data).digest("hex");
+  const payload = await runRemoteSessionScript(payloadScript(remoteSyncInputScript, {
     sessionId: safeSessionId,
     category: VM_SESSION_INPUT_CATEGORY,
     fileName: path.basename(safeName),
     categories: vmSessionOutputCategories,
     allowedExtensions: [...allowedSessionExtensions],
     contentB64: data.toString("base64")
-  }));
+  }), {
+    lane: "interactive",
+    queueDeadlineMs: 5_000,
+    dedupeKey: `session-input:${safeSessionId}:${path.basename(safeName)}:${expectedSha256}`
+  });
+  if (typeof payload.path !== "string" || typeof payload.size !== "number" || typeof payload.sha256 !== "string") {
+    throw httpError(502, "VM input sync response was incomplete");
+  }
+  if (payload.sha256 !== expectedSha256) {
+    throw httpError(502, "VM input sync SHA-256 mismatch");
+  }
+  sessionFilesCache.delete(safeSessionId);
+  return {
+    path: payload.path,
+    size: payload.size,
+    sha256: payload.sha256,
+    deduplicated: payload.deduplicated === true
+  };
 }

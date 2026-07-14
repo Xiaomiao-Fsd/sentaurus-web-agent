@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent, MouseEvent } from "react";
+import type { DragEvent, FormEvent, MouseEvent, ReactNode } from "react";
 import { VM_SESSION_INPUT_CATEGORY, VM_SESSION_OUTPUT_CATEGORIES } from "@sentaurus-agent/shared";
 import type {
   RunDetail,
@@ -23,6 +23,7 @@ import {
   createRun,
   deleteRun as deleteRunApi,
   downloadUrl,
+  getVmAgentAgentsMd,
   getAuthToken,
   getHealth,
   getRun,
@@ -33,6 +34,7 @@ import {
   listRuns,
   renameRun,
   saveRunSimulationSetup,
+  saveVmAgentAgentsMd,
   sendVmAgentMessage,
   setAuthToken,
   uploadRunFile,
@@ -40,8 +42,28 @@ import {
   vmRunArtifactDownloadUrl,
   vmSessionFileDownloadUrl
 } from "./lib/api.js";
+import {
+  applySlashCommandSuggestion,
+  nextSlashSuggestionIndex,
+  slashCommandQuery,
+  slashCommandSuggestions
+} from "./slashCommands.js";
+import type { SlashCommandSuggestion } from "./slashCommands.js";
 import { TopStatusBar } from "./app/TopStatusBar.js";
 import { useToast } from "./components/ui/Toast.js";
+import {
+  assertHistoryResponse,
+  completedSessionHistoryState,
+  failedSessionHistoryState,
+  historyErrorDetails,
+  IDLE_SESSION_HISTORY,
+  isCurrentHistoryRequest,
+  isHistoryBootstrapSettled,
+  loadingSessionHistoryState,
+  shouldLoadSelectedSessionHistory
+} from "./sessionHistory.js";
+import { vmSessionFilesCompletionState } from "./vmSessionFilesState.js";
+import type { SessionHistoryState } from "./sessionHistory.js";
 import { errorMessage, formatBytes, formatCompactNumber, formatDate, formatFullDate, normalizeAuthToken, shortId } from "./utils/format.js";
 
 type PanelNotice = {
@@ -95,6 +117,15 @@ type MessageVmSessionFile = {
   createdAt: string;
 };
 
+type ChatTurnGroup = {
+  id: string;
+  messages: VmAgentMessage[];
+};
+
+type ChatItem =
+  | { type: "message"; message: VmAgentMessage; key: string }
+  | { type: "turn"; group: ChatTurnGroup; key: string };
+
 type SessionMenuState = {
   runId: string;
   x: number;
@@ -123,13 +154,16 @@ type PendingImagePreview = {
   size: number;
 };
 
-const REFERENCE_CONTEXT_TOKENS = 272_000;
+const REFERENCE_CONTEXT_TOKENS = 1_000_000;
 const REPLY_RETRY_INTERVAL_MS = 10_000;
 const MAX_REPLY_RETRIES = 180;
 const STREAM_RECONNECT_DELAY_MS = 3_000;
 const STREAM_FALLBACK_POLL_MS = 10_000;
+const SESSION_HISTORY_LIMIT = 5000;
+const GLOBAL_HISTORY_LIMIT = 500;
+const STREAM_BATCH_LIMIT = 500;
 const SESSION_ORDER_KEY = "sentaurus_session_order";
-const ATTACHMENT_ACCEPT = ".txt,.plt,.cmd,.des,.log,.out,.err,.csv,.json,.png,.jpg,.jpeg,.webp,.gif";
+const ATTACHMENT_ACCEPT = ".txt,.plt,.dat,.cmd,.des,.log,.out,.err,.csv,.json,.png,.jpg,.jpeg,.webp,.gif,.svg";
 const MAX_PENDING_IMAGE_ATTACHMENTS = 12;
 const OUTPUT_CATEGORIES: VmSessionOutputCategory[] = [...VM_SESSION_OUTPUT_CATEGORIES];
 const INPUT_SESSION_CATEGORY = VM_SESSION_INPUT_CATEGORY;
@@ -200,6 +234,60 @@ function isThinkingMessage(message: VmAgentMessage): boolean {
   return message.meta?.kind === "agent_thinking" || message.meta?.kind === "agent_reasoning_summary";
 }
 
+function messageKind(message: VmAgentMessage): string {
+  return typeof message.meta?.kind === "string" ? message.meta.kind : "";
+}
+
+function isWorklogKind(kind: string): boolean {
+  return kind === "worklog_summary" || kind === "file_operation" || kind === "tool_run" || kind === "run_progress" || kind === "run_diagnostic" || kind === "progress";
+}
+
+function isFoldableWorklogMessage(message: VmAgentMessage): boolean {
+  const kind = messageKind(message);
+  return message.role !== "user" && (message.meta?.foldable === true || isWorklogKind(kind));
+}
+
+function streamState(message: VmAgentMessage): string {
+  const value = message.meta?.streamState ?? message.meta?.status;
+  return typeof value === "string" ? value.toLowerCase() : "";
+}
+
+function isAgentStreamDelta(message: VmAgentMessage): boolean {
+  const kind = messageKind(message);
+  return message.role === "agent" && (kind === "agent_response_delta" || message.meta?.delta === true);
+}
+
+function isAgentStreamDone(message: VmAgentMessage): boolean {
+  if (message.role !== "agent") return false;
+  const kind = messageKind(message);
+  const state = streamState(message);
+  return kind === "agent_response_done"
+    || kind === "agent_response_error"
+    || message.meta?.done === true
+    || state === "done"
+    || state === "completed"
+    || state === "final"
+    || state === "error";
+}
+
+function isAgentStreamingDraft(message: VmAgentMessage): boolean {
+  if (message.role !== "agent") return false;
+  if (isAgentStreamDelta(message)) return true;
+  if (isAgentStreamDone(message)) return false;
+  const kind = messageKind(message);
+  const state = streamState(message);
+  return kind === "agent_response_stream"
+    || message.meta?.done === false
+    || state === "queued"
+    || state === "running"
+    || state === "streaming";
+}
+
+function messageTurnId(message: VmAgentMessage): string | null {
+  const value = message.meta?.turnId || message.meta?.groupId;
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
 function suppressAttachmentPreview(message: VmAgentMessage): boolean {
   return message.meta?.suppressAttachmentPreview === true;
 }
@@ -207,6 +295,15 @@ function suppressAttachmentPreview(message: VmAgentMessage): boolean {
 function metaString(message: VmAgentMessage, key: string): string | null {
   const value = message.meta?.[key];
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function streamTargetMessageId(message: VmAgentMessage): string | null {
+  if (message.role !== "agent") return null;
+  if (!isAgentStreamDelta(message) && !isAgentStreamingDraft(message) && !isAgentStreamDone(message)) return null;
+  return metaString(message, "targetMessageId")
+    || metaString(message, "messageId")
+    || metaString(message, "streamId")
+    || message.id;
 }
 
 function parseJsonValue<T>(value: string | null): T | null {
@@ -448,6 +545,53 @@ function messagesForSession(messages: VmAgentMessage[], sessionId: string | null
   return filtered;
 }
 
+function chatItemsForMessages(messages: VmAgentMessage[]): ChatItem[] {
+  const items: ChatItem[] = [];
+  let pending: ChatTurnGroup | null = null;
+
+  const flush = () => {
+    if (!pending) return;
+    const onlyMessage = pending.messages[0];
+    if (pending.messages.length === 1 && onlyMessage.role !== "user" && !isFoldableWorklogMessage(onlyMessage)) {
+      items.push({ type: "message", message: onlyMessage, key: onlyMessage.id });
+    } else {
+      items.push({ type: "turn", group: pending, key: pending.id });
+    }
+    pending = null;
+  };
+
+  for (const message of messages) {
+    const turnId = messageTurnId(message);
+    if (!turnId) {
+      flush();
+      items.push({ type: "message", message, key: message.id });
+      continue;
+    }
+    if (!pending || pending.id !== turnId) {
+      flush();
+      pending = { id: turnId, messages: [message] };
+    } else {
+      pending.messages.push(message);
+    }
+  }
+
+  flush();
+  return items;
+}
+
+function turnHasWorklog(group: ChatTurnGroup): boolean {
+  return group.messages.some(isFoldableWorklogMessage);
+}
+
+function turnHasFinalResult(group: ChatTurnGroup): boolean {
+  return group.messages.some((message) => {
+    if (message.role === "user" || isFoldableWorklogMessage(message)) return false;
+    if (isAgentStreamingDraft(message)) return false;
+    const kind = messageKind(message);
+    return kind === "run_final" || kind === "vm_agent_attachments" || message.meta?.summaryOfGroup === true || message.role === "agent";
+  });
+}
+
 function globalAgentMessages(messages: VmAgentMessage[]): VmAgentMessage[] {
   return messages.filter((message) => !messageSessionId(message));
 }
@@ -492,6 +636,14 @@ function latestMessagePreview(messages: VmAgentMessage[], runId: string): string
   if (!latest) return "No scoped VM messages yet";
   const compact = latest.content.replace(/\s+/g, " ").trim();
   return compact.length > 86 ? `${compact.slice(0, 86)}...` : compact;
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
 }
 
 function progressStatus(value: unknown): ProgressStatus {
@@ -550,9 +702,30 @@ function thinkingStageLabel(message: VmAgentMessage): string {
   return stage.replace(/_/g, " ");
 }
 
+function estimateTextTokens(value: string): number {
+  let ascii = 0;
+  let nonAscii = 0;
+  for (const char of value) {
+    if (char.charCodeAt(0) < 128) ascii += 1;
+    else nonAscii += 1;
+  }
+  return Math.ceil(ascii / 4 + nonAscii);
+}
+
+function estimatedMessageText(message: VmAgentMessage): string {
+  return JSON.stringify({
+    role: message.role,
+    source: (message as VmAgentMessage & { source?: string }).source,
+    content: message.content,
+    meta: message.meta,
+    attachments: message.attachments
+  });
+}
+
 function estimateContextUsage(messages: VmAgentMessage[]): ContextStats {
-  const characters = messages.reduce((total, message) => total + message.content.length, 0);
-  const estimatedTokens = Math.ceil(characters / 4);
+  const serializedMessages = messages.map(estimatedMessageText);
+  const characters = serializedMessages.reduce((total, text) => total + text.length, 0);
+  const estimatedTokens = serializedMessages.reduce((total, text) => total + estimateTextTokens(text), 0);
   return {
     characters,
     estimatedTokens,
@@ -585,6 +758,31 @@ function mergeMessageList(prev: VmAgentMessage[], next: VmAgentMessage[] | undef
   if (!next?.length) return prev;
   const byId = new Map(prev.map((message) => [message.id, message]));
   for (const message of next) {
+    const targetMessageId = streamTargetMessageId(message);
+    if (targetMessageId) {
+      const existing = byId.get(targetMessageId);
+      const appendContent = isAgentStreamDelta(message) || message.meta?.append === true;
+      const mergedContent = existing && appendContent
+        ? `${existing.content}${message.content}`
+        : message.content || existing?.content || "";
+      byId.set(targetMessageId, {
+        ...existing,
+        ...message,
+        id: targetMessageId,
+        role: "agent",
+        content: mergedContent,
+        createdAt: existing?.createdAt || message.createdAt,
+        sequence: existing?.sequence ?? message.sequence,
+        meta: {
+          ...existing?.meta,
+          ...message.meta,
+          kind: isAgentStreamDone(message) ? messageKind(message) || "agent_response_done" : "agent_response_stream",
+          done: isAgentStreamDone(message)
+        },
+        attachments: message.attachments || existing?.attachments
+      });
+      continue;
+    }
     const existing = byId.get(message.id);
     byId.set(message.id, existing ? { ...existing, ...message, meta: { ...existing.meta, ...message.meta } } : message);
   }
@@ -628,7 +826,7 @@ function sentaurusRunStatus(message: VmAgentMessage): string | null {
 
 function hasAgentReplyForSession(messages: VmAgentMessage[] | undefined, sessionId: string): boolean {
   return !!messages?.some((message) => {
-    const isAgentReply = message.role === "agent";
+    const isAgentReply = message.role === "agent" && !isAgentStreamingDraft(message);
     const isSystemError = message.role === "system" && (message.meta?.kind === "llm_error" || message.meta?.kind === "worker_error");
     if (!isAgentReply && !isSystemError) return false;
     const scopedSession = messageSessionId(message);
@@ -722,6 +920,26 @@ function displayAttachmentKey(attachment: VmAgentMessageAttachment): string {
   return `${attachment.source}:${attachment.runId || ""}:${attachment.category || ""}:${attachment.path}`;
 }
 
+function renderInlineCode(text: string): ReactNode[] {
+  return text.split(/(`[^`]+`)/g).map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`") && part.length > 1) {
+      return <code key={index}>{part.slice(1, -1)}</code>;
+    }
+    return part;
+  });
+}
+
+function renderMessageText(content: string): ReactNode {
+  const lines = content.split(/\r?\n/);
+  return lines.map((line, index) => {
+    const listMatch = line.match(/^\s*[-*]\s+(.+)$/);
+    if (listMatch) {
+      return <div className="message-list-line" key={index}><span>-</span><p>{renderInlineCode(listMatch[1])}</p></div>;
+    }
+    return <p key={index}>{renderInlineCode(line || " ")}</p>;
+  });
+}
+
 function vmArtifactDisplayKey(file: SessionVmArtifact): string {
   return `vm-run-artifact:${file.runId}::${file.path}`;
 }
@@ -768,6 +986,8 @@ export default function App() {
   const [vmAgent, setVmAgent] = useState<VmAgentStatus | null>(null);
   const [vmAgentMessages, setVmAgentMessages] = useState<VmAgentMessage[]>([]);
   const [composer, setComposer] = useState("");
+  const [dismissedSlashQuery, setDismissedSlashQuery] = useState<string | null>(null);
+  const [slashSuggestionIndex, setSlashSuggestionIndex] = useState(0);
   const [vmAgentStatusLoading, setVmAgentStatusLoading] = useState(false);
   const [vmAgentConnectLoading, setVmAgentConnectLoading] = useState(false);
   const [vmAgentHistoryLoading, setVmAgentHistoryLoading] = useState(false);
@@ -787,7 +1007,10 @@ export default function App() {
   const [mobileChatInfoOpen, setMobileChatInfoOpen] = useState(false);
   const [mobileComposerToolsOpen, setMobileComposerToolsOpen] = useState(false);
   const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [runsHydrated, setRunsHydrated] = useState(false);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [historyAttemptedSessionId, setHistoryAttemptedSessionId] = useState<string | null>(null);
+  const [sessionHistoryById, setSessionHistoryById] = useState<Record<string, SessionHistoryState>>({});
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [panelNotice, setPanelNotice] = useState<PanelNotice | null>(null);
   const [sessionOrder, setSessionOrder] = useState<string[]>(() => loadSessionOrder());
@@ -803,16 +1026,42 @@ export default function App() {
   const [messageDisplayOverrides, setMessageDisplayOverrides] = useState<Record<string, string>>({});
   const [imagePreview, setImagePreview] = useState<ImagePreview | null>(null);
   const [pendingImagePreviews, setPendingImagePreviews] = useState<PendingImagePreview[]>([]);
+  const [composerDragActive, setComposerDragActive] = useState(false);
+  const [agentsModalOpen, setAgentsModalOpen] = useState(false);
+  const [agentsModalLoading, setAgentsModalLoading] = useState(false);
+  const [agentsModalSaving, setAgentsModalSaving] = useState(false);
+  const [agentsModalError, setAgentsModalError] = useState<string | null>(null);
+  const [agentsModalDraft, setAgentsModalDraft] = useState("");
+  const [agentsModalSavedValue, setAgentsModalSavedValue] = useState("");
+  const [worklogClock, setWorklogClock] = useState(Date.now());
   const messageEndRef = useRef<HTMLDivElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const agentsTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const pendingReplySessionRef = useRef<string | null>(null);
   const pendingReplyRetryRef = useRef(0);
   const vmAgentCursorRef = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
   const notifiedCompletionIdsRef = useRef<Set<string>>(new Set());
   const sessionMenuCloseTimerRef = useRef<number | null>(null);
+  const composerDragDepthRef = useRef(0);
   const setupSyncKeyRef = useRef("");
+  const historyRequestSequenceRef = useRef(0);
+  const historyAbortControllerRef = useRef<AbortController | null>(null);
+  const vmSessionFilesRequestRef = useRef<{
+    sessionId: string;
+    controller: AbortController;
+    promise: Promise<VmSessionFilesResponse>;
+  } | null>(null);
 
   selectedRunIdRef.current = selectedRunId;
+
+  const activeSlashQuery = slashCommandQuery(composer);
+  const visibleSlashSuggestions = useMemo(() => {
+    if (!activeSlashQuery || dismissedSlashQuery === activeSlashQuery) return [];
+    return slashCommandSuggestions(composer);
+  }, [activeSlashQuery, composer, dismissedSlashQuery]);
+  const activeSlashSuggestion = visibleSlashSuggestions[slashSuggestionIndex] || visibleSlashSuggestions[0] || null;
+  const agentsModalDirty = agentsModalDraft !== agentsModalSavedValue;
 
   useEffect(() => {
     const previews = pendingAttachments
@@ -835,12 +1084,46 @@ export default function App() {
     if (panelNotice) notify(panelNotice.kind, panelNotice.text);
   }, [notify, panelNotice]);
 
+  useEffect(() => {
+    if (!activeSlashQuery) {
+      setDismissedSlashQuery(null);
+      setSlashSuggestionIndex(0);
+      return;
+    }
+    if (dismissedSlashQuery && dismissedSlashQuery !== activeSlashQuery) {
+      setDismissedSlashQuery(null);
+    }
+  }, [activeSlashQuery, dismissedSlashQuery]);
+
+  useEffect(() => {
+    if (slashSuggestionIndex < visibleSlashSuggestions.length) return;
+    setSlashSuggestionIndex(0);
+  }, [slashSuggestionIndex, visibleSlashSuggestions.length]);
+
+  useEffect(() => {
+    if (!agentsModalOpen) return;
+    agentsTextareaRef.current?.focus();
+  }, [agentsModalOpen]);
+
   const orderedRuns = useMemo(() => orderRuns(runs, sessionOrder), [runs, sessionOrder]);
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId]);
+  const selectedHistoryState = selectedRunId ? sessionHistoryById[selectedRunId] || IDLE_SESSION_HISTORY : IDLE_SESSION_HISTORY;
+  const selectedHistoryPhase = selectedHistoryState.phase;
+  const historyBootstrapSettled = isHistoryBootstrapSettled(runsHydrated, selectedRunId, historyAttemptedSessionId);
   const visibleSessionMenu = sessionMenu || closingSessionMenu;
   const menuRun = useMemo(() => runs.find((run) => run.id === visibleSessionMenu?.runId) || null, [runs, visibleSessionMenu]);
   const currentMessages = useMemo(() => messagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
-  const visibleMessages = useMemo(() => currentMessages.filter((message) => !isProgressMessage(message) && !isThinkingMessage(message)), [currentMessages]);
+  const visibleMessages = useMemo(() => currentMessages.filter((message) => {
+    if (isThinkingMessage(message)) return false;
+    if (isProgressMessage(message)) return !!messageTurnId(message);
+    return true;
+  }), [currentMessages]);
+  const chatItems = useMemo(() => chatItemsForMessages(visibleMessages), [visibleMessages]);
+  const hasActiveWorklog = useMemo(() => chatItems.some((item) => (
+    item.type === "turn"
+    && item.group.messages.some((message) => message.role === "user")
+    && !turnHasFinalResult(item.group)
+  )), [chatItems]);
   const progressRows = useMemo(() => progressRowsForSession(vmAgentMessages, selectedRunId).slice(-12), [selectedRunId, vmAgentMessages]);
   const thinkingMessages = useMemo(() => thinkingMessagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
   const messageSimulationSetup = useMemo(() => latestSimulationSetupFromMessages(currentMessages), [currentMessages]);
@@ -871,8 +1154,16 @@ export default function App() {
   const clockSkewLabel = formatClockSkew(vmAgent?.clockSkewMs);
   const clockSkewOk = typeof vmAgent?.clockSkewMs === "number" ? !clockSkewWarning : null;
   const canSendMessage = !!authKey && !!selectedRunId && !messageSending && !attachmentUploading;
+  const composerDropEnabled = !!authKey && !!selectedRunId && !messageSending && !attachmentUploading;
   const waitingForAgentReply = !!pendingReplySessionId;
   const startAgentDisabled = !authKey || vmAgentConnectLoading || messageSending || waitingForAgentReply;
+
+  useEffect(() => {
+    if (!hasActiveWorklog) return undefined;
+    setWorklogClock(Date.now());
+    const interval = window.setInterval(() => setWorklogClock(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [hasActiveWorklog]);
 
   function setVmAgentCursorValue(cursor: number) {
     const nextCursor = Number.isFinite(cursor) && cursor >= 0 ? cursor : 0;
@@ -960,6 +1251,7 @@ export default function App() {
     try {
       const result = await listRuns();
       setRuns(result.runs);
+      setRunsHydrated(true);
       if (!selectedRunId && result.runs[0]) setSelectedRunId(result.runs[0].id);
       setPanelNotice({ kind: "success", text: "AUTH_TOKEN saved." });
     } catch (err) {
@@ -1006,12 +1298,66 @@ export default function App() {
     }
   }
 
+  async function loadSelectedSessionHistory(
+    sessionId: string,
+    options: { retrying?: boolean; showBusy?: boolean } = {}
+  ): Promise<boolean> {
+    const requestSequence = historyRequestSequenceRef.current + 1;
+    historyRequestSequenceRef.current = requestSequence;
+    historyAbortControllerRef.current?.abort();
+    const controller = new AbortController();
+    historyAbortControllerRef.current = controller;
+    setSessionHistoryById((current) => ({
+      ...current,
+      [sessionId]: loadingSessionHistoryState(current[sessionId], options.retrying)
+    }));
+    if (options.showBusy) setVmAgentHistoryLoading(true);
+
+    try {
+      const response = await getVmAgentMessages(0, { limit: SESSION_HISTORY_LIMIT, sessionId, signal: controller.signal });
+      if (!isCurrentHistoryRequest(historyRequestSequenceRef.current, requestSequence, selectedRunIdRef.current, sessionId)) return false;
+      assertHistoryResponse(response);
+      setVmAgent(response.status);
+      setVmAgentCursorValue(response.cursor);
+      mergeVmAgentMessages(response.messages);
+      handleVmAgentMessageBatch(response.messages);
+      setSessionHistoryById((current) => ({
+        ...current,
+        [sessionId]: completedSessionHistoryState(response)
+      }));
+      setHistoryAttemptedSessionId(sessionId);
+      return true;
+    } catch (err) {
+      if (controller.signal.aborted) return false;
+      if (!isCurrentHistoryRequest(historyRequestSequenceRef.current, requestSequence, selectedRunIdRef.current, sessionId)) return false;
+      const details = historyErrorDetails(err, errorMessage(err));
+      if (details.status) setVmAgent(details.status);
+      setSessionHistoryById((current) => ({
+        ...current,
+        [sessionId]: failedSessionHistoryState(current[sessionId], details)
+      }));
+      setHistoryAttemptedSessionId(sessionId);
+      return false;
+    } finally {
+      if (historyAbortControllerRef.current === controller) historyAbortControllerRef.current = null;
+      if (options.showBusy && historyRequestSequenceRef.current === requestSequence) {
+        setVmAgentHistoryLoading(false);
+      }
+    }
+  }
+
   async function handleRefreshVmAgentMessages(showBusy = true) {
+    if (selectedRunId) {
+      await loadSelectedSessionHistory(selectedRunId, {
+        retrying: selectedHistoryPhase === "failed",
+        showBusy
+      });
+      return;
+    }
     if (showBusy) setVmAgentHistoryLoading(true);
     try {
-      const response = selectedRunId
-        ? await getVmAgentMessages(0, { limit: 500, sessionId: selectedRunId })
-        : await getVmAgentMessages(0, { limit: 100 });
+      const response = await getVmAgentMessages(0, { limit: GLOBAL_HISTORY_LIMIT });
+      assertHistoryResponse(response);
       setVmAgent(response.status);
       setVmAgentCursorValue(response.cursor);
       mergeVmAgentMessages(response.messages);
@@ -1020,6 +1366,58 @@ export default function App() {
       recordError(err);
     } finally {
       if (showBusy) setVmAgentHistoryLoading(false);
+    }
+  }
+
+  function applySlashSuggestion(suggestion: SlashCommandSuggestion) {
+    setComposer(applySlashCommandSuggestion(composer, suggestion));
+    setDismissedSlashQuery(null);
+    setSlashSuggestionIndex(0);
+    window.requestAnimationFrame(() => composerInputRef.current?.focus());
+  }
+
+  async function openAgentsModal() {
+    if (!authKey) {
+      setPanelNotice({ kind: "error", text: "Save AUTH_TOKEN before editing VM AGENTS.md." });
+      return;
+    }
+    setAgentsModalOpen(true);
+    setAgentsModalLoading(true);
+    setAgentsModalError(null);
+    try {
+      const response = await getVmAgentAgentsMd();
+      setAgentsModalDraft(response.content || "");
+      setAgentsModalSavedValue(response.content || "");
+    } catch (err) {
+      const message = errorMessage(err);
+      setAgentsModalError(message);
+      setAgentsModalDraft("");
+      setAgentsModalSavedValue("");
+    } finally {
+      setAgentsModalLoading(false);
+    }
+  }
+
+  function closeAgentsModal(force = false) {
+    if (agentsModalSaving) return;
+    if (!force && agentsModalDirty && !window.confirm("Discard unsaved AGENTS.md changes?")) return;
+    setAgentsModalOpen(false);
+    setAgentsModalError(null);
+  }
+
+  async function saveAgentsModal() {
+    if (!authKey || agentsModalLoading || agentsModalSaving) return;
+    setAgentsModalSaving(true);
+    setAgentsModalError(null);
+    try {
+      const response = await saveVmAgentAgentsMd(agentsModalDraft);
+      setAgentsModalDraft(response.content || "");
+      setAgentsModalSavedValue(response.content || "");
+      setPanelNotice({ kind: "success", text: "VM AGENTS.md saved." });
+    } catch (err) {
+      setAgentsModalError(errorMessage(err));
+    } finally {
+      setAgentsModalSaving(false);
     }
   }
 
@@ -1081,14 +1479,33 @@ export default function App() {
         ? `\n\nAttachments available to the VM agent: ${allAttachmentNames.join(", ")}.`
         : "";
       const visibleText = text || `Attached ${allAttachmentNames.length} file${allAttachmentNames.length === 1 ? "" : "s"}.`;
+      const optimisticTurnId = `ui_turn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const optimisticUserMessage: VmAgentMessage = {
+        id: `ui_user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        role: "user",
+        content: visibleText,
+        createdAt: new Date().toISOString(),
+        meta: { sessionId: selectedRunId, turnId: optimisticTurnId, pending: true }
+      };
+      mergeVmAgentMessages([optimisticUserMessage]);
+      beginPendingAgentReply(selectedRunId);
       const response = await sendVmAgentMessage(`${visibleText}${attachmentLine}`, selectedRunId, attachmentRefs, displayAttachments);
       const messages = response.messages || [response.message];
       setVmAgent(response.status);
       setVmAgentCursorValue(response.cursor);
-      beginPendingAgentReply(selectedRunId);
       const userMessage = [...messages]
         .reverse()
         .find((message) => message.role === "user" && messageBelongsToSession(message, selectedRunId));
+      const responseTurnId = messages.map(messageTurnId).find((turnId): turnId is string => !!turnId);
+      if (userMessage) {
+        setVmAgentMessages((prev) => prev.filter((message) => message.id !== optimisticUserMessage.id));
+      } else if (responseTurnId) {
+        setVmAgentMessages((prev) => prev.map((message) => (
+          message.id === optimisticUserMessage.id
+            ? { ...message, meta: { ...message.meta, turnId: responseTurnId } }
+            : message
+        )));
+      }
       if (userMessage && (uploadedAttachments.length > 0 || vmAttachments.length > 0)) {
         const vmDisplayAttachments: UploadedAttachment[] = vmAttachments.map((ref) => ({
           id: ref.id,
@@ -1106,6 +1523,7 @@ export default function App() {
     } catch (err) {
       recordError(err);
       clearPendingAgentReply(selectedRunId);
+      setVmAgentMessages((prev) => prev.filter((message) => message.meta?.pending !== true));
       if (!textOverride) setComposer(text);
       setPendingAttachments((prev) => [...attachments, ...prev]);
       setPendingVmAttachments((prev) => [...vmAttachments, ...prev]);
@@ -1115,13 +1533,21 @@ export default function App() {
     }
   }
 
-  async function refreshRuns(selectFirst = false) {
+  async function refreshRuns(selectFirst = false): Promise<string | null> {
     try {
       const result = await listRuns();
       setRuns(result.runs);
-      if (selectFirst && !selectedRunId && result.runs[0]) setSelectedRunId(result.runs[0].id);
+      const currentSelection = selectedRunIdRef.current;
+      const nextSelection = currentSelection && result.runs.some((run) => run.id === currentSelection)
+        ? currentSelection
+        : result.runs[0]?.id || null;
+      if (selectFirst && nextSelection !== currentSelection) setSelectedRunId(nextSelection);
+      setRunsHydrated(true);
+      return nextSelection;
     } catch (err) {
       recordError(err);
+      setRunsHydrated(true);
+      return null;
     }
   }
 
@@ -1138,13 +1564,36 @@ export default function App() {
 
   async function refreshVmSessionFiles(id = selectedRunId, showBusy = true) {
     if (!id || !authKey) return;
+    const activeRequest = vmSessionFilesRequestRef.current;
+    if (activeRequest && activeRequest.sessionId !== id) {
+      activeRequest.controller.abort();
+      vmSessionFilesRequestRef.current = null;
+    }
+    let request = vmSessionFilesRequestRef.current;
+    if (!request) {
+      const controller = new AbortController();
+      request = {
+        sessionId: id,
+        controller,
+        promise: getVmSessionFiles(id, controller.signal)
+      };
+      vmSessionFilesRequestRef.current = request;
+    }
     if (showBusy) setVmSessionFilesLoading(true);
     try {
-      setVmSessionFiles(await getVmSessionFiles(id));
+      const response = await request.promise;
+      if (vmSessionFilesRequestRef.current !== request || selectedRunIdRef.current !== id) return;
+      setVmSessionFiles(response);
     } catch (err) {
+      if (request.controller.signal.aborted) return;
       recordError(err);
     } finally {
-      if (showBusy) setVmSessionFilesLoading(false);
+      const { ownsActiveRequest, shouldClearLoading } = vmSessionFilesCompletionState(
+        vmSessionFilesRequestRef.current,
+        request
+      );
+      if (ownsActiveRequest) vmSessionFilesRequestRef.current = null;
+      if (showBusy && shouldClearLoading) setVmSessionFilesLoading(false);
     }
   }
 
@@ -1269,6 +1718,51 @@ export default function App() {
     });
     if (skippedImages > 0) notify("info", `Only ${MAX_PENDING_IMAGE_ATTACHMENTS} images can be attached to one message.`);
     if (accepted.length > 0) setPendingAttachments((prev) => [...prev, ...accepted]);
+  }
+
+  function dragEventHasFiles(event: DragEvent<HTMLElement>): boolean {
+    return Array.from(event.dataTransfer.types || []).includes("Files");
+  }
+
+  function resetComposerDragState() {
+    composerDragDepthRef.current = 0;
+    setComposerDragActive(false);
+  }
+
+  function handleComposerDragEnter(event: DragEvent<HTMLFormElement>) {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    composerDragDepthRef.current += 1;
+    if (composerDropEnabled) setComposerDragActive(true);
+  }
+
+  function handleComposerDragOver(event: DragEvent<HTMLFormElement>) {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = composerDropEnabled ? "copy" : "none";
+    if (composerDropEnabled) setComposerDragActive(true);
+  }
+
+  function handleComposerDragLeave(event: DragEvent<HTMLFormElement>) {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    composerDragDepthRef.current = Math.max(0, composerDragDepthRef.current - 1);
+    if (composerDragDepthRef.current === 0) setComposerDragActive(false);
+  }
+
+  function handleComposerDrop(event: DragEvent<HTMLFormElement>) {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    resetComposerDragState();
+    if (!composerDropEnabled) {
+      notify("error", selectedRunId ? "Cannot attach files while the current message is sending." : "Create or select a session before attaching files.");
+      return;
+    }
+    handleSelectAttachments(event.dataTransfer.files);
   }
 
   function removePendingAttachment(index: number) {
@@ -1415,6 +1909,220 @@ export default function App() {
     );
   }
 
+  function renderChatMessage(message: VmAgentMessage) {
+    const optimisticAttachments = (messageAttachments[message.id] || []).map((file) => displayAttachmentFromUploaded(file, selectedRunId));
+    const messageDisplayAttachments = (message.attachments || []).flatMap((attachment) => {
+      const displayAttachment = displayAttachmentFromMessage(attachment, message);
+      return displayAttachment ? [displayAttachment] : [];
+    });
+    const allDisplayAttachments = messageDisplayAttachments.length ? messageDisplayAttachments : optimisticAttachments;
+    let visibleImageAttachments = 0;
+    const displayAttachments = allDisplayAttachments.filter((attachment) => {
+      if (attachment.kind !== "image") return true;
+      visibleImageAttachments += 1;
+      return visibleImageAttachments <= MAX_PENDING_IMAGE_ATTACHMENTS;
+    });
+    const hiddenDisplayAttachmentCount = Math.max(0, allDisplayAttachments.length - displayAttachments.length);
+    const displayAttachmentKeys = new Set(displayAttachments.map(displayAttachmentKey));
+    const messageVmArtifacts = vmArtifactsForMessage(message).filter((file) => !displayAttachmentKeys.has(vmArtifactDisplayKey(file)));
+    const messageVmSessionFiles = vmSessionFilesForMessage(message).filter((file) => !displayAttachmentKeys.has(vmSessionFileDisplayKey(file)));
+    const visibleVmArtifacts = messageVmArtifacts.slice(0, 16);
+    const visibleVmSessionFiles = messageVmSessionFiles.slice(0, 16);
+    const hiddenVmArtifactCount = Math.max(0, messageVmArtifacts.length - visibleVmArtifacts.length);
+    const hiddenVmSessionFileCount = Math.max(0, messageVmSessionFiles.length - visibleVmSessionFiles.length);
+    const content = messageDisplayOverrides[message.id] ?? message.content;
+    const hasMessageAttachments = displayAttachments.length > 0 || messageVmArtifacts.length > 0 || messageVmSessionFiles.length > 0;
+    const kind = messageKind(message);
+    return (
+      <article className={`message-row ${message.role} ${kind ? `kind-${kind.replace(/[^A-Za-z0-9_-]/g, "-")}` : ""}`} key={message.id}>
+        <div className="avatar">{message.role === "agent" ? "VM" : message.role === "user" ? "You" : "Sys"}</div>
+        <div className={`message-bubble ${hasMessageAttachments ? "has-attachments" : ""}`}>
+          {content && <div className="message-content">{renderMessageText(content)}</div>}
+          {hasMessageAttachments && (
+            <div className="message-attachments">
+              {displayAttachments.map((attachment) => {
+                const href = imageAttachmentUrl(attachment);
+                const ref = attachmentRefFromDisplayAttachment(attachment);
+                if (attachment.kind === "image" && href) {
+                  return (
+                    <span className="chat-image-with-link" key={`${displayAttachmentKey(attachment)}:${attachment.id}`}>
+                      {renderImagePreview(href, attachment.name || attachment.path, href)}
+                      {ref && <button className="link-button image-context-action" onClick={() => addPendingVmAttachment(ref)} type="button">Add to context</button>}
+                    </span>
+                  );
+                }
+                return (
+                  <span className="attachment-chip" key={`${displayAttachmentKey(attachment)}:${attachment.id}`}>
+                    {href ? (
+                      <a href={href} rel="noreferrer" target="_blank">
+                        <span>{attachment.name || attachment.path}</span>
+                        <small>{attachmentStateLabel(ref || undefined)} / {formatBytes(attachment.size)}</small>
+                      </a>
+                    ) : (
+                      <>
+                        <span>{attachment.name || attachment.path}</span>
+                        <small>{attachmentStateLabel(ref || undefined)} / {formatBytes(attachment.size)}</small>
+                      </>
+                    )}
+                    {ref && <button type="button" onClick={() => addPendingVmAttachment(ref)}>Add</button>}
+                  </span>
+                );
+              })}
+              {visibleVmArtifacts.map((file) => (
+                isImagePath(file.path) ? (
+                  <span className="chat-image-with-link" key={`${file.runId}:${file.path}`}>
+                    {renderImagePreview(vmRunArtifactDownloadUrl(file.runId, file.path), file.path, vmRunArtifactDownloadUrl(file.runId, file.path))}
+                    <button className="link-button image-context-action" onClick={() => addPendingVmAttachment(vmArtifactAttachmentRef(file))} type="button">Add to context</button>
+                  </span>
+                ) : (
+                  <span className="attachment-chip artifact-chip" key={`${file.runId}:${file.path}`} title={`${file.runId}/${file.path}`}>
+                    <a href={vmRunArtifactDownloadUrl(file.runId, file.path)} rel="noreferrer" target="_blank">
+                      <span>{file.path}</span>
+                      <small>{file.attempt ? `try ${file.attempt} / ${formatBytes(file.size)}` : formatBytes(file.size)}</small>
+                    </a>
+                    <button type="button" onClick={() => addPendingVmAttachment(vmArtifactAttachmentRef(file))}>Add to context</button>
+                  </span>
+                )
+              ))}
+              {visibleVmSessionFiles.map((file) => {
+                const href = vmSessionFileDownloadUrl(file.runId, file.category, file.path);
+                return file.isImage ? (
+                  <span className="chat-image-with-link" key={`${file.runId}:${file.category}:${file.path}`}>
+                    {renderImagePreview(href, file.name || file.path, href)}
+                    <button className="link-button image-context-action" onClick={() => addPendingVmAttachment(vmSessionFileAttachmentRef(file))} type="button">Add to context</button>
+                  </span>
+                ) : (
+                  <span className="attachment-chip artifact-chip" key={`${file.runId}:${file.category}:${file.path}`} title={`${file.category}/${file.path}`}>
+                    <a href={href} rel="noreferrer" target="_blank">
+                      <span>{file.path}</span>
+                      <small>{file.category} / {formatBytes(file.size)}</small>
+                    </a>
+                    <button type="button" onClick={() => addPendingVmAttachment(vmSessionFileAttachmentRef(file))}>Add to context</button>
+                  </span>
+                );
+              })}
+              {(hiddenDisplayAttachmentCount > 0 || hiddenVmArtifactCount > 0 || hiddenVmSessionFileCount > 0) && (
+                <span className="attachment-chip muted-chip">
+                  <span>+{hiddenDisplayAttachmentCount + hiddenVmArtifactCount + hiddenVmSessionFileCount} more</span>
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      </article>
+    );
+  }
+
+  function worklogDurationLabel(
+    messages: VmAgentMessage[],
+    finalMessages: VmAgentMessage[],
+    active: boolean,
+    startMessages: VmAgentMessage[] = [],
+  ): string {
+    const explicit = finalMessages.flatMap((message) => typeof message.meta?.worklogDurationMs === "number" ? [message.meta.worklogDurationMs] : []);
+    if (explicit.length > 0) return formatDuration(explicit.at(-1) || 0);
+    const firstMessage = startMessages[0] || messages[0] || finalMessages[0];
+    const first = firstMessage ? Date.parse(firstMessage.createdAt) : NaN;
+    const last = active
+      ? worklogClock
+      : finalMessages.at(-1)
+        ? Date.parse(finalMessages.at(-1)?.createdAt || "")
+        : messages.at(-1)
+          ? Date.parse(messages.at(-1)?.createdAt || "")
+          : NaN;
+    if (Number.isFinite(first) && Number.isFinite(last) && last >= first) return formatDuration(last - first);
+    return "a moment";
+  }
+
+  function formatWorklogEvent(message: VmAgentMessage): ReactNode {
+    const kind = messageKind(message);
+    if (kind === "progress") {
+      const stage = metaString(message, "progressStage") || "progress";
+      const status = metaString(message, "progressStatus") || "running";
+      const detail = metaString(message, "progressDetail") || message.content;
+      const progress = typeof message.meta?.progress === "number" ? ` · ${message.meta.progress}%` : "";
+      return <span>{progressLabel(stage)} · {status}{progress}<br />{renderInlineCode(detail)}</span>;
+    }
+    if (kind === "file_operation") {
+      return <span>{message.content || `${metaString(message, "operation") || "Touched"} ${metaString(message, "path") || "file"}`}</span>;
+    }
+    if (kind === "tool_run") {
+      const status = metaString(message, "status") || "running";
+      const command = metaString(message, "commandLabel") || message.content;
+      return <span>{status} <code>{command}</code></span>;
+    }
+    return renderInlineCode(message.content);
+  }
+
+  function renderWorklogFold(
+    messages: VmAgentMessage[],
+    finalMessages: VmAgentMessage[],
+    active: boolean,
+    startMessages: VmAgentMessage[] = [],
+  ) {
+    if (messages.length === 0 && !active) return null;
+    const fileOperations = messages.filter((message) => messageKind(message) === "file_operation");
+    return (
+      <article className="message-row agent worklog-row">
+        <div className="avatar">VM</div>
+        <details className={`worklog-fold ${active ? "active" : ""}`}>
+          <summary>
+            <span>{active ? "Working for" : "Worked for"} {worklogDurationLabel(messages, finalMessages, active, startMessages)}</span>
+            <small>{messages.length > 0 ? `${messages.length} event${messages.length === 1 ? "" : "s"}` : "starting"}</small>
+          </summary>
+          <div className="worklog-body">
+            <div className="worklog-body-inner">
+              {messages.length === 0 && (
+                <p className="worklog-empty">Waiting for VM worker activity...</p>
+              )}
+              {fileOperations.length > 0 && (
+                <section className="worklog-files">
+                  <h3>Files</h3>
+                  <ul>
+                    {fileOperations.slice(-12).map((message) => (
+                      <li key={message.id}>
+                        <span>{renderInlineCode(message.content)}</span>
+                        {typeof message.meta?.size === "number" && <small>{formatBytes(message.meta.size)}</small>}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+              <div className="worklog-events">
+                {messages.map((message) => {
+                  const kind = messageKind(message);
+                  const status = metaString(message, "status") || metaString(message, "progressStatus");
+                  return (
+                    <div className={`worklog-event kind-${kind || "event"} ${status || ""}`} key={message.id}>
+                      <span>{kind ? kind.replace(/_/g, " ") : "event"}</span>
+                      <p>{formatWorklogEvent(message)}</p>
+                      <small>{formatDate(message.createdAt)}</small>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </details>
+      </article>
+    );
+  }
+
+  function renderTurnGroup(group: ChatTurnGroup) {
+    const userMessages = group.messages.filter((message) => message.role === "user");
+    const foldable = group.messages.filter(isFoldableWorklogMessage);
+    const visible = group.messages.filter((message) => message.role !== "user" && !isFoldableWorklogMessage(message));
+    const finalMessages = visible.filter((message) => messageKind(message) === "run_final" || message.meta?.summaryOfGroup === true);
+    const active = userMessages.length > 0 && !turnHasFinalResult(group);
+    return (
+      <div className="chat-turn-group" key={group.id}>
+        {userMessages.map((message) => renderChatMessage(message))}
+        {renderWorklogFold(foldable, finalMessages.length ? finalMessages : visible, active, userMessages)}
+        {visible.map((message) => renderChatMessage(message))}
+      </div>
+    );
+  }
+
   function outputCategoryCollapsed(category: VmSessionOutputCategory): boolean {
     return collapsedOutputCategories[category] ?? true;
   }
@@ -1517,12 +2225,20 @@ export default function App() {
   useEffect(() => {
     if (!authKey) {
       setVmAgentStreamState("auth required");
+      setRunsHydrated(false);
+      setHistoryAttemptedSessionId(null);
       return;
     }
+    setRunsHydrated(false);
     void refreshRuns(true);
     void refreshVm();
-    void handleRefreshVmAgentMessages(false);
+  }, [authKey]);
 
+  useEffect(() => {
+    if (!authKey || !historyBootstrapSettled) {
+      if (authKey) setVmAgentStreamState(selectedRunId ? "loading history" : "loading sessions");
+      return;
+    }
     let closed = false;
     let reconnectTimer: number | null = null;
     let events: EventSource | null = null;
@@ -1550,18 +2266,25 @@ export default function App() {
         reconnecting = false;
         setVmAgentStreamState("live");
       });
-      source.addEventListener("messages", (event) => {
+      const handleStreamMessages = (event: Event) => {
         if (closed || events !== source) return;
-        const data = JSON.parse((event as MessageEvent).data) as VmAgentHistoryResponse;
-        setVmAgent(data.status);
-        setVmAgentCursorValue(data.cursor);
-        mergeVmAgentMessages(data.messages);
-        handleVmAgentMessageBatch(data.messages);
+        const data = JSON.parse((event as MessageEvent).data) as VmAgentHistoryResponse & { message?: VmAgentMessage };
+        if (data.ok === false || data.status?.ok === false) return;
+        if (data.status) setVmAgent(data.status);
+        if (typeof data.cursor === "number") setVmAgentCursorValue(data.cursor);
+        const messages = Array.isArray(data.messages) ? data.messages : data.message ? [data.message] : [];
+        if (messages.length === 0) return;
+        mergeVmAgentMessages(messages);
+        handleVmAgentMessageBatch(messages);
         const pendingSessionId = pendingReplySessionRef.current;
-        if (pendingSessionId && hasAgentReplyForSession(data.messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
+        if (pendingSessionId && hasAgentReplyForSession(messages, pendingSessionId)) clearPendingAgentReply(pendingSessionId);
         reconnecting = false;
         setVmAgentStreamState("live");
-      });
+      };
+      source.addEventListener("messages", handleStreamMessages);
+      source.addEventListener("message", handleStreamMessages);
+      source.addEventListener("message_delta", handleStreamMessages);
+      source.addEventListener("message_done", handleStreamMessages);
       source.addEventListener("ping", () => {
         if (closed || events !== source) return;
         reconnecting = false;
@@ -1582,18 +2305,19 @@ export default function App() {
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       events?.close();
     };
-  }, [authKey]);
+  }, [authKey, historyBootstrapSettled, selectedRunId]);
 
   useEffect(() => {
-    if (!authKey || vmAgentStreamState === "live") return;
+    if (!authKey || !historyBootstrapSettled || vmAgentStreamState === "live") return;
     let closed = false;
     let inFlight = false;
     const interval = window.setInterval(() => {
       if (closed || inFlight) return;
       inFlight = true;
-      void getVmAgentMessages(vmAgentCursorRef.current, { limit: 100 })
+      void getVmAgentMessages(vmAgentCursorRef.current, { limit: STREAM_BATCH_LIMIT })
         .then((response) => {
           if (closed) return;
+          assertHistoryResponse(response);
           setVmAgent(response.status);
           setVmAgentCursorValue(response.cursor);
           mergeVmAgentMessages(response.messages);
@@ -1612,77 +2336,39 @@ export default function App() {
       closed = true;
       window.clearInterval(interval);
     };
-  }, [authKey, vmAgentStreamState]);
+  }, [authKey, historyBootstrapSettled, vmAgentStreamState]);
 
   useEffect(() => {
     if (!pendingReplySessionId || !authKey) return;
-    let closed = false;
-    let inFlight = false;
     const interval = window.setInterval(() => {
-      if (closed || inFlight || !pendingReplySessionRef.current) return;
-      const requestedSessionId = pendingReplySessionRef.current;
-      inFlight = true;
-      void getVmAgentMessages(0, { limit: 500, sessionId: requestedSessionId })
-        .then((response) => {
-          if (closed) return;
-          setVmAgent(response.status);
-          setVmAgentCursorValue(response.cursor);
-          mergeVmAgentMessages(response.messages);
-          handleVmAgentMessageBatch(response.messages);
-          const waitingSessionId = pendingReplySessionRef.current;
-          if (waitingSessionId && hasAgentReplyForSession(response.messages, waitingSessionId)) {
-            clearPendingAgentReply(waitingSessionId);
-            return;
-          }
-          const nextRetry = pendingReplyRetryRef.current + 1;
-          pendingReplyRetryRef.current = nextRetry;
-          setPendingReplyRetryCount(nextRetry);
-          if (nextRetry >= MAX_REPLY_RETRIES) {
-            clearPendingAgentReply(waitingSessionId || undefined);
-            recordSystemNotice("No agent reply after 30 minutes of fallback polling. Stopped waiting so the agent can be restarted manually.", "error");
-          }
-        })
-        .catch((err) => {
-          if (closed) return;
-          const nextRetry = pendingReplyRetryRef.current + 1;
-          pendingReplyRetryRef.current = nextRetry;
-          setPendingReplyRetryCount(nextRetry);
-          if (nextRetry >= MAX_REPLY_RETRIES) {
-            clearPendingAgentReply();
-            recordError(err);
-          }
-        })
-        .finally(() => {
-          inFlight = false;
-        });
+      const waitingSessionId = pendingReplySessionRef.current;
+      if (!waitingSessionId) return;
+      const nextRetry = pendingReplyRetryRef.current + 1;
+      pendingReplyRetryRef.current = nextRetry;
+      setPendingReplyRetryCount(nextRetry);
+      if (nextRetry >= MAX_REPLY_RETRIES) {
+        clearPendingAgentReply(waitingSessionId);
+        recordSystemNotice("No agent reply after 30 minutes. Stopped waiting so the agent can be restarted manually.", "error");
+      }
     }, REPLY_RETRY_INTERVAL_MS);
-    return () => {
-      closed = true;
-      window.clearInterval(interval);
-    };
+    return () => window.clearInterval(interval);
   }, [pendingReplySessionId, authKey]);
 
   useEffect(() => {
     if (!selectedRunId || !authKey) return;
-    let closed = false;
-    void getVmAgentMessages(0, { limit: 500, sessionId: selectedRunId })
-      .then((response) => {
-        if (closed) return;
-        setVmAgent(response.status);
-        setVmAgentCursorValue(response.cursor);
-        mergeVmAgentMessages(response.messages);
-        handleVmAgentMessageBatch(response.messages);
-      })
-      .catch((err) => {
-        if (!closed) recordError(err);
-      });
-    return () => {
-      closed = true;
-    };
+    if (!shouldLoadSelectedSessionHistory(sessionHistoryById[selectedRunId])) {
+      setHistoryAttemptedSessionId(selectedRunId);
+      return;
+    }
+    void loadSelectedSessionHistory(selectedRunId);
   }, [selectedRunId, authKey]);
 
   useEffect(() => {
     if (!selectedRunId || !authKey) {
+      historyAbortControllerRef.current?.abort();
+      historyAbortControllerRef.current = null;
+      vmSessionFilesRequestRef.current?.controller.abort();
+      vmSessionFilesRequestRef.current = null;
       setRunDetail(null);
       setVmSessionFiles({ categories: OUTPUT_CATEGORIES, files: [] });
       return;
@@ -1699,6 +2385,11 @@ export default function App() {
       closed = true;
     };
   }, [selectedRunId, authKey]);
+
+  useEffect(() => () => {
+    historyAbortControllerRef.current?.abort();
+    vmSessionFilesRequestRef.current?.controller.abort();
+  }, []);
 
   useEffect(() => {
     if (!selectedRunId || !authKey) return;
@@ -1761,7 +2452,8 @@ export default function App() {
   const chatComposerClassName = [
     "chat-composer",
     composer.trim() || pendingAttachmentCount ? "has-draft" : "",
-    mobileComposerToolsOpen ? "tools-open" : ""
+    mobileComposerToolsOpen ? "tools-open" : "",
+    composerDragActive ? "drag-active" : ""
   ].filter(Boolean).join(" ");
 
   return (
@@ -1895,6 +2587,7 @@ export default function App() {
             <div className="meta-row">
               <span>{selectedRunId ? shortId(selectedRunId) : "select or create a session"}</span>
               <span>stream: {vmAgentStreamState}</span>
+              {selectedRunId && <span>history: {selectedHistoryPhase}</span>}
               {selectedRun && <span>{selectedRun.status}</span>}
               {latestProgress && <span>{progressLabel(latestProgress.stage)}: {latestProgress.status}</span>}
               {clockSkewWarning && <span>VM clock skew: {clockSkewLabel}</span>}
@@ -1914,7 +2607,17 @@ export default function App() {
                 Force stop
               </button>
             )}
-            <button className="secondary" onClick={() => void handleRefreshVmAgentMessages()} disabled={!authKey || vmAgentHistoryLoading}>{vmAgentHistoryLoading ? "Loading" : "History"}</button>
+            <button
+              className="secondary"
+              onClick={() => void handleRefreshVmAgentMessages()}
+              disabled={!authKey || vmAgentHistoryLoading || selectedHistoryPhase === "loading"}
+            >
+              {selectedHistoryPhase === "loading" && selectedHistoryState.retrying
+                ? "Retrying"
+                : vmAgentHistoryLoading || selectedHistoryPhase === "loading"
+                  ? "Loading"
+                  : "History"}
+            </button>
           </div>
         </header>
 
@@ -1974,119 +2677,79 @@ export default function App() {
         </section>
 
         <div className="message-list">
+          {selectedRunId && selectedHistoryPhase === "loading" && (
+            <div className="history-load-banner loading" role="status">
+              <div>
+                <strong>{selectedHistoryState.retrying ? "Retrying session history..." : "Loading full session history..."}</strong>
+                <span>Existing messages and the live cursor remain available while this request runs.</span>
+              </div>
+            </div>
+          )}
+          {selectedRunId && selectedHistoryPhase === "failed" && (
+            <div className="history-load-banner failed" role="alert">
+              <div>
+                <strong>History failed to load.</strong>
+                <span>{selectedHistoryState.error || "The VM history bridge is unavailable."} Existing messages were preserved.</span>
+              </div>
+              {selectedHistoryState.retryable !== false && (
+                <button
+                  className="secondary"
+                  onClick={() => void loadSelectedSessionHistory(selectedRunId, { retrying: true, showBusy: true })}
+                  type="button"
+                >
+                  Retry
+                </button>
+              )}
+            </div>
+          )}
+          {selectedRunId && selectedHistoryPhase === "truncated" && (
+            <div className="history-load-banner truncated" role="status">
+              <div>
+                <strong>History loaded with an older-page boundary.</strong>
+                <span>The latest visible turns are available; increase the server history budget if older turns are required.</span>
+              </div>
+            </div>
+          )}
           {renderThinkingPanel()}
           {visibleMessages.length === 0 && (
             <div className="empty-chat">
-              <strong>{selectedRun ? "No messages in this session." : "No session selected."}</strong>
-              <span>{selectedRun ? "Send a prompt or use a quick action to talk with the VM agent." : "Create or select a session from the left panel."}</span>
+              <strong>
+                {!selectedRun
+                  ? "No session selected."
+                  : selectedHistoryPhase === "empty"
+                    ? "No messages in this session."
+                    : selectedHistoryPhase === "failed"
+                      ? "Session history is temporarily unavailable."
+                      : "Loading session history..."}
+              </strong>
+              <span>
+                {!selectedRun
+                  ? "Create or select a session from the left panel."
+                  : selectedHistoryPhase === "empty"
+                    ? "Send a prompt or use a quick action to talk with the VM agent."
+                    : selectedHistoryPhase === "failed"
+                      ? "Use Retry above; a failed load never clears existing messages."
+                      : "The selected session is being hydrated before live updates begin."}
+              </span>
             </div>
           )}
-          {visibleMessages.map((message) => {
-            const optimisticAttachments = (messageAttachments[message.id] || []).map((file) => displayAttachmentFromUploaded(file, selectedRunId));
-            const messageDisplayAttachments = (message.attachments || []).flatMap((attachment) => {
-              const displayAttachment = displayAttachmentFromMessage(attachment, message);
-              return displayAttachment ? [displayAttachment] : [];
-            });
-            const allDisplayAttachments = messageDisplayAttachments.length ? messageDisplayAttachments : optimisticAttachments;
-            let visibleImageAttachments = 0;
-            const displayAttachments = allDisplayAttachments.filter((attachment) => {
-              if (attachment.kind !== "image") return true;
-              visibleImageAttachments += 1;
-              return visibleImageAttachments <= MAX_PENDING_IMAGE_ATTACHMENTS;
-            });
-            const hiddenDisplayAttachmentCount = Math.max(0, allDisplayAttachments.length - displayAttachments.length);
-            const displayAttachmentKeys = new Set(displayAttachments.map(displayAttachmentKey));
-            const messageVmArtifacts = vmArtifactsForMessage(message).filter((file) => !displayAttachmentKeys.has(vmArtifactDisplayKey(file)));
-            const messageVmSessionFiles = vmSessionFilesForMessage(message).filter((file) => !displayAttachmentKeys.has(vmSessionFileDisplayKey(file)));
-            const visibleVmArtifacts = messageVmArtifacts.slice(0, 16);
-            const visibleVmSessionFiles = messageVmSessionFiles.slice(0, 16);
-            const hiddenVmArtifactCount = Math.max(0, messageVmArtifacts.length - visibleVmArtifacts.length);
-            const hiddenVmSessionFileCount = Math.max(0, messageVmSessionFiles.length - visibleVmSessionFiles.length);
-            const content = messageDisplayOverrides[message.id] ?? message.content;
-            const hasMessageAttachments = displayAttachments.length > 0 || messageVmArtifacts.length > 0 || messageVmSessionFiles.length > 0;
-            return (
-              <article className={`message-row ${message.role}`} key={message.id}>
-                <div className="avatar">{message.role === "agent" ? "VM" : message.role === "user" ? "You" : "Sys"}</div>
-                <div className={`message-bubble ${hasMessageAttachments ? "has-attachments" : ""}`}>
-                  {content && <div className="message-content">{content}</div>}
-                  {hasMessageAttachments && (
-                    <div className="message-attachments">
-                      {displayAttachments.map((attachment) => {
-                        const href = imageAttachmentUrl(attachment);
-                        const ref = attachmentRefFromDisplayAttachment(attachment);
-                        if (attachment.kind === "image" && href) {
-                          return (
-                            <span className="chat-image-with-link" key={`${displayAttachmentKey(attachment)}:${attachment.id}`}>
-                              {renderImagePreview(href, attachment.name || attachment.path, href)}
-                              {ref && <button className="link-button image-context-action" onClick={() => addPendingVmAttachment(ref)} type="button">Add to context</button>}
-                            </span>
-                          );
-                        }
-                        return (
-                          <span className="attachment-chip" key={`${displayAttachmentKey(attachment)}:${attachment.id}`}>
-                            {href ? (
-                              <a href={href} rel="noreferrer" target="_blank">
-                                <span>{attachment.name || attachment.path}</span>
-                                <small>{attachmentStateLabel(ref || undefined)} / {formatBytes(attachment.size)}</small>
-                              </a>
-                            ) : (
-                              <>
-                                <span>{attachment.name || attachment.path}</span>
-                                <small>{attachmentStateLabel(ref || undefined)} / {formatBytes(attachment.size)}</small>
-                              </>
-                            )}
-                            {ref && <button type="button" onClick={() => addPendingVmAttachment(ref)}>Add</button>}
-                          </span>
-                        );
-                      })}
-                      {visibleVmArtifacts.map((file) => (
-                        isImagePath(file.path) ? (
-                          <span className="chat-image-with-link" key={`${file.runId}:${file.path}`}>
-                            {renderImagePreview(vmRunArtifactDownloadUrl(file.runId, file.path), file.path, vmRunArtifactDownloadUrl(file.runId, file.path))}
-                            <button className="link-button image-context-action" onClick={() => addPendingVmAttachment(vmArtifactAttachmentRef(file))} type="button">Add to context</button>
-                          </span>
-                        ) : (
-                          <span className="attachment-chip artifact-chip" key={`${file.runId}:${file.path}`} title={`${file.runId}/${file.path}`}>
-                            <a href={vmRunArtifactDownloadUrl(file.runId, file.path)} rel="noreferrer" target="_blank">
-                              <span>{file.path}</span>
-                              <small>{file.attempt ? `try ${file.attempt} / ${formatBytes(file.size)}` : formatBytes(file.size)}</small>
-                            </a>
-                            <button type="button" onClick={() => addPendingVmAttachment(vmArtifactAttachmentRef(file))}>Add to context</button>
-                          </span>
-                        )
-                      ))}
-                      {visibleVmSessionFiles.map((file) => {
-                        const href = vmSessionFileDownloadUrl(file.runId, file.category, file.path);
-                        return file.isImage ? (
-                          <span className="chat-image-with-link" key={`${file.runId}:${file.category}:${file.path}`}>
-                            {renderImagePreview(href, file.name || file.path, href)}
-                            <button className="link-button image-context-action" onClick={() => addPendingVmAttachment(vmSessionFileAttachmentRef(file))} type="button">Add to context</button>
-                          </span>
-                        ) : (
-                          <span className="attachment-chip artifact-chip" key={`${file.runId}:${file.category}:${file.path}`} title={`${file.category}/${file.path}`}>
-                            <a href={href} rel="noreferrer" target="_blank">
-                              <span>{file.path}</span>
-                              <small>{file.category} / {formatBytes(file.size)}</small>
-                            </a>
-                            <button type="button" onClick={() => addPendingVmAttachment(vmSessionFileAttachmentRef(file))}>Add to context</button>
-                          </span>
-                        );
-                      })}
-                      {(hiddenDisplayAttachmentCount > 0 || hiddenVmArtifactCount > 0 || hiddenVmSessionFileCount > 0) && (
-                        <span className="attachment-chip muted-chip">
-                          <span>+{hiddenDisplayAttachmentCount + hiddenVmArtifactCount + hiddenVmSessionFileCount} more</span>
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </article>
-            );
-          })}
+          {chatItems.map((item) => item.type === "turn" ? renderTurnGroup(item.group) : renderChatMessage(item.message))}
           <div ref={messageEndRef} />
         </div>
 
-        <form className={chatComposerClassName} onSubmit={(event) => { event.preventDefault(); void handleVmAgentMessage(); }}>
+        <form
+          className={chatComposerClassName}
+          onDragEnter={handleComposerDragEnter}
+          onDragLeave={handleComposerDragLeave}
+          onDragOver={handleComposerDragOver}
+          onDrop={handleComposerDrop}
+          onSubmit={(event) => { event.preventDefault(); void handleVmAgentMessage(); }}
+        >
+          {composerDragActive && (
+            <div className="composer-drop-overlay" aria-hidden="true">
+              <span>Drop files to attach</span>
+            </div>
+          )}
           <div className="mobile-composer-toolbar">
             <button
               aria-controls="mobile-composer-tools"
@@ -2101,7 +2764,23 @@ export default function App() {
           </div>
           <div className="composer-tools" id="mobile-composer-tools">
           <div className="quick-prompts">
-            {QUICK_PROMPTS.map((prompt) => (
+            <button
+              className="quick-chip"
+              disabled={!canSendMessage}
+              onClick={() => setComposer(QUICK_PROMPTS[0]!.prompt)}
+              type="button"
+            >
+              {QUICK_PROMPTS[0]!.label}
+            </button>
+            <button
+              className="quick-chip quick-chip-secondary"
+              disabled={!authKey || agentsModalLoading || agentsModalSaving}
+              onClick={() => void openAgentsModal()}
+              type="button"
+            >
+              AGENTS.md
+            </button>
+            {QUICK_PROMPTS.slice(1).map((prompt) => (
               <button
                 className="quick-chip"
                 disabled={!canSendMessage}
@@ -2166,18 +2845,68 @@ export default function App() {
           )}
           </div>
           <div className="composer-box">
-            <textarea
-              value={composer}
-              onChange={(event) => setComposer(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  void handleVmAgentMessage();
-                }
-              }}
-              placeholder="Message the VM agent..."
-              rows={3}
-            />
+            <div className="composer-input-stack">
+              {visibleSlashSuggestions.length > 0 && (
+                <div className="composer-slash-palette" role="listbox" aria-label="Slash commands">
+                  {visibleSlashSuggestions.map((suggestion, index) => {
+                    const selected = index === Math.max(0, Math.min(slashSuggestionIndex, visibleSlashSuggestions.length - 1));
+                    return (
+                      <button
+                        aria-selected={selected}
+                        className={`composer-slash-option ${selected ? "selected" : ""}`}
+                        key={suggestion.command}
+                        onClick={() => applySlashSuggestion(suggestion)}
+                        onMouseEnter={() => setSlashSuggestionIndex(index)}
+                        type="button"
+                      >
+                        <strong>{suggestion.label}</strong>
+                        <span>{suggestion.description}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              <textarea
+                ref={composerInputRef}
+                value={composer}
+                onChange={(event) => setComposer(event.target.value)}
+                onKeyDown={(event) => {
+                  if (visibleSlashSuggestions.length > 0) {
+                    if (event.key === "ArrowDown") {
+                      event.preventDefault();
+                      setSlashSuggestionIndex((current) => nextSlashSuggestionIndex(current, 1, visibleSlashSuggestions.length));
+                      return;
+                    }
+                    if (event.key === "ArrowUp") {
+                      event.preventDefault();
+                      setSlashSuggestionIndex((current) => nextSlashSuggestionIndex(current, -1, visibleSlashSuggestions.length));
+                      return;
+                    }
+                    if (event.key === "Tab" && activeSlashSuggestion) {
+                      event.preventDefault();
+                      applySlashSuggestion(activeSlashSuggestion);
+                      return;
+                    }
+                    if (event.key === "Enter" && activeSlashSuggestion) {
+                      event.preventDefault();
+                      applySlashSuggestion(activeSlashSuggestion);
+                      return;
+                    }
+                    if (event.key === "Escape" && activeSlashQuery) {
+                      event.preventDefault();
+                      setDismissedSlashQuery(activeSlashQuery);
+                      return;
+                    }
+                  }
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void handleVmAgentMessage();
+                  }
+                }}
+                placeholder="Message the VM agent..."
+                rows={3}
+              />
+            </div>
             <div className="composer-actions">
               <label className="attach-button">
                 Attach
@@ -2209,7 +2938,7 @@ export default function App() {
           </div>
           <div className="metric-grid">
             <div><strong>{formatCompactNumber(contextStats.estimatedTokens)}</strong><span>est. tokens</span></div>
-            <div><strong>{contextStats.percent}%</strong><span>of 272k</span></div>
+            <div><strong>{contextStats.percent}%</strong><span>of 1.0m</span></div>
             <div><strong>{contextStats.messageCount}</strong><span>messages</span></div>
             <div><strong>{formatCompactNumber(contextStats.characters)}</strong><span>characters</span></div>
           </div>
@@ -2275,6 +3004,48 @@ export default function App() {
           </section>
         )}
       </aside>
+
+      {agentsModalOpen && (
+        <div className="modal-backdrop" onClick={() => closeAgentsModal()}>
+          <div className="agents-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="section-head">
+              <h2>VM AGENTS.md</h2>
+              <div className="confirm-actions">
+                <button className="secondary" disabled={agentsModalSaving} onClick={() => closeAgentsModal()} type="button">Close</button>
+                <button disabled={agentsModalLoading || agentsModalSaving || !agentsModalDirty} onClick={() => void saveAgentsModal()} type="button">
+                  {agentsModalSaving ? "Saving" : "Save"}
+                </button>
+              </div>
+            </div>
+            <p className="modal-caption">Edits apply to `~/.sentaurus-web-agent/vm-agent/AGENTS.md` inside the VM worker root.</p>
+            {agentsModalError && <p className="panel-notice error">{agentsModalError}</p>}
+            <textarea
+              ref={agentsTextareaRef}
+              className="agents-modal-textarea"
+              disabled={agentsModalLoading || agentsModalSaving}
+              onChange={(event) => setAgentsModalDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+                  event.preventDefault();
+                  void saveAgentsModal();
+                  return;
+                }
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  closeAgentsModal();
+                }
+              }}
+              placeholder={agentsModalLoading ? "Loading AGENTS.md..." : "No VM AGENTS.md content loaded."}
+              rows={18}
+              value={agentsModalDraft}
+            />
+            <div className="agents-modal-footer">
+              <span>{agentsModalLoading ? "Loading" : agentsModalSaving ? "Saving" : agentsModalDirty ? "Unsaved changes" : "Saved"}</span>
+              <span>{agentsModalDraft.length} chars</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {imagePreview && (
         <div className="image-lightbox" onClick={() => setImagePreview(null)}>

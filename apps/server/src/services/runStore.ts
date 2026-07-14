@@ -49,6 +49,19 @@ function normalizeSimulationSetup(input: Partial<SimulationSetup> | undefined): 
     }).slice(0, 24)
     : undefined;
   const updatedBy = source.updatedBy === "user" || source.updatedBy === "system" ? source.updatedBy : "vm-agent";
+  const inputHashes = source.inputHashes && typeof source.inputHashes === "object"
+    ? Object.fromEntries(
+      Object.entries(source.inputHashes)
+        .filter(([key, value]) => Boolean(setupText(key, 120)) && typeof value === "string" && /^[a-f0-9]{64}$/i.test(value))
+        .map(([key, value]) => [key.slice(0, 120), value.toLowerCase()])
+    )
+    : undefined;
+  const actualBiases = source.actualBiases && typeof source.actualBiases === "object"
+    ? {
+      lowVd: typeof source.actualBiases.lowVd === "number" && Number.isFinite(source.actualBiases.lowVd) ? source.actualBiases.lowVd : undefined,
+      highVd: typeof source.actualBiases.highVd === "number" && Number.isFinite(source.actualBiases.highVd) ? source.actualBiases.highVd : undefined
+    }
+    : undefined;
   return {
     deviceType: setupText(source.deviceType),
     gateBias: setupText(source.gateBias),
@@ -62,6 +75,12 @@ function normalizeSimulationSetup(input: Partial<SimulationSetup> | undefined): 
     simulationGoals: setupText(source.simulationGoals, 800),
     expectedOutputs,
     notes: setupText(source.notes, 1000),
+    extractorVersion: setupText(source.extractorVersion, 120),
+    metricProfile: setupText(source.metricProfile, 120),
+    postprocessStatus: setupText(source.postprocessStatus, 80),
+    postprocessErrorCode: setupText(source.postprocessErrorCode, 120),
+    inputHashes: inputHashes && Object.keys(inputHashes).length > 0 ? inputHashes : undefined,
+    actualBiases: actualBiases && (actualBiases.lowVd !== undefined || actualBiases.highVd !== undefined) ? actualBiases : undefined,
     updatedAt: setupText(source.updatedAt, 80) || new Date().toISOString(),
     updatedBy
   };

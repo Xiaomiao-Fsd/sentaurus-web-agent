@@ -47,12 +47,39 @@ npm run dev
 
 Open:
 
-- Web UI: <http://10.6.22.1:5174>
+- Web UI (IPv6 loopback): <http://[::1]:5174>
+- Web UI bind address: `[::]:5174`
 - Backend health: <http://10.6.22.1:5175/api/health>
 
 The web UI asks for the `AUTH_TOKEN` from `.env` before calling protected APIs.
+Any non-loopback `HOST` requires a non-default `AUTH_TOKEN` with at least 24 characters; the server refuses to start otherwise.
+
+## Stable local run root and migration
+
+Relative `LOCAL_RUN_BASE` values are resolved from the repository root, not the process launch directory. The default canonical run root is:
+
+```text
+data/runs
+```
+
+Before switching an existing launcher, inventory both the canonical root and the legacy workspace root:
+
+```powershell
+npm run migrate:runs:dry-run
+```
+
+Apply the non-destructive merge after reviewing the JSON report:
+
+```powershell
+npm run migrate:runs
+```
+
+The migration validates each manifest ID, hashes every file, copies only unique run IDs through a staging directory, rewrites only the copied manifest's `localDir`, and never overwrites a conflicting duplicate. The legacy roots remain unchanged for rollback.
 
 ## Configure the VM-local LLM provider
+
+The independently deployable worker source and upgrade installer live in [`vm-worker/`](vm-worker/README.md).
+Release archives include both the Windows Web application and this CentOS worker component.
 
 The host `.env` does not need LLM credentials for the VM Agent panel. The backend only relays messages over SSH.
 

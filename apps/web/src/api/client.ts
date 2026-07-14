@@ -1,4 +1,4 @@
-export const API_BASE = import.meta.env.VITE_API_BASE || "http://10.6.22.1:5175";
+﻿export const API_BASE = import.meta.env.VITE_API_BASE || "";
 
 const AUTH_TOKEN_KEY = "sentaurus_auth_token";
 

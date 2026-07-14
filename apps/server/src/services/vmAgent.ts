@@ -1,26 +1,42 @@
-import fs from "node:fs/promises";
+﻿import fs from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import path from "node:path";
-import type { VmAgentAttachmentRef, VmAgentMessage, VmAgentMessageAttachment, VmAgentStatus } from "@sentaurus-agent/shared";
+import { inflateSync } from "node:zlib";
+import type {
+  VmAgentAgentsMdResponse,
+  VmAgentAttachmentRef,
+  VmAgentHistoryErrorCode,
+  VmAgentMessage,
+  VmAgentMessageAttachment,
+  VmAgentStatus
+} from "@sentaurus-agent/shared";
 import { config } from "../config.js";
 import { safeRelativePath, safeRunId } from "../security/pathSafe.js";
 import { resolveRunFile } from "./runStore.js";
-import { runSshCommandWithInput } from "./sshClient.js";
+import { runSshCommandWithInput, runSshCommandWithInputDownload, runSshCommandWithInputFast } from "./sshClient.js";
 import { downloadVmSessionFile } from "./vmSessionFiles.js";
 
 type VmAgentOperation = "status" | "start" | "send" | "history";
 
-type RemoteAgentRequest = {
+export type RemoteAgentRequest = {
   operation: VmAgentOperation;
   message?: string;
   sessionId?: string;
+  turnId?: string;
+  includeFolded?: boolean;
+  protocolVersion?: number;
   attachments?: VmAgentAttachmentRef[];
   displayAttachments?: VmAgentMessageAttachment[];
   after?: number;
   limit?: number;
+  historyBefore?: number;
+  responseByteBudget?: number;
 };
 
-type RemoteAgentPayload = {
+export type RemoteAgentPayload = {
   ok?: boolean;
+  protocolVersion?: number;
   error?: string;
   agent?: string;
   version?: string;
@@ -50,8 +66,47 @@ type RemoteAgentPayload = {
   clockSkewWarning?: boolean;
   messages?: unknown[];
   cursor?: number;
+  truncated?: boolean;
+  continuation?: string;
+  rawCount?: number;
+  compactedCount?: number;
+  payloadBytes?: number;
+  historyCompacted?: boolean;
+  transportCompressedBytes?: number;
+  transportUncompressedBytes?: number;
+  bridgeError?: "timeout" | "queue" | "ssh" | "invalid_response";
+  retryable?: boolean;
   raw?: string;
 };
+
+export class VmAgentHistoryError extends Error {
+  readonly code: VmAgentHistoryErrorCode;
+  readonly statusCode: 502 | 503 | 504;
+  readonly retryable: boolean;
+  readonly cursor: number;
+  readonly status: VmAgentStatus;
+
+  constructor(
+    code: VmAgentHistoryErrorCode,
+    message: string,
+    statusCode: 502 | 503 | 504,
+    cursor: number,
+    status: VmAgentStatus,
+    retryable = true
+  ) {
+    super(message);
+    this.name = "VmAgentHistoryError";
+    this.code = code;
+    this.statusCode = statusCode;
+    this.retryable = retryable;
+    this.cursor = cursor;
+    this.status = status;
+  }
+}
+
+export function isVmAgentHistoryError(value: unknown): value is VmAgentHistoryError {
+  return value instanceof VmAgentHistoryError;
+}
 
 type EnrichedVmAgentAttachmentRef = VmAgentAttachmentRef & {
   contextStatus?: "inline" | "vm_path" | "metadata_only" | "not_found" | "too_large" | "unsupported" | "error";
@@ -62,10 +117,14 @@ type EnrichedVmAgentAttachmentRef = VmAgentAttachmentRef & {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.5.0";
+const agentVersion = "0.6.0";
+const dfiseExtractorSource = readFileSync(new URL("../../remote/dfise_idvg_extract.py", import.meta.url), "utf8");
+const dfiseExtractorSha256 = createHash("sha256").update(dfiseExtractorSource, "utf8").digest("hex");
+const localWorkerSource = readFileSync(new URL("../../../../agent_worker.py", import.meta.url), "utf8");
 const maxVmArtifactBytes = 50 * 1024 * 1024;
 const maxInlineAttachmentBytes = 512 * 1024;
 const maxInlineAttachmentTotalChars = 300_000;
+const maxVmAgentsMdBytes = 256 * 1024;
 const readableAttachmentExtensions = new Set([
   ".txt",
   ".md",
@@ -99,6 +158,9 @@ const vmArtifactExtensions = new Set([
   ".png",
   ".jpg",
   ".jpeg",
+  ".webp",
+  ".gif",
+  ".svg",
   ".json",
   ".cmd",
   ".des",
@@ -109,6 +171,163 @@ const vmArtifactExtensions = new Set([
   ".sat"
 ]);
 
+const quickStatusScript = String.raw`# -*- coding: utf-8 -*-
+import getpass
+import glob
+import json
+import os
+import socket
+import time
+
+AGENT_NAME = "sentaurus-vm-agent"
+AGENT_VERSION = "0.6.0"
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
+QUEUE_DIR = os.path.join(ROOT, "queue")
+MESSAGES_PATH = os.path.join(ROOT, "messages.jsonl")
+PID_PATH = os.path.join(ROOT, "agent_worker.pid")
+CONFIG_PATH = os.path.join(ROOT, "config.json")
+ENV_PATH = os.path.join(ROOT, ".env")
+MANUALS_DIR = os.path.join(ROOT, "manuals")
+
+def read_env_file(path):
+    data = {}
+    if not os.path.exists(path):
+        return data
+    with open(path, "r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            data[key.strip()] = value.strip().strip('"').strip("'")
+    return data
+
+def config_list(value):
+    if value is None:
+        return []
+    raw_items = value if isinstance(value, list) else str(value).replace("\n", ",").split(",")
+    items = []
+    for item in raw_items:
+        text = str(item).strip()
+        if text and text not in items:
+            items.append(text[:160])
+    return items
+
+def model_candidates(primary_model, configured_models):
+    models = config_list(configured_models)
+    primary = str(primary_model or "").strip()
+    if primary and primary not in models:
+        models.insert(0, primary)
+    return models or ["gpt-5.5"]
+
+def config_int(env, file_config, env_key, file_key, fallback, minimum, maximum):
+    raw = env.get(env_key)
+    if raw is None:
+        raw = file_config.get(file_key)
+    if raw is None:
+        raw = file_config.get(env_key)
+    try:
+        value = int(raw)
+    except Exception:
+        value = fallback
+    return max(minimum, min(maximum, value))
+
+def load_config():
+    env = read_env_file(ENV_PATH)
+    file_config = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as handle:
+                file_config = json.load(handle)
+        except Exception:
+            file_config = {}
+    primary_model = env.get("LLM_MODEL") or file_config.get("llmModel") or file_config.get("LLM_MODEL") or "gpt-5.5"
+    raw_models = env.get("LLM_MODELS") or file_config.get("llmModels") or file_config.get("LLM_MODELS")
+    return {
+        "api_base": env.get("LLM_API_BASE") or file_config.get("llmApiBase") or file_config.get("LLM_API_BASE") or "",
+        "api_key": env.get("LLM_API_KEY") or file_config.get("llmApiKey") or file_config.get("LLM_API_KEY") or "",
+        "model": primary_model,
+        "models": model_candidates(primary_model, raw_models),
+        "max_autodebug_attempts": config_int(env, file_config, "VM_AGENT_MAX_AUTODEBUG_ATTEMPTS", "vmAgentMaxAutodebugAttempts", 5, 1, 8),
+    }
+
+def read_pid():
+    try:
+        with open(PID_PATH, "r") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    return int(line)
+    except Exception:
+        return None
+    return None
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+def message_count():
+    if not os.path.exists(MESSAGES_PATH):
+        return 0
+    count = 0
+    with open(MESSAGES_PATH, "r") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+def queue_depth():
+    return len(glob.glob(os.path.join(QUEUE_DIR, "*.json"))) if os.path.isdir(QUEUE_DIR) else 0
+
+def list_manuals():
+    if not os.path.isdir(MANUALS_DIR):
+        return []
+    allowed = set([".txt", ".md", ".rst", ".cmd", ".des", ".par", ".scm", ".sde"])
+    result = []
+    for path in sorted(glob.glob(os.path.join(MANUALS_DIR, "*"))):
+        name = os.path.basename(path)
+        if os.path.isfile(path) and not name.startswith(".") and os.path.splitext(name)[1].lower() in allowed:
+            result.append(name)
+    return result
+
+config = load_config()
+pid = read_pid()
+running = pid_alive(pid)
+manuals = list_manuals()
+payload = {
+    "ok": True,
+    "agent": AGENT_NAME,
+    "version": AGENT_VERSION,
+    "hostname": socket.gethostname(),
+    "user": getpass.getuser(),
+    "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "sentaurus_session_output"],
+    "mailbox": "~/.sentaurus-web-agent/vm-agent",
+    "messageCount": message_count(),
+    "workerRunning": running,
+    "workerPid": pid if running else None,
+    "llmConfigured": bool(config.get("api_base") and config.get("api_key")),
+    "llmModel": config.get("model"),
+    "llmModels": config.get("models"),
+    "maxAutodebugAttempts": config.get("max_autodebug_attempts"),
+    "manualCount": len(manuals),
+    "manualFiles": manuals[:20],
+    "queueDepth": queue_depth(),
+    "vmTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "vmEpochMs": int(time.time() * 1000),
+    "messages": [],
+    "cursor": message_count(),
+    "protocolVersion": 2,
+}
+print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+print("REMOTE_AGENT_DONE")
+`;
+
 type VmRunArtifactDownload = {
   path: string;
   fileName: string;
@@ -116,11 +335,26 @@ type VmRunArtifactDownload = {
   data: Buffer;
 };
 
+type VmAgentAgentsMdPayload = {
+  ok?: boolean;
+  error?: string;
+  statusCode?: number;
+  path?: string;
+  exists?: boolean;
+  content?: string;
+  size?: number;
+  updatedAt?: string;
+  sha256?: string;
+};
+
 const remoteWorkerScript = String.raw`# -*- coding: utf-8 -*-
+import base64
 import datetime
 import glob
 import getpass
+import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -137,9 +371,15 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.5.0"
+AGENT_VERSION = "0.6.0"
+DFISE_EXTRACTOR_VERSION = "dfise-idvg-extract/1"
+DFISE_METRIC_PROFILE = "tcad-idvg-v1"
+DFISE_MIN_SS_WINDOW_POINTS = 7
+DFISE_MIN_SS_ADJACENT_PAIRS = 6
+DFISE_EXTRACTOR_SHA256 = "__DFISE_EXTRACTOR_SHA256__"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
+DFISE_EXTRACTOR_PATH = os.path.join(ROOT, "dfise_idvg_extract.py")
 QUEUE_DIR = os.path.join(ROOT, "queue")
 DONE_DIR = os.path.join(ROOT, "processed")
 MESSAGES_PATH = os.path.join(ROOT, "messages.jsonl")
@@ -149,16 +389,19 @@ CONFIG_PATH = os.path.join(ROOT, "config.json")
 ENV_PATH = os.path.join(ROOT, ".env")
 MANUALS_DIR = os.path.join(ROOT, "manuals")
 LLM_HARD_TIMEOUT_SECONDS = 120
+VM_CONTEXT_WINDOW_TOKENS = 1000000
+VM_CONTEXT_TARGET_TOKENS = 850000
+VM_CONTEXT_HARD_TOKENS = 950000
 
 class HardTimeout(Exception):
     pass
 RUNS_DIR = os.path.join(HOME, "STDB", "web-agent-runs")
 SESSION_OUTPUT_ROOT = os.path.join(HOME, "STDB", "web-agent-sessions")
-OUTPUT_CATEGORY_INPUT = u"我的输入"
-OUTPUT_CATEGORY_RESULTS = u"仿真结果文件"
-OUTPUT_CATEGORY_LOGS = u"仿真日志文件"
-OUTPUT_CATEGORY_PARAMS = u"仿真参数文件"
-OUTPUT_CATEGORY_OTHER = u"其它文件"
+OUTPUT_CATEGORY_INPUT = u"\u6211\u7684\u8f93\u5165"
+OUTPUT_CATEGORY_RESULTS = u"\u4eff\u771f\u7ed3\u679c\u6587\u4ef6"
+OUTPUT_CATEGORY_LOGS = u"\u4eff\u771f\u65e5\u5fd7\u6587\u4ef6"
+OUTPUT_CATEGORY_PARAMS = u"\u4eff\u771f\u53c2\u6570\u6587\u4ef6"
+OUTPUT_CATEGORY_OTHER = u"\u5176\u5b83\u6587\u4ef6"
 STOP_PATH = os.path.join(ROOT, "stop")
 
 try:
@@ -182,6 +425,9 @@ def safe_text(value, limit=12000):
 
 def message_id(prefix):
     return "%s_%s_%s" % (prefix, datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"), uuid.uuid4().hex[:8])
+
+def turn_id():
+    return "turn_%s_%s" % (datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"), uuid.uuid4().hex[:6])
 
 def append_jsonl(path, payload):
     ensure_dir(os.path.dirname(path))
@@ -249,6 +495,93 @@ def append_thinking(session_id, request_message_id, stage, detail, status="runni
     content = "%s: %s" % (safe_text(stage, 80), safe_text(detail, 900))
     return append_message("system", content, "vm-agent-thinking", meta, "thinking")
 
+def base_worklog_meta(kind, session_id, turn_id_value, phase, run_id=""):
+    meta = {
+        "kind": kind,
+        "sessionId": safe_text(session_id, 160),
+        "turnId": safe_text(turn_id_value, 180),
+        "groupId": safe_text(turn_id_value, 180),
+        "phase": safe_text(phase, 80),
+        "foldable": kind not in ["run_final", "vm_agent_attachments"],
+        "collapsedByDefault": kind not in ["run_final", "vm_agent_attachments"],
+        "publicWorklog": True,
+        "displayLanguage": "zh-CN",
+    }
+    if run_id:
+        meta["runId"] = safe_text(run_id, 180)
+    return meta
+
+def append_worklog(session_id, turn_id_value, phase, text, run_id=""):
+    meta = base_worklog_meta("worklog_summary", session_id, turn_id_value, phase, run_id)
+    return append_message("agent", text, "vm-agent-worklog", meta, "worklog")
+
+def append_file_operation(session_id, turn_id_value, operation, path, category=None, size=None, run_id=""):
+    file_path = safe_text(path, 500).replace("\\", "/")
+    op = safe_text(operation, 40).strip().lower() or "touched"
+    label = {"created": "Created", "edited": "Edited", "read": "Read", "deleted": "Deleted", "uploaded": "Uploaded", "published": "Published", "produced": "Produced"}.get(op, op.capitalize())
+    meta = base_worklog_meta("file_operation", session_id, turn_id_value, "file", run_id)
+    meta["operation"] = op
+    meta["path"] = file_path
+    if category:
+        meta["category"] = safe_text(category, 180)
+    if size is not None:
+        try:
+            meta["size"] = max(0, int(size))
+        except Exception:
+            pass
+    return append_message("agent", "%s %s" % (label, file_path), "vm-agent-worklog", meta, "file")
+
+def append_tool_run(session_id, turn_id_value, tool, command_label, status, exit_code=None, duration_ms=None, run_id=""):
+    meta = base_worklog_meta("tool_run", session_id, turn_id_value, "tool", run_id)
+    meta["tool"] = safe_text(tool, 80)
+    meta["commandLabel"] = safe_text(command_label, 240)
+    meta["status"] = safe_text(status, 40)
+    if exit_code is not None:
+        try:
+            meta["exitCode"] = int(exit_code)
+        except Exception:
+            pass
+    if duration_ms is not None:
+        try:
+            meta["durationMs"] = max(0, int(duration_ms))
+        except Exception:
+            pass
+    content = "%s %s" % (safe_text(status, 40).capitalize(), safe_text(command_label, 240))
+    return append_message("agent", content, "vm-agent-worklog", meta, "tool")
+
+def append_run_diagnostic(session_id, turn_id_value, text, run_id=""):
+    meta = base_worklog_meta("run_diagnostic", session_id, turn_id_value, "debug", run_id)
+    return append_message("agent", text, "vm-agent-worklog", meta, "diag")
+
+def append_run_final(session_id, turn_id_value, content, result, duration_ms=None):
+    run_id_value = safe_text(result.get("id"), 180) if isinstance(result, dict) else ""
+    meta = base_worklog_meta("run_final", session_id, turn_id_value, "final", run_id_value)
+    meta["foldable"] = False
+    meta["collapsedByDefault"] = False
+    meta["summaryOfGroup"] = True
+    status = safe_text(result.get("status"), 80) if isinstance(result, dict) else ""
+    if status:
+        meta["runStatus"] = status
+    if duration_ms is not None:
+        try:
+            meta["worklogDurationMs"] = max(0, int(duration_ms))
+        except Exception:
+            pass
+    return append_message("agent", content, "vm-agent-worker", meta, "final")
+
+def append_attachment_message(session_id, turn_id_value, attachments, meta):
+    attachment_meta = meta.copy() if isinstance(meta, dict) else {}
+    attachment_meta["kind"] = "vm_agent_attachments"
+    attachment_meta["sessionId"] = safe_text(session_id, 160)
+    attachment_meta["turnId"] = safe_text(turn_id_value, 180)
+    attachment_meta["groupId"] = safe_text(turn_id_value, 180)
+    attachment_meta["phase"] = "attachment"
+    attachment_meta["foldable"] = False
+    attachment_meta["collapsedByDefault"] = False
+    attachment_meta["attachmentCount"] = len(attachments or [])
+    attachment_meta["imageAttachmentCount"] = len([item for item in attachments or [] if isinstance(item, dict) and item.get("kind") == "image"])
+    return append_message("agent", "Published %s VM attachment%s." % (len(attachments or []), "" if len(attachments or []) == 1 else "s"), "vm-agent-worker", attachment_meta, "attach", attachments)
+
 def read_all_messages():
     messages = []
     if not os.path.exists(MESSAGES_PATH):
@@ -286,7 +619,7 @@ def context_has_important_keywords(item):
     keywords = [
         "28nm", "28 nm", "mosfet", "nmos", "fdsoi", "utb", "id-vg", "idvg",
         "vth", "ss", "dibl", "ion", "ioff", "calibrat", "target", "baseline",
-        u"目标", u"校准", u"基线", u"结果", u"曲线", u"转移特性", u"阈值", u"亚阈值",
+        u"\u76ee\u6807", u"\u6821\u51c6", u"\u57fa\u7ebf", u"\u7ed3\u679c", u"\u66f2\u7ebf", u"\u8f6c\u79fb\u7279\u6027", u"\u9608\u503c", u"\u4e9a\u9608\u503c",
     ]
     for keyword in keywords:
         if keyword in text:
@@ -600,8 +933,311 @@ def run_step(run_dir, step, index, timeout_seconds=1800):
         "stderrTail": read_file_tail(stderr_path),
     }
 
+def sha256_path(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def finite_number(value):
+    try:
+        return not math.isnan(float(value)) and not math.isinf(float(value))
+    except Exception:
+        return False
+
+def postprocess_float(spec, key, default_value, minimum, maximum):
+    raw = spec.get(key)
+    if raw is None:
+        return default_value
+    try:
+        value = float(raw)
+    except Exception:
+        raise ValueError("%s must be numeric" % key)
+    if not finite_number(value) or value < minimum or value > maximum:
+        raise ValueError("%s is outside the allowed range" % key)
+    return value
+
+def normalize_dfise_postprocess(spec):
+    if not isinstance(spec, dict):
+        raise ValueError("postprocess item must be an object")
+    allowed_keys = set([
+        "kind", "lowInput", "highInput", "expectedLowVd", "expectedHighVd",
+        "biasToleranceV", "vthCurrentAperUm", "ssCurrentMinAperUm",
+        "ssCurrentMaxAperUm", "minimumPointCount", "outputPrefix", "metricProfile",
+    ])
+    unknown = sorted([safe_text(key, 120) for key in spec.keys() if key not in allowed_keys])
+    if unknown:
+        raise ValueError("dfise-idvg-v1 contains unsupported field(s): %s" % ", ".join(unknown))
+    if safe_text(spec.get("kind"), 80).strip() != "dfise-idvg-v1":
+        raise ValueError("unsupported postprocess kind")
+    low_input = safe_file_name(spec.get("lowInput"))
+    high_input = safe_file_name(spec.get("highInput"))
+    if os.path.splitext(low_input)[1].lower() != ".plt" or os.path.splitext(high_input)[1].lower() != ".plt":
+        raise ValueError("dfise-idvg-v1 inputs must be .plt files")
+    output_prefix = safe_text(spec.get("outputPrefix") or "idvg", 100).strip()
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$", output_prefix):
+        raise ValueError("dfise-idvg-v1 outputPrefix is invalid")
+    metric_profile = safe_text(spec.get("metricProfile") or DFISE_METRIC_PROFILE, 80).strip()
+    if metric_profile != DFISE_METRIC_PROFILE:
+        raise ValueError("unsupported metricProfile: %s" % metric_profile)
+    minimum_points = int(postprocess_float(spec, "minimumPointCount", 20, 3, 100000))
+    normalized = {
+        "kind": "dfise-idvg-v1",
+        "lowInput": low_input,
+        "highInput": high_input,
+        "expectedLowVd": postprocess_float(spec, "expectedLowVd", None, -1000, 1000),
+        "expectedHighVd": postprocess_float(spec, "expectedHighVd", None, -1000, 1000),
+        "biasToleranceV": postprocess_float(spec, "biasToleranceV", 1e-6, 1e-12, 1),
+        "vthCurrentAperUm": postprocess_float(spec, "vthCurrentAperUm", 1e-7, 1e-30, 1e6),
+        "ssCurrentMinAperUm": postprocess_float(spec, "ssCurrentMinAperUm", 1e-12, 1e-30, 1e6),
+        "ssCurrentMaxAperUm": postprocess_float(spec, "ssCurrentMaxAperUm", 1e-7, 1e-30, 1e6),
+        "minimumPointCount": minimum_points,
+        "outputPrefix": output_prefix,
+        "metricProfile": metric_profile,
+    }
+    if normalized["ssCurrentMinAperUm"] >= normalized["ssCurrentMaxAperUm"]:
+        raise ValueError("ssCurrentMinAperUm must be lower than ssCurrentMaxAperUm")
+    return normalized
+
+def normalize_postprocess_request(request):
+    values = request.get("postprocess") or []
+    if not isinstance(values, list):
+        raise ValueError("postprocess must be an array")
+    if len(values) > 4:
+        raise ValueError("run request has too many postprocess items")
+    return [normalize_dfise_postprocess(item) for item in values]
+
+def stage_postprocess_input(run_dir, session_id, name):
+    target = os.path.abspath(os.path.join(run_dir, safe_file_name(name)))
+    run_base = os.path.abspath(run_dir)
+    if target != run_base and not target.startswith(run_base + os.sep):
+        raise ValueError("postprocess input escapes run directory")
+    if os.path.isfile(target):
+        return target
+    session_id = safe_text(session_id, 180).strip()
+    if not session_id or not re.match(r"^run_[A-Za-z0-9_-]+$", session_id):
+        raise ValueError("postprocess input is missing from the run and no valid session input is available: %s" % name)
+    source_root = os.path.abspath(os.path.join(SESSION_OUTPUT_ROOT, session_id, "output", OUTPUT_CATEGORY_INPUT))
+    source = os.path.abspath(os.path.join(source_root, safe_file_name(name)))
+    if source != source_root and not source.startswith(source_root + os.sep):
+        raise ValueError("postprocess session input escapes input category")
+    if not os.path.isfile(source):
+        raise ValueError("postprocess input does not exist: %s" % name)
+    shutil.copy2(source, target)
+    return target
+
+def parse_last_json_line(text):
+    for line in reversed(safe_text(text, 1000000).splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                value = json.loads(line)
+                if isinstance(value, dict):
+                    return value
+            except Exception:
+                pass
+    return None
+
+def run_captured_process(args, cwd, timeout_seconds):
+    started = time.time()
+    proc = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    timed_out = False
+    while proc.poll() is None:
+        if time.time() - started > timeout_seconds:
+            timed_out = True
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            break
+        time.sleep(0.1)
+    stdout, stderr = proc.communicate()
+    try:
+        stdout = stdout.decode("utf-8", "replace")
+    except AttributeError:
+        pass
+    try:
+        stderr = stderr.decode("utf-8", "replace")
+    except AttributeError:
+        pass
+    return {
+        "exitCode": -1 if timed_out else proc.returncode,
+        "timedOut": timed_out,
+        "seconds": int(time.time() - started),
+        "stdout": stdout or "",
+        "stderr": stderr or "",
+    }
+
+def validate_dfise_success(run_dir, low_path, high_path, payload, request):
+    if payload.get("status") != "ok":
+        return False, safe_text(((payload.get("error") or {}).get("code") if isinstance(payload.get("error"), dict) else "") or "POSTPROCESS_INCOMPLETE", 120)
+    if payload.get("metricProfile") != DFISE_METRIC_PROFILE:
+        return False, "UNSUPPORTED_METRIC_PROFILE"
+    if payload.get("extractorVersion") != DFISE_EXTRACTOR_VERSION:
+        return False, "EXTRACTOR_VERSION_MISMATCH"
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+    required_metrics = ["vthLowV", "vthHighV", "ssLowMvPerDec", "ssHighMvPerDec", "diblMvPerV"]
+    if not all(finite_number(metrics.get(key)) for key in required_metrics):
+        return False, "NONFINITE_METRIC"
+    for window_key, pair_key in [
+        ("ssLowWindowPointCount", "ssLowAdjacentPairCount"),
+        ("ssHighWindowPointCount", "ssHighAdjacentPairCount"),
+    ]:
+        if int(metrics.get(window_key) or 0) < DFISE_MIN_SS_WINDOW_POINTS or int(metrics.get(pair_key) or 0) < DFISE_MIN_SS_ADJACENT_PAIRS:
+            return False, "SS_WINDOW_NOT_COVERED"
+    inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
+    low = inputs.get("low") if isinstance(inputs.get("low"), dict) else {}
+    high = inputs.get("high") if isinstance(inputs.get("high"), dict) else {}
+    low_hash = sha256_path(low_path)
+    high_hash = sha256_path(high_path)
+    if low.get("sha256") != low_hash or high.get("sha256") != high_hash:
+        return False, "INPUT_HASH_MISMATCH"
+    minimum_points = int(request.get("minimumPointCount") or 20)
+    if int(low.get("validPointCount") or 0) < minimum_points or int(high.get("validPointCount") or 0) < minimum_points:
+        return False, "INSUFFICIENT_POINTS"
+    tolerance = float(request.get("biasToleranceV") or 1e-6)
+    for item, expected_key in [(low, "expectedLowVd"), (high, "expectedHighVd")]:
+        expected = request.get(expected_key)
+        if expected is not None:
+            if not finite_number(item.get("actualVd")) or abs(float(item.get("actualVd")) - float(expected)) > tolerance:
+                return False, "BIAS_MISMATCH"
+    artifact_root = os.path.abspath(os.path.join(run_dir, "artifacts"))
+    outputs = payload.get("outputs") if isinstance(payload.get("outputs"), dict) else {}
+    required_outputs = {
+        "csv": ".csv",
+        "metricsJson": ".json",
+        "metricsDat": ".dat",
+        "report": ".txt",
+        "plot": ".png",
+    }
+    resolved_outputs = {}
+    for key, expected_ext in required_outputs.items():
+        output_path = os.path.abspath(safe_text(outputs.get(key), 1000))
+        if output_path == artifact_root or not output_path.startswith(artifact_root + os.sep):
+            return False, "OUTPUT_PATH_INVALID"
+        if os.path.splitext(output_path)[1].lower() != expected_ext:
+            return False, "OUTPUT_PATH_INVALID"
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
+            return False, "OUTPUT_MISSING"
+        resolved_outputs[key] = output_path
+    try:
+        with open(resolved_outputs["metricsJson"], "rb") as handle:
+            metrics_file = json.load(handle)
+        if metrics_file.get("status") != "ok":
+            return False, "POSTPROCESS_INCOMPLETE"
+        file_inputs = metrics_file.get("inputs") if isinstance(metrics_file.get("inputs"), dict) else {}
+        file_low = file_inputs.get("low") if isinstance(file_inputs.get("low"), dict) else {}
+        file_high = file_inputs.get("high") if isinstance(file_inputs.get("high"), dict) else {}
+        if file_low.get("sha256") != low_hash or file_high.get("sha256") != high_hash:
+            return False, "INPUT_HASH_MISMATCH"
+        file_metrics = metrics_file.get("metrics") if isinstance(metrics_file.get("metrics"), dict) else {}
+        for key in required_metrics:
+            if not finite_number(file_metrics.get(key)):
+                return False, "NONFINITE_METRIC"
+            expected = float(metrics.get(key))
+            actual = float(file_metrics.get(key))
+            if abs(actual - expected) > max(1e-12, abs(expected) * 1e-12):
+                return False, "METRICS_OUTPUT_MISMATCH"
+        with open(resolved_outputs["csv"], "rb") as handle:
+            csv_text = handle.read().decode("utf-8", "replace")
+        csv_lines = [line for line in csv_text.splitlines() if line.strip()]
+        if not csv_lines or csv_lines[0].strip() != "Vg_V,Id_low_A_per_um,Id_high_A_per_um,Vd_low_V,Vd_high_V":
+            return False, "CSV_OUTPUT_INVALID"
+        if len(csv_lines) - 1 < minimum_points:
+            return False, "CSV_OUTPUT_INCOMPLETE"
+        with open(resolved_outputs["report"], "rb") as handle:
+            report_text = handle.read().decode("utf-8", "replace")
+        if ("low.sha256=%s" % low_hash) not in report_text or ("high.sha256=%s" % high_hash) not in report_text:
+            return False, "INPUT_HASH_MISMATCH"
+    except Exception:
+        return False, "OUTPUT_VALIDATION_FAILED"
+    return True, ""
+
+def run_dfise_postprocess(run_dir, session_id, spec, index, timeout_seconds=120):
+    normalized = normalize_dfise_postprocess(spec)
+    low_path = stage_postprocess_input(run_dir, session_id, normalized["lowInput"])
+    high_path = stage_postprocess_input(run_dir, session_id, normalized["highInput"])
+    if not os.path.isfile(DFISE_EXTRACTOR_PATH):
+        raise ValueError("fixed DF-ISE extractor is not deployed")
+    extractor_hash = sha256_path(DFISE_EXTRACTOR_PATH)
+    if extractor_hash != DFISE_EXTRACTOR_SHA256:
+        raise ValueError("fixed DF-ISE extractor hash mismatch")
+    version_result = run_captured_process([sys.executable or "python", DFISE_EXTRACTOR_PATH, "--version"], run_dir, 10)
+    if version_result.get("exitCode") != 0 or safe_text(version_result.get("stdout"), 200).strip() != DFISE_EXTRACTOR_VERSION:
+        raise ValueError("fixed DF-ISE extractor version mismatch")
+    output_prefix = os.path.join(run_dir, "artifacts", normalized["outputPrefix"])
+    args = [
+        sys.executable or "python", DFISE_EXTRACTOR_PATH,
+        "--low", low_path,
+        "--high", high_path,
+        "--bias-tolerance", repr(normalized["biasToleranceV"]),
+        "--vth-current", repr(normalized["vthCurrentAperUm"]),
+        "--ss-current-min", repr(normalized["ssCurrentMinAperUm"]),
+        "--ss-current-max", repr(normalized["ssCurrentMaxAperUm"]),
+        "--min-points", str(normalized["minimumPointCount"]),
+        "--metric-profile", normalized["metricProfile"],
+        "--output-prefix", output_prefix,
+        "--stdout-json",
+    ]
+    if normalized["expectedLowVd"] is not None:
+        args.extend(["--expected-low-vd", repr(normalized["expectedLowVd"])])
+    if normalized["expectedHighVd"] is not None:
+        args.extend(["--expected-high-vd", repr(normalized["expectedHighVd"])])
+    process = run_captured_process(args, run_dir, timeout_seconds)
+    payload = parse_last_json_line(process.get("stdout"))
+    semantic_status = safe_text((payload or {}).get("status"), 80) or "failed"
+    error_payload = (payload or {}).get("error") if isinstance((payload or {}).get("error"), dict) else {}
+    error_code = safe_text(error_payload.get("code"), 120)
+    output_success, validation_error = validate_dfise_success(run_dir, low_path, high_path, payload or {}, normalized)
+    success = process.get("exitCode") == 0 and not process.get("timedOut") and output_success
+    if not success and not error_code:
+        if process.get("timedOut"):
+            error_code = "POSTPROCESS_TIMEOUT"
+        elif process.get("exitCode") != 0:
+            error_code = validation_error or "POSTPROCESS_FAILED"
+        else:
+            error_code = validation_error or "POSTPROCESS_FAILED"
+    outputs = {}
+    for key, value in (((payload or {}).get("outputs") or {}).items() if isinstance((payload or {}).get("outputs"), dict) else []):
+        output_path = os.path.abspath(safe_text(value, 1000))
+        if output_path.startswith(os.path.abspath(run_dir) + os.sep):
+            outputs[key] = os.path.relpath(output_path, run_dir)
+    if success:
+        result_status = "ok"
+    elif semantic_status in ["incomplete", "invalid-input"]:
+        result_status = semantic_status
+    elif error_code in ["INSUFFICIENT_POINTS", "NO_VALID_POINTS", "NONFINITE_METRIC", "SS_WINDOW_NOT_COVERED", "VTH_NOT_COVERED"]:
+        result_status = "incomplete"
+    elif error_code in ["BIAS_MISMATCH", "BIAS_ORDER_INVALID", "DATASET_NOT_FOUND", "INVALID_ARGUMENT", "MALFORMED_DATA_BLOCK", "UNSUPPORTED_METRIC_PROFILE", "UNSUPPORTED_SS_METHOD"]:
+        result_status = "invalid-input"
+    else:
+        result_status = "failed"
+    return {
+        "kind": "dfise-idvg-v1",
+        "index": index,
+        "status": result_status,
+        "exitCode": process.get("exitCode"),
+        "timedOut": bool(process.get("timedOut")),
+        "seconds": process.get("seconds"),
+        "stdoutTail": safe_text(process.get("stdout"), 4000),
+        "stderrTail": safe_text(process.get("stderr"), 4000),
+        "errorCode": error_code or None,
+        "errorMessage": safe_text(error_payload.get("message"), 500) or None,
+        "extractorVersion": (payload or {}).get("extractorVersion") or DFISE_EXTRACTOR_VERSION,
+        "extractorSha256": extractor_hash,
+        "metricProfile": (payload or {}).get("metricProfile") or DFISE_METRIC_PROFILE,
+        "inputs": (payload or {}).get("inputs"),
+        "metrics": (payload or {}).get("metrics"),
+        "outputs": outputs,
+        "request": normalized,
+    }
+
 def collect_run_artifacts(run_dir, limit=80):
-    allowed = set([".log", ".out", ".err", ".plt", ".tdr", ".grd", ".dat", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".bnd", ".sat", ".md", ".rst", ".sde"])
+    allowed = set([".log", ".out", ".err", ".plt", ".tdr", ".grd", ".dat", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".bnd", ".sat", ".md", ".rst", ".sde"])
     artifacts = []
     for root, _dirs, files in os.walk(run_dir):
         for name in files:
@@ -627,7 +1263,7 @@ def output_category_for_artifact(rel_path):
         return OUTPUT_CATEGORY_LOGS
     if ext in [".cmd", ".des", ".par", ".scm", ".tcl", ".sde"] or name in ["run_request.json", "setup.json"]:
         return OUTPUT_CATEGORY_PARAMS
-    if ext in [".plt", ".tdr", ".grd", ".dat", ".csv", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bnd", ".sat"]:
+    if ext in [".plt", ".tdr", ".grd", ".dat", ".csv", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bnd", ".sat"]:
         return OUTPUT_CATEGORY_RESULTS
     return OUTPUT_CATEGORY_OTHER
 
@@ -642,11 +1278,12 @@ def safe_artifact_rel_parts(rel_path):
         raise ValueError("empty artifact path")
     return clean
 
-READABLE_ATTACHMENT_EXTENSIONS = set([".txt", ".md", ".rst", ".log", ".out", ".err", ".csv", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".sde", ".dat", ".plt"])
+READABLE_ATTACHMENT_EXTENSIONS = set([".txt", ".md", ".rst", ".log", ".out", ".err", ".csv", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".sde", ".dat", ".plt", ".svg"])
 BINARY_ATTACHMENT_EXTENSIONS = set([".tdr", ".grd", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".bnd", ".sat"])
 MAX_ATTACHMENT_READ_BYTES = 256 * 1024
 MAX_ATTACHMENT_CONTEXT_CHARS = 600000
-IMAGE_EXTENSIONS = set([".png", ".jpg", ".jpeg", ".webp", ".gif"])
+IMAGE_EXTENSIONS = set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"])
+SESSION_FILE_EXTENSIONS = READABLE_ATTACHMENT_EXTENSIONS | BINARY_ATTACHMENT_EXTENSIONS
 
 def content_type_for_ext(ext):
     if ext == ".png":
@@ -657,6 +1294,16 @@ def content_type_for_ext(ext):
         return "image/webp"
     if ext == ".gif":
         return "image/gif"
+    if ext == ".svg":
+        return "image/svg+xml"
+    if ext == ".csv":
+        return "text/csv"
+    if ext in [".txt", ".md", ".rst", ".log", ".out", ".err", ".cmd", ".des", ".par", ".scm", ".tcl", ".sde", ".dat", ".plt"]:
+        return "text/plain"
+    if ext == ".json":
+        return "application/json"
+    if ext == ".pdf":
+        return "application/pdf"
     return "application/octet-stream"
 
 def display_attachments_for_artifacts(run_id, artifacts, limit=12):
@@ -665,12 +1312,13 @@ def display_attachments_for_artifacts(run_id, artifacts, limit=12):
     for item in artifacts or []:
         rel = safe_text(item.get("path"), 500).replace("\\", "/")
         ext = os.path.splitext(rel)[1].lower()
-        if ext not in IMAGE_EXTENSIONS:
+        if ext not in SESSION_FILE_EXTENSIONS:
             continue
         name = os.path.basename(rel)
+        kind = "image" if ext in IMAGE_EXTENSIONS else "file"
         result.append({
             "id": safe_text(("artifact_%s_%s" % (run_id, rel)).replace("/", "_"), 180),
-            "kind": "image",
+            "kind": kind,
             "name": name,
             "size": int(item.get("size") or 0),
             "contentType": content_type_for_ext(ext),
@@ -723,7 +1371,7 @@ def normalize_session_file_category(value):
         return raw
     return aliases.get(lowered) or aliases.get(raw) or OUTPUT_CATEGORY_RESULTS
 
-def safe_source_image_path(path):
+def safe_source_file_path(path):
     path = safe_text(path, 1200).strip()
     if not path:
         raise ValueError("sourcePath is required")
@@ -734,30 +1382,113 @@ def safe_source_image_path(path):
     if not os.path.isfile(source):
         raise ValueError("sourcePath does not exist")
     ext = os.path.splitext(source)[1].lower()
-    if ext not in IMAGE_EXTENSIONS:
-        raise ValueError("VM_SESSION_FILE only supports image files for chat preview")
+    if ext not in SESSION_FILE_EXTENSIONS:
+        raise ValueError("sourcePath extension is not allowlisted")
+    return source
+
+def safe_generated_file_name(value, default_name="generated.png"):
+    name = safe_file_name(value or default_name)
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in SESSION_FILE_EXTENSIONS:
+        raise ValueError("published file extension is not allowlisted")
+    return name
+
+def image_bytes_from_session_file_spec(spec):
+    content_b64 = spec.get("contentBase64") or spec.get("contentB64")
+    if content_b64:
+        encoded = safe_text(content_b64, 12 * 1024 * 1024).strip()
+        if encoded.startswith("data:") and "," in encoded:
+            encoded = encoded.split(",", 1)[1]
+        encoded = "".join(encoded.split())
+        encoded = encoded.replace("-", "+").replace("_", "/")
+        try:
+            encoded_bytes = encoded.encode("ascii") if not isinstance(encoded, str) else encoded
+        except Exception:
+            raise ValueError("contentBase64 contains non-ASCII characters")
+        missing_padding = len(encoded_bytes) % 4
+        if missing_padding:
+            encoded_bytes += "=" * (4 - missing_padding)
+        try:
+            data = base64.decodestring(encoded_bytes)
+        except Exception:
+            try:
+                data = base64.b64decode(encoded_bytes)
+            except Exception:
+                try:
+                    data = base64.urlsafe_b64decode(encoded_bytes)
+                except Exception:
+                    raise ValueError("contentBase64 is not valid base64")
+        if len(data) > 8 * 1024 * 1024:
+            raise ValueError("contentBase64 image is too large")
+        return data
+
+    content = spec.get("content")
+    if isinstance(content, string_types):
+        text = safe_text(content, 2 * 1024 * 1024)
+        if text.lstrip().startswith("<svg"):
+            return text.encode("utf-8")
+    return None
+
+def validate_image_bytes(name, data):
+    ext = os.path.splitext(name)[1].lower()
+    if ext == ".png" and not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("contentBase64 does not contain a PNG image")
+    if ext in [".jpg", ".jpeg"] and not data.startswith(b"\xff\xd8"):
+        raise ValueError("contentBase64 does not contain a JPEG image")
+    if ext == ".webp" and not (data.startswith(b"RIFF") and data[8:12] == b"WEBP"):
+        raise ValueError("contentBase64 does not contain a WebP image")
+    if ext == ".gif" and not (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
+        raise ValueError("contentBase64 does not contain a GIF image")
+    if ext == ".svg" and not data.lstrip().startswith(b"<svg"):
+        raise ValueError("content does not contain an SVG image")
+
+def resolve_run_artifact_path(spec):
+    run_id = safe_text(spec.get("runId") or spec.get("vmRunId"), 180).strip()
+    artifact_path = safe_text(spec.get("artifactPath") or spec.get("artifact_path"), 500).strip()
+    if not run_id or not artifact_path:
+        return None
+    if not re.match(r"^run_[A-Za-z0-9_-]+$", run_id):
+        raise ValueError("runId is invalid")
+    parts = safe_artifact_rel_parts(artifact_path)
+    source = os.path.abspath(os.path.join(RUNS_DIR, run_id, *parts))
+    run_dir = os.path.abspath(os.path.join(RUNS_DIR, run_id))
+    if source != run_dir and not source.startswith(run_dir + os.sep):
+        raise ValueError("artifactPath escapes run directory")
+    if not os.path.isfile(source):
+        raise ValueError("artifactPath does not exist")
+    ext = os.path.splitext(source)[1].lower()
+    if ext not in SESSION_FILE_EXTENSIONS:
+        raise ValueError("artifactPath extension is not allowlisted")
     return source
 
 def publish_vm_session_file(session_id, spec):
     session_id = safe_text(session_id, 180).strip()
     if not session_id or not re.match(r"^run_[A-Za-z0-9_-]+$", session_id):
         raise ValueError("sessionId is required to publish a VM session file")
-    source = safe_source_image_path(spec.get("sourcePath") or spec.get("path") or "")
-    name = safe_file_name(spec.get("name") or os.path.basename(source))
+    generated_bytes = image_bytes_from_session_file_spec(spec)
+    artifact_source = resolve_run_artifact_path(spec)
+    source_path_value = spec.get("sourcePath") or spec.get("path") or ""
+    source = artifact_source or (None if generated_bytes is not None else safe_source_file_path(source_path_value))
+    default_name = os.path.basename(source) if source else "generated.png"
+    name = safe_generated_file_name(spec.get("name") or default_name)
     ext = os.path.splitext(name)[1].lower()
-    if ext not in IMAGE_EXTENSIONS:
-        raise ValueError("published file name must be an image")
     category = normalize_session_file_category(spec.get("category"))
     category_dir = os.path.abspath(os.path.join(SESSION_OUTPUT_ROOT, session_id, "output", category))
     ensure_dir(category_dir)
     target = os.path.abspath(os.path.join(category_dir, name))
     if target == category_dir or not target.startswith(category_dir + os.sep):
         raise ValueError("published file escapes output category")
-    shutil.copy2(source, target)
+    if generated_bytes is not None:
+        if ext in IMAGE_EXTENSIONS:
+            validate_image_bytes(name, generated_bytes)
+        with open(target, "wb") as handle:
+            handle.write(generated_bytes)
+    else:
+        shutil.copy2(source, target)
     size = os.path.getsize(target)
     return {
         "id": safe_text(("vm_session_%s_%s_%s" % (session_id, category, name)).replace("/", "_").replace(" ", "_"), 180),
-        "kind": "image",
+        "kind": "image" if ext in IMAGE_EXTENSIONS else "file",
         "name": name,
         "size": size,
         "contentType": content_type_for_ext(ext),
@@ -949,6 +1680,38 @@ def unicode_text(value, limit=6000):
             pass
     return text
 
+def estimate_context_tokens(value):
+    text = unicode_text(value, 2000000)
+    ascii_count = 0
+    non_ascii_count = 0
+    for char in text:
+        try:
+            code = ord(char)
+        except Exception:
+            code = 128
+        if code < 128:
+            ascii_count += 1
+        else:
+            non_ascii_count += 1
+    return int(math.ceil(ascii_count / 4.0 + non_ascii_count))
+
+def fit_text_to_token_budget(value, token_budget, marker):
+    text = unicode_text(value, 2000000)
+    token_budget = max(0, int(token_budget or 0))
+    if estimate_context_tokens(text) <= token_budget:
+        return text
+    marker = unicode_text(marker, 1000)
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = text[:middle] + marker
+        if estimate_context_tokens(candidate) <= token_budget:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + marker
+
 def lowered_text(value, limit=6000):
     try:
         return unicode_text(value, limit).lower()
@@ -974,6 +1737,18 @@ def preview_run_steps(run_request):
             entry = safe_text(step.get("input") or step.get("entry") or step.get("entryFile"), 180).strip()
             if tool in allowed and entry:
                 result.append({"tool": tool, "input": entry})
+    return result
+
+def preview_run_postprocess(run_request):
+    if not isinstance(run_request, dict):
+        return []
+    values = run_request.get("postprocess")
+    if not isinstance(values, list):
+        return []
+    result = []
+    for item in values:
+        if isinstance(item, dict) and safe_text(item.get("kind"), 80).strip() == "dfise-idvg-v1":
+            result.append(item)
     return result
 
 def run_request_file_summary(run_request, limit=12000):
@@ -1026,11 +1801,12 @@ def user_requested_final_data(user_text):
 def validate_run_request_against_reply(user_text, visible_reply, run_request):
     if not run_request:
         return None
-    if run_request_file_count(run_request) == 0:
+    postprocess = preview_run_postprocess(run_request)
+    if run_request_file_count(run_request) == 0 and not postprocess:
         return "Run request contains no complete input file content."
     steps = preview_run_steps(run_request)
-    if not steps:
-        return "Run request contains no executable Sentaurus tool step."
+    if not steps and not postprocess:
+        return "Run request contains no executable Sentaurus tool step or fixed postprocess."
     tool_set = set([step.get("tool") for step in steps if step.get("tool")])
     visible = lowered_text(visible_reply, 10000)
     file_text = run_request_file_summary(run_request, 16000)
@@ -1046,12 +1822,12 @@ def validate_run_request_against_reply(user_text, visible_reply, run_request):
         "inspect", "csv", ".csv", ".plt", "extract", "curve", "result", "data extraction",
         u"\u63d0\u53d6", u"\u66f2\u7ebf", u"\u6570\u636e", u"\u7ed3\u679c",
     ])
-    if visible_mentions_extract and "inspect" not in tool_set and "sdevice" not in tool_set:
+    if visible_mentions_extract and "inspect" not in tool_set and "sdevice" not in tool_set and not postprocess:
         missing.append("inspect/extraction")
 
     steps_only_sde = bool(steps) and all(step.get("tool") == "sde" for step in steps)
     file_mentions_later_sdevice = contains_any(file_text, ["sdevice", "id-vg", "idvg", "inspect"])
-    if steps_only_sde and user_wants_result and (future_promise or visible_mentions_sdevice or file_mentions_later_sdevice):
+    if steps_only_sde and not postprocess and user_wants_result and (future_promise or visible_mentions_sdevice or file_mentions_later_sdevice):
         missing.append("complete device/extraction flow")
 
     if missing:
@@ -1065,7 +1841,7 @@ def validate_run_request_against_reply(user_text, visible_reply, run_request):
             "A run request is atomic; include every required SDE/SProcess/SDevice/Inspect step now, or ask for missing assumptions without emitting a run request."
         ) % ", ".join(unique_missing)
 
-    if future_promise and user_wants_result and "sdevice" not in tool_set and "inspect" not in tool_set and "sprocess" not in tool_set:
+    if future_promise and user_wants_result and not postprocess and "sdevice" not in tool_set and "inspect" not in tool_set and "sprocess" not in tool_set:
         return (
             "Refusing to execute a preliminary-only Sentaurus run request after a final-result request. "
             "Do not promise autonomous continuation outside the JSON block; emit a complete workflow or ask for missing assumptions."
@@ -1138,7 +1914,7 @@ def setup_text(value, limit=500):
 
 def normalize_simulation_setup(value):
     setup = {}
-    for key in ["deviceType", "gateBias", "drainBias", "sourceBulk", "geometry", "dopingOrImplant", "physicsModels", "mesh", "temperature", "notes"]:
+    for key in ["deviceType", "gateBias", "drainBias", "sourceBulk", "geometry", "dopingOrImplant", "physicsModels", "mesh", "temperature", "notes", "extractorVersion", "metricProfile", "postprocessStatus", "postprocessErrorCode"]:
         item = setup_text(value.get(key), 500)
         if item:
             setup[key] = item
@@ -1154,7 +1930,53 @@ def normalize_simulation_setup(value):
                 clean_outputs.append(text)
         if clean_outputs:
             setup["expectedOutputs"] = clean_outputs
+    input_hashes = value.get("inputHashes")
+    if isinstance(input_hashes, dict):
+        clean_hashes = {}
+        for key, item in input_hashes.items():
+            name = setup_text(key, 120)
+            digest = setup_text(item, 128)
+            if name and digest and re.match(r"^[a-fA-F0-9]{64}$", digest):
+                clean_hashes[name] = digest.lower()
+        if clean_hashes:
+            setup["inputHashes"] = clean_hashes
+    actual_biases = value.get("actualBiases")
+    if isinstance(actual_biases, dict):
+        clean_biases = {}
+        for key in ["lowVd", "highVd"]:
+            if finite_number(actual_biases.get(key)):
+                clean_biases[key] = float(actual_biases.get(key))
+        if clean_biases:
+            setup["actualBiases"] = clean_biases
     setup["updatedAt"] = setup_text(value.get("updatedAt"), 80) or now_iso()
+    setup["updatedBy"] = "vm-agent"
+    return setup
+
+def enrich_setup_from_postprocess(setup, result):
+    setup = dict(setup or {})
+    values = result.get("postprocessResults") or []
+    if not values:
+        return setup
+    item = values[-1]
+    setup["extractorVersion"] = safe_text(item.get("extractorVersion") or DFISE_EXTRACTOR_VERSION, 120)
+    setup["metricProfile"] = safe_text(item.get("metricProfile") or DFISE_METRIC_PROFILE, 120)
+    setup["postprocessStatus"] = safe_text(item.get("status") or "failed", 80)
+    if item.get("errorCode"):
+        setup["postprocessErrorCode"] = safe_text(item.get("errorCode"), 120)
+    inputs = item.get("inputs") if isinstance(item.get("inputs"), dict) else {}
+    hashes = {}
+    biases = {}
+    for label, bias_key in [("low", "lowVd"), ("high", "highVd")]:
+        input_item = inputs.get(label) if isinstance(inputs.get(label), dict) else {}
+        if input_item.get("sha256"):
+            hashes[label] = safe_text(input_item.get("sha256"), 128)
+        if finite_number(input_item.get("actualVd")):
+            biases[bias_key] = float(input_item.get("actualVd"))
+    if hashes:
+        setup["inputHashes"] = hashes
+    if biases:
+        setup["actualBiases"] = biases
+    setup["updatedAt"] = now_iso()
     setup["updatedBy"] = "vm-agent"
     return setup
 
@@ -1188,13 +2010,18 @@ def setup_from_run_request(request):
         "updatedAt": now_iso(),
         "updatedBy": "vm-agent",
     }
+    postprocess = preview_run_postprocess(request)
+    if postprocess:
+        setup["extractorVersion"] = DFISE_EXTRACTOR_VERSION
+        setup["metricProfile"] = DFISE_METRIC_PROFILE
+        setup["postprocessStatus"] = "pending"
     for key in ["gateBias", "drainBias", "sourceBulk", "geometry", "dopingOrImplant", "physicsModels", "mesh", "temperature"]:
         value = setup_text(request.get(key), 500)
         if value:
             setup[key] = value
     return setup
 
-def execute_run_request(request, session_id=""):
+def execute_run_request(request, session_id="", turn_id_value=""):
     ensure_dir(RUNS_DIR)
     title = safe_text(request.get("title") or session_id or "sentaurus-job", 120)
     run_id = "run_%s_%s_%s" % (datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"), safe_run_slug(title), uuid.uuid4().hex[:6])
@@ -1204,13 +2031,17 @@ def execute_run_request(request, session_id=""):
     ensure_dir(run_dir)
     ensure_dir(os.path.join(run_dir, "logs"))
     ensure_dir(os.path.join(run_dir, "artifacts"))
+    append_worklog(session_id, turn_id_value, "file", "Creating this Sentaurus run directory and writing deck files returned by the model.", run_id)
+    postprocess = normalize_postprocess_request(request)
     files = request.get("files") or []
-    if not isinstance(files, list) or not files:
-        raise ValueError("run request requires a non-empty files array")
+    if not isinstance(files, list):
+        raise ValueError("run request files must be an array")
+    if not files and not postprocess:
+        raise ValueError("run request requires files or fixed postprocess inputs")
     if len(files) > 30:
         raise ValueError("run request has too many files")
     total_chars = 0
-    allowed_ext = set([".cmd", ".des", ".par", ".scm", ".tcl", ".txt", ".dat"])
+    allowed_ext = set([".cmd", ".des", ".par", ".scm", ".tcl", ".txt", ".dat", ".plt"])
     written = []
     for file_item in files:
         if not isinstance(file_item, dict):
@@ -1225,14 +2056,17 @@ def execute_run_request(request, session_id=""):
             raise ValueError("run request files are too large")
         write_utf8(os.path.join(run_dir, name), content)
         written.append(name)
+        append_file_operation(session_id, turn_id_value, "created", name, OUTPUT_CATEGORY_PARAMS, len(content), run_id)
     steps = request.get("steps") or []
     if not isinstance(steps, list) or not steps:
         tool = safe_text(request.get("tool"), 40).strip().lower()
         entry = request.get("entryFile") or request.get("input")
         if tool and entry:
             steps = [{"tool": tool, "input": entry}]
-    if not isinstance(steps, list) or not steps:
-        raise ValueError("run request requires steps or tool+entryFile")
+    if not isinstance(steps, list):
+        raise ValueError("run request steps must be an array")
+    if not steps and not postprocess:
+        raise ValueError("run request requires steps or postprocess")
     if len(steps) > 8:
         raise ValueError("run request has too many steps")
     manifest = {
@@ -1242,12 +2076,15 @@ def execute_run_request(request, session_id=""):
         "sessionId": session_id,
         "files": written,
         "steps": steps,
+        "postprocess": postprocess,
         "status": "running",
     }
     write_utf8(os.path.join(run_dir, "run_request.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+    append_file_operation(session_id, turn_id_value, "created", "run_request.json", OUTPUT_CATEGORY_PARAMS, 0, run_id)
     audit("sentaurus_run_started", {"runId": run_id, "title": title, "sessionId": session_id})
     append_progress(session_id, "runner_prepare", "completed", "Prepared run directory %s with %s file(s)" % (run_id, len(written)), 50, run_id)
     step_results = []
+    postprocess_results = []
     ok = True
     step_count = max(1, len(steps))
     for index, step in enumerate(steps, 1):
@@ -1255,25 +2092,57 @@ def execute_run_request(request, session_id=""):
         entry = safe_file_name(step.get("input") or step.get("entry") or step.get("entryFile"))
         step_start_progress = 55 + int(((index - 1) / float(step_count)) * 35)
         append_progress(session_id, "sentaurus_step", "running", "Step %s/%s: %s %s" % (index, step_count, tool, entry), step_start_progress, run_id)
+        append_tool_run(session_id, turn_id_value, tool, "%s %s" % (tool, entry), "running", None, None, run_id)
         result = run_step(run_dir, step, index)
         step_results.append(result)
+        duration_ms = int(float(result.get("seconds") or 0) * 1000)
         if result.get("exitCode") != 0:
             ok = False
             append_progress(session_id, "sentaurus_step", "failed", "Step %s/%s: %s %s exit %s" % (index, step_count, result.get("tool"), result.get("input"), result.get("exitCode")), step_start_progress, run_id)
+            append_tool_run(session_id, turn_id_value, result.get("tool") or tool, "%s %s" % (result.get("tool") or tool, result.get("input") or entry), "failed", result.get("exitCode"), duration_ms, run_id)
+            if result.get("stderrTail"):
+                append_run_diagnostic(session_id, turn_id_value, "Sentaurus step failed: %s %s exit %s. Log tail: %s" % (result.get("tool") or tool, result.get("input") or entry, result.get("exitCode"), safe_text(result.get("stderrTail").replace("\n", " | "), 500)), run_id)
             break
         append_progress(session_id, "sentaurus_step", "completed", "Step %s/%s: %s %s exit 0 in %ss" % (index, step_count, result.get("tool"), result.get("input"), result.get("seconds")), min(95, step_start_progress + max(1, int(35 / float(step_count)))), run_id)
-    manifest["status"] = "succeeded" if ok else "failed"
+        append_tool_run(session_id, turn_id_value, result.get("tool") or tool, "%s %s" % (result.get("tool") or tool, result.get("input") or entry), "succeeded", result.get("exitCode"), duration_ms, run_id)
+    if ok:
+        for index, spec in enumerate(postprocess, 1):
+            append_progress(session_id, "postprocess", "running", "Postprocess %s/%s: fixed dfise-idvg-v1 extractor" % (index, len(postprocess)), 92, run_id)
+            append_tool_run(session_id, turn_id_value, "dfise-idvg-v1", "fixed tcad-idvg-v1 postprocess", "running", None, None, run_id)
+            result = run_dfise_postprocess(run_dir, session_id, spec, index)
+            postprocess_results.append(result)
+            semantic_ok = result.get("status") == "ok" and result.get("exitCode") == 0
+            append_tool_run(session_id, turn_id_value, "dfise-idvg-v1", "fixed tcad-idvg-v1 postprocess", "succeeded" if semantic_ok else "failed", result.get("exitCode"), int(float(result.get("seconds") or 0) * 1000), run_id)
+            if semantic_ok:
+                append_progress(session_id, "postprocess", "completed", "Fixed DF-ISE extraction completed with all required metrics", 98, run_id)
+            else:
+                ok = False
+                append_progress(session_id, "postprocess", "failed", "Fixed DF-ISE extraction returned %s (%s)" % (result.get("status"), result.get("errorCode") or "unknown"), 98, run_id)
+                append_run_diagnostic(session_id, turn_id_value, "DF-ISE postprocess failed semantic validation: %s %s" % (result.get("errorCode") or "unknown", result.get("errorMessage") or ""), run_id)
+                break
+    manifest["postprocessResults"] = postprocess_results
+    if ok:
+        manifest["status"] = "succeeded"
+    elif postprocess_results and postprocess_results[-1].get("status") == "incomplete":
+        manifest["status"] = "incomplete"
+    elif postprocess_results and postprocess_results[-1].get("status") == "invalid-input":
+        manifest["status"] = "failed-postcondition"
+    else:
+        manifest["status"] = "failed"
     manifest["finishedAt"] = now_iso()
     manifest["stepResults"] = step_results
     artifacts = collect_run_artifacts(run_dir)
     manifest["artifacts"] = artifacts
     write_utf8(os.path.join(run_dir, "run_result.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+    append_file_operation(session_id, turn_id_value, "produced", "run_result.json", OUTPUT_CATEGORY_RESULTS, 0, run_id)
     artifacts = collect_run_artifacts(run_dir)
     manifest["artifacts"] = artifacts
     manifest["sessionOutputSyncedCount"] = sync_run_artifacts_to_session_output(session_id, run_id, run_dir, artifacts)
     write_utf8(os.path.join(run_dir, "run_result.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
     sync_run_artifacts_to_session_output(session_id, run_id, run_dir, [{"path": "run_result.json", "size": 0}])
-    audit("sentaurus_run_finished", {"runId": run_id, "ok": ok, "steps": step_results})
+    for artifact in artifacts[:16]:
+        append_file_operation(session_id, turn_id_value, "produced", artifact.get("path"), None, artifact.get("size"), run_id)
+    audit("sentaurus_run_finished", {"runId": run_id, "ok": ok, "status": manifest.get("status"), "steps": step_results, "postprocess": postprocess_results})
     append_progress(session_id, "artifacts", "completed" if ok else "failed", "Collected %s artifact/log file(s)" % len(artifacts), 100 if ok else 95, run_id)
     return manifest
 
@@ -1298,6 +2167,40 @@ def format_run_result(result):
         lines.append("  - ... %s more" % (len(artifacts) - 18))
     return "\n".join(lines)
 
+def concise_run_final_reply(visible_reply, result, attempts=None, stop_reason=""):
+    attempts = attempts or []
+    status = result.get("status")
+    run_id = safe_text(result.get("id"), 180)
+    failed = first_failed_step(result)
+    prefix = safe_text(visible_reply, 900).strip()
+    lines = []
+    if status == "succeeded":
+        lines.append("Sentaurus run completed with status: succeeded.")
+        if run_id:
+            lines.append("")
+            lines.append("Run ID: %s." % run_id)
+        if attempts and len(attempts) > 1:
+            lines.append("Auto-debug attempted %s time(s); the final attempt succeeded." % len(attempts))
+        lines.append("")
+        lines.append("Next step: review attached/output curves, logs, and run_result.json.")
+    else:
+        if failed:
+            lines.append("Sentaurus run failed: %s %s exit %s." % (failed.get("tool"), failed.get("input"), failed.get("exitCode")))
+            stderr_tail = safe_text((failed.get("stderrTail") or "").replace("\n", " | "), 260)
+            if stderr_tail:
+                lines.append("")
+                lines.append("Key log tail: %s" % stderr_tail)
+        else:
+            lines.append("Sentaurus run did not complete successfully.")
+        if stop_reason:
+            lines.append("")
+            lines.append("Stop reason: %s." % safe_text(stop_reason, 260))
+        lines.append("")
+        lines.append("Next step: inspect worklog, failed step, and generated files, then retry with corrected deck/files.")
+    if prefix:
+        return prefix + "\n\n" + "\n".join(lines)
+    return "\n".join(lines)
+
 def run_dir_for_result(result):
     run_id = safe_text(result.get("id"), 180).strip()
     return os.path.join(RUNS_DIR, run_id) if run_id else ""
@@ -1306,6 +2209,18 @@ def first_failed_step(result):
     for step in result.get("stepResults") or []:
         if step.get("timedOut") or step.get("exitCode") != 0:
             return step
+    for item in result.get("postprocessResults") or []:
+        if item.get("status") != "ok" or item.get("exitCode") != 0:
+            request = item.get("request") if isinstance(item.get("request"), dict) else {}
+            return {
+                "tool": item.get("kind") or "dfise-idvg-v1",
+                "input": "%s + %s" % (request.get("lowInput") or "low.plt", request.get("highInput") or "high.plt"),
+                "exitCode": item.get("exitCode"),
+                "timedOut": bool(item.get("timedOut")),
+                "stdoutTail": item.get("stdoutTail"),
+                "stderrTail": item.get("stderrTail") or ("%s: %s" % (item.get("errorCode") or "POSTPROCESS_FAILED", item.get("errorMessage") or "")),
+                "postprocessErrorCode": item.get("errorCode"),
+            }
     return None
 
 def safe_read_run_file(result, rel_path, limit=8000):
@@ -1369,6 +2284,9 @@ def attempts_meta(attempts):
     return items
 
 def is_recoverable_run_failure(result):
+    if result.get("status") in ["incomplete", "failed-postcondition"]:
+        failed = first_failed_step(result) or {}
+        return failed.get("postprocessErrorCode") in ["BIAS_MISMATCH", "SS_WINDOW_NOT_COVERED", "VTH_NOT_COVERED", "INSUFFICIENT_POINTS", "NO_VALID_POINTS"]
     if result.get("status") != "failed":
         return False
     failed = first_failed_step(result)
@@ -1435,6 +2353,8 @@ def build_repair_prompt(original_user_text, previous_run_request, result, attemp
         "- Do not use shell commands or unsafe paths.",
         "- Use only allowed tools: sde, sprocess, sdevice, inspect.",
         "- Use only safe ASCII file names without spaces and extensions .cmd, .des, .par, .scm, .tcl, .txt, or .dat.",
+        "- For DF-ISE .plt extraction, keep kind=dfise-idvg-v1 and only adjust lowInput/highInput, expected biases, outputPrefix, or the SDevice sweep that produces the inputs.",
+        "- Never generate, edit, replace, or inline the fixed dfise_idvg_extract.py parser. Never replace it with Inspect cv_* or dynamic Tcl parsing.",
         "- If convergence failed, adjust solver, physics, or sweep settings conservatively.",
         "",
         "Durable SDE/SDevice generation guardrails:",
@@ -1480,7 +2400,7 @@ def format_autodebug_reply(visible_reply, attempts, stop_reason, repair_notes):
         lines.append("Suggested next step: review the failed deck/logs above or provide the missing process/device assumptions so the next repair has better constraints.")
     return "\n".join(lines)
 
-def run_with_autodebug(original_user_text, initial_run_request, visible_reply, session_id, current_message_id, initial_setup=None):
+def run_with_autodebug(original_user_text, initial_run_request, visible_reply, session_id, current_message_id, turn_id_value="", initial_setup=None):
     config = load_config()
     max_attempts = int(config.get("max_autodebug_attempts") or 5)
     run_request = initial_run_request
@@ -1490,12 +2410,14 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
     stop_reason = ""
     for attempt_no in range(1, max_attempts + 1):
         append_progress(session_id, "runner", "running", "Attempt %s/%s: executing allowlisted Sentaurus run request" % (attempt_no, max_attempts), 45, "")
-        result = execute_run_request(run_request, session_id)
+        append_worklog(session_id, turn_id_value, "tool", "Starting Sentaurus attempt %s/%s and recording files/tool steps." % (attempt_no, max_attempts))
+        result = execute_run_request(run_request, session_id, turn_id_value)
         result["autoDebugAttempt"] = attempt_no
         attempts.append(result)
         if result.get("status") == "succeeded":
             if attempt_no > 1:
                 append_progress(session_id, "autodebug", "completed", "Auto-debug succeeded on attempt %s/%s" % (attempt_no, max_attempts), 100, result.get("id"))
+                append_run_diagnostic(session_id, turn_id_value, "Auto-debug succeeded after attempt %s." % attempt_no, result.get("id"))
             return format_autodebug_reply(visible_reply, attempts, "", repair_notes), result, attempts, latest_setup, ""
         if attempt_no >= max_attempts:
             stop_reason = "retry budget reached"
@@ -1504,6 +2426,7 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
             stop_reason = "failure was not considered safely recoverable"
             break
         append_progress(session_id, "autodebug", "running", "Attempt %s failed; diagnosing logs and repairing deck" % attempt_no, 95, result.get("id"))
+        append_worklog(session_id, turn_id_value, "debug", "Run attempt failed; reading failed-step logs and trying to generate a safe repair deck.", result.get("id"))
         repair_prompt = build_repair_prompt(original_user_text, run_request, result, attempts)
         try:
             repair_reply, _repair_meta = run_with_timeout(LLM_HARD_TIMEOUT_SECONDS, "VM agent auto-debug repair LLM call", call_llm, repair_prompt, config, session_id, current_message_id)
@@ -1516,15 +2439,19 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
             if not next_run_request:
                 stop_reason = "repair LLM did not produce a corrected run request"
                 append_progress(session_id, "repair_llm", "failed", stop_reason, 100, result.get("id"))
+                append_run_diagnostic(session_id, turn_id_value, "Auto-debug did not return a new executable run request.", result.get("id"))
                 break
             run_request = next_run_request
             append_progress(session_id, "repair_llm", "completed", "Repair request ready for attempt %s/%s" % (attempt_no + 1, max_attempts), 45, result.get("id"))
+            append_worklog(session_id, turn_id_value, "debug", "Generated repaired run request; preparing next attempt.", result.get("id"))
         except Exception as exc:
             stop_reason = "repair LLM failed: %s" % safe_text(str(exc), 500)
             append_progress(session_id, "repair_llm", "failed", stop_reason, 100, result.get("id"))
+            append_run_diagnostic(session_id, turn_id_value, "Auto-debug repair call failed: %s" % safe_text(str(exc), 500), result.get("id"))
             break
     final = attempts[-1] if attempts else {}
     append_progress(session_id, "autodebug", "failed", stop_reason or "auto-debug stopped without a successful run", 100, final.get("id"))
+    append_run_diagnostic(session_id, turn_id_value, "Auto-debug stopped: %s" % (stop_reason or "no successful run"), final.get("id"))
     return format_autodebug_reply(visible_reply, attempts, stop_reason, repair_notes), final, attempts, latest_setup, stop_reason
 
 def list_instances():
@@ -1564,7 +2491,7 @@ def manual_query_tokens(user_text):
         "sde", "sdevice", "sprocess", "svisual", "inspect", "swb", "smesh", "tdx",
         "mesh", "electrode", "contact", "doping", "physics", "solve", "plot", "current",
         "extract", "threshold", "mobility", "recombination", "avalanche", "quantum", "deck",
-        "tdr", "plt", "cmd", "des", "parameter", "workbench", "simulation", u"仿真", u"网格", u"电极", u"掺杂",
+        "tdr", "plt", "cmd", "des", "parameter", "workbench", "simulation", u"\u4eff\u771f", u"\u7f51\u683c", u"\u7535\u6781", u"\u63ba\u6742",
     ]
     for token in domain_tokens:
         if token in raw and token not in tokens:
@@ -1726,6 +2653,9 @@ def parse_responses_text(data):
     return "\n".join(parts).strip()
 
 def call_llm_model(user_text, config, model, system):
+    user_text = unicode_text(user_text, 1000000)
+    system = unicode_text(system, 1000000)
+    model = safe_text(model, 200)
     api_style = (config.get("api_style") or "chat-completions").lower()
     if api_style in ["openai-responses", "responses"]:
         payload = {
@@ -1735,11 +2665,11 @@ def call_llm_model(user_text, config, model, system):
                 {"role": "user", "content": user_text},
             ],
         }
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         request = urllib2.Request(responses_url(config.get("api_base")), body, {
             "content-type": "application/json",
             "authorization": "Bearer %s" % config.get("api_key"),
-            "user-agent": "sentaurus-vm-agent/0.5.0",
+            "user-agent": "sentaurus-vm-agent/0.6.0",
         })
         response = urllib2.urlopen(request, timeout=90).read()
         try:
@@ -1759,11 +2689,11 @@ def call_llm_model(user_text, config, model, system):
         ],
         "temperature": 0.2,
     }
-    body = json.dumps(payload).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.5.0",
+        "user-agent": "sentaurus-vm-agent/0.6.0",
     })
     response = urllib2.urlopen(request, timeout=90).read()
     try:
@@ -1776,12 +2706,9 @@ def call_llm_model(user_text, config, model, system):
         raise Exception("LLM returned no content")
     return parsed
 
-def call_llm(user_text, config, session_id="", current_message_id=""):
-    snapshot = skill_snapshot()
-    manual_context = read_manual_context(user_text)
-    recent_session_context = session_context(session_id, current_message_id)
-    system = (
-        "You are the Sentaurus TCAD simulation agent running inside the CentOS VM. "
+def build_llm_system_prompt(snapshot, recent_session_context, manual_context):
+    return (
+        u"You are the Sentaurus TCAD simulation agent running inside the CentOS VM. "
         "Your core mission is to help the user establish complete Sentaurus simulation tasks: clarify the device/process objective, "
         "create or revise SDE/SProcess/SDevice/SWB decks and parameter data, prepare run directories and extraction plans, "
         "invoke Sentaurus only through the VM-local allowlisted runner, monitor logs, and export results/artifacts/metrics back to the user. "
@@ -1790,22 +2717,44 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
         "When the user explicitly asks you to run/simulate and you can create a self-contained minimal Sentaurus deck, include a concise human explanation, one simulation setup block, and exactly one run request block. "
         "The setup block schema is: <SIMULATION_SETUP>{\"deviceType\":\"...\",\"gateBias\":\"...\",\"drainBias\":\"...\",\"sourceBulk\":\"...\",\"geometry\":\"...\",\"dopingOrImplant\":\"...\",\"physicsModels\":\"...\",\"mesh\":\"...\",\"temperature\":\"...\",\"simulationGoals\":\"...\",\"expectedOutputs\":[\"file or curve\"],\"notes\":\"...\"}</SIMULATION_SETUP>. "
         "Populate the setup block with actual assumptions from the same browser session; omit unknown fields instead of inventing critical process/device parameters. "
-        "The block schema is: <SENTAURUS_RUN_REQUEST>{\"title\":\"short-title\",\"files\":[{\"name\":\"main.cmd\",\"content\":\"...\"}],\"steps\":[{\"tool\":\"sde|sprocess|sdevice|inspect\",\"input\":\"main.cmd\"}]}</SENTAURUS_RUN_REQUEST>. "
+        "The block schema is: <SENTAURUS_RUN_REQUEST>{\"title\":\"short-title\",\"files\":[{\"name\":\"main.cmd\",\"content\":\"...\"}],\"steps\":[{\"tool\":\"sde|sprocess|sdevice|inspect\",\"input\":\"main.cmd\"}],\"postprocess\":[{\"kind\":\"dfise-idvg-v1\",\"lowInput\":\"idvg_low.plt\",\"highInput\":\"idvg_high.plt\",\"expectedLowVd\":0.05,\"expectedHighVd\":0.8,\"outputPrefix\":\"idvg_step0005\"}]}</SENTAURUS_RUN_REQUEST>. "
         "A run request is atomic: the worker will execute only the JSON block you provide and will not automatically continue later based on visible text. "
         "Never say you will continue, follow up, add SDevice later, extract data later, or send final results later unless every required file and ordered step is already present in the same run request. "
         "For requests asking for final simulation results, Id-Vg curves, .plt/.csv data, or extraction, do not emit an SDE-only request; include SDevice and/or Inspect extraction steps, or ask for missing assumptions. "
         "Use only safe ASCII file names without spaces, and only .cmd, .des, .par, .scm, .tcl, .txt, or .dat files. "
+        "Capability rule dfise-plt-postprocess-v1: for readable DF-ISE .plt Id-Vg extraction, use only the fixed typed dfise-idvg-v1 postprocess; do not generate Inspect cv_* extraction or dynamic Tcl/Python parsers; read actual Vd from file content; reject expected-bias mismatch; require finite Vth_low, Vth_high, SS_low, SS_high, and DIBL before success; publish CSV/JSON/DAT/TXT/PLT through general file attachments and PNG/SVG through image preview. "
         "If the required deck cannot be made self-contained, ask for the missing files/assumptions instead of emitting a run request. "
         "Use the installed tool paths and VM state in the snapshot. Ask for missing physics/process assumptions instead of inventing critical parameters. "
         "Before saying previous files, run directories, decks, or results are unavailable, inspect the recent browser-session context below. "
         "If the user says 'continue', 'that project', or similar, resolve it from the same-session context whenever possible. "
-        "When you need to publish an existing VM image file into the browser chat, include a <VM_SESSION_FILE>{\"category\":\"simulation image\",\"name\":\"safe-name.png\",\"sourcePath\":\"/home/TCAD2022/STDB/.../safe-name.png\"}</VM_SESSION_FILE> block; use it only for real .png, .jpg, .jpeg, .webp, or .gif files under ~/STDB. "
+        "User-facing replies should be Chinese by default unless the user asks otherwise. "
+        "Do not reveal hidden chain-of-thought. If progress visibility is useful, write concise public worklog summaries in Chinese. "
+        "Public worklog summaries must describe observable actions, decisions, and status, not private reasoning traces. "
+        "Final answers should be concise and separated from progress, diagnostics, and attachments. "
+        u"Publish real outputs with <VM_SESSION_FILE>. PNG/JPEG/WebP/GIF/SVG are image previews; CSV/JSON/DAT/TXT/PLT/PDF and other allowlisted artifacts are general downloadable files. A run artifact may use {\"category\":\"仿真结果文件\",\"name\":\"safe-name.csv\",\"runId\":\"run_...\",\"artifactPath\":\"artifacts/safe-name.csv\"}; a safe ~/STDB file may use sourcePath. Do not send non-images through image-only assumptions. "
         "The browser and host backend only relay messages; API credentials stay inside this VM. "
-        "Current VM skill snapshot: " + json.dumps(snapshot, ensure_ascii=True, sort_keys=True) + "\n\n" +
-        "Durable SDE/SDevice generation guardrails:\n" + deck_generation_guardrails() + "\n\n" +
-        "Recent browser-session context, newest last:\n" + recent_session_context + "\n\n" +
-        "VM-local Sentaurus manual/context excerpts:\n" + manual_context
+        u"Current VM skill snapshot: " + unicode_text(json.dumps(snapshot, ensure_ascii=True, sort_keys=True), 200000) + u"\n\n" +
+        u"Durable SDE/SDevice generation guardrails:\n" + unicode_text(deck_generation_guardrails(), 200000) + u"\n\n" +
+        u"Recent browser-session context, newest last:\n" + unicode_text(recent_session_context, 400000) + u"\n\n" +
+        u"VM-local Sentaurus manual/context excerpts:\n" + unicode_text(manual_context, 400000)
     )
+
+def call_llm(user_text, config, session_id="", current_message_id=""):
+    snapshot = skill_snapshot()
+    manual_context = read_manual_context(user_text)
+    recent_session_context = session_context(session_id, current_message_id)
+    system = build_llm_system_prompt(snapshot, recent_session_context, manual_context)
+    context_tokens = estimate_context_tokens(system) + estimate_context_tokens(user_text)
+    if context_tokens > VM_CONTEXT_TARGET_TOKENS:
+        user_tokens = estimate_context_tokens(user_text)
+        available = max(80000, VM_CONTEXT_TARGET_TOKENS - user_tokens - 60000)
+        session_budget = int(available * 0.68)
+        manual_budget = int(available * 0.24)
+        recent_session_context = fit_text_to_token_budget(recent_session_context, session_budget, u"\n\n[Same-session context compressed to fit the 1.0M-token model window.]")
+        manual_context = fit_text_to_token_budget(manual_context, manual_budget, u"\n\n[Manual context compressed to fit the 1.0M-token model window.]")
+        system = build_llm_system_prompt(snapshot, recent_session_context, manual_context)
+        if estimate_context_tokens(system) + user_tokens > VM_CONTEXT_HARD_TOKENS:
+            system = fit_text_to_token_budget(system, max(40000, VM_CONTEXT_HARD_TOKENS - user_tokens - 5000), u"\n\n[System prompt hard-truncated to protect the 1.0M-token model window.]")
     models = config.get("models") or [config.get("model") or "gpt-5.5"]
     errors = []
     for index, model in enumerate(models):
@@ -1848,30 +2797,32 @@ def process_queue_file(path):
     try:
         with open(path, "r") as handle:
             item = json.load(handle)
-        user_text = safe_text(item.get("content"), 4000)
+        user_text = unicode_text(item.get("content"), 4000)
         text = user_text
         incoming_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         session_id = safe_text(incoming_meta.get("sessionId"), 160).strip()
+        request_turn_id = safe_text(incoming_meta.get("turnId"), 180).strip() or turn_id()
+        started_at = time.time()
         request_message_id = item.get("id") or ""
         attachments = item.get("contextAttachments") if isinstance(item.get("contextAttachments"), list) else item.get("attachments") if isinstance(item.get("attachments"), list) else []
         display_attachments = []
         audit("queue_processing_started", {"file": os.path.basename(path), "sessionId": session_id})
         append_progress(session_id, "received", "running", "Worker picked up queued request", 5)
-        append_thinking(session_id, request_message_id, "received", "Queued request is now being processed inside the VM.")
+        append_worklog(session_id, request_turn_id, "planning", "Received this request; preparing context and attachments before deciding whether Sentaurus execution is needed.")
         if attachments:
-            append_thinking(session_id, request_message_id, "attachments", "Resolving %s attachment reference(s), including inline fallback content when provided." % len(attachments))
+            append_worklog(session_id, request_turn_id, "file", "Reading %s attachment reference(s); readable text enters context, images/binaries stay metadata-only." % len(attachments))
             attachment_text, attachment_summaries = attachment_context(session_id, attachments)
             incoming_meta["attachmentsJson"] = json.dumps(attachment_summaries, ensure_ascii=True, sort_keys=True)
             if attachment_text:
-                text = user_text + "\n\n" + safe_text(attachment_text, MAX_ATTACHMENT_CONTEXT_CHARS)
-            append_thinking(session_id, request_message_id, "attachments", "Attachment context ready: %s readable/meta item(s)." % len(attachment_summaries))
+                text = user_text + u"\n\n" + unicode_text(attachment_text, MAX_ATTACHMENT_CONTEXT_CHARS)
+            append_worklog(session_id, request_turn_id, "file", "Attachment context ready: %s readable/reference item(s)." % len(attachment_summaries))
         if wants_skill_reply(text):
             append_progress(session_id, "skill", "running", "Handling local slash-command skill", 20)
-            append_thinking(session_id, request_message_id, "skill", "Handling this request with a local VM skill.")
+            append_worklog(session_id, request_turn_id, "planning", "Handling this local VM skill request without exposing API credentials.")
         else:
             append_progress(session_id, "llm_context", "running", "Building session history and manual context", 12)
-            append_thinking(session_id, request_message_id, "context", "Building same-session context and Sentaurus manual context for the model.")
-        append_thinking(session_id, request_message_id, "llm", "Calling the VM-local configured model; credentials stay inside CentOS.")
+            append_worklog(session_id, request_turn_id, "planning", "Building same-session history context and Sentaurus manual context.")
+        append_worklog(session_id, request_turn_id, "planning", "Calling the VM-local configured model to generate a reply or safe run request.")
         reply, meta = reply_for(text, session_id, request_message_id)
         published_file_specs, reply_without_session_files = extract_vm_session_files(reply)
         published_display_attachments = []
@@ -1879,10 +2830,13 @@ def process_queue_file(path):
         for spec in published_file_specs:
             try:
                 published_display_attachments.append(publish_vm_session_file(session_id, spec))
-                append_progress(session_id, "attachment_publish", "completed", "Published image %s to session output" % safe_text(spec.get("name") or os.path.basename(safe_text(spec.get("sourcePath"), 500)), 180), 100)
+                if published_display_attachments[-1]:
+                    append_file_operation(session_id, request_turn_id, "published", published_display_attachments[-1].get("path"), published_display_attachments[-1].get("category"), published_display_attachments[-1].get("size"), session_id)
+                append_progress(session_id, "attachment_publish", "completed", "Published file %s to session output" % safe_text(spec.get("name") or os.path.basename(safe_text(spec.get("sourcePath"), 500)), 180), 100)
             except Exception as exc:
-                append_progress(session_id, "attachment_publish", "failed", "Failed to publish image: %s" % safe_text(str(exc), 300), 100)
+                append_progress(session_id, "attachment_publish", "failed", "Failed to publish file: %s" % safe_text(str(exc), 300), 100)
                 publish_errors.append(safe_text(str(exc), 300))
+                append_run_diagnostic(session_id, request_turn_id, "File publish failed: %s" % safe_text(str(exc), 300))
                 audit("vm_session_file_publish_failed", {"sessionId": session_id, "error": safe_text(str(exc), 500), "spec": spec})
         reply = reply_without_session_files
         simulation_setup, setup_visible_reply = extract_json_tag(reply, "SIMULATION_SETUP")
@@ -1890,11 +2844,11 @@ def process_queue_file(path):
             simulation_setup = normalize_simulation_setup(simulation_setup)
             meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
         run_request, visible_reply = extract_run_request(setup_visible_reply)
-        append_thinking(session_id, request_message_id, "validation", "Checking whether the model returned a safe Sentaurus run request.")
+        append_worklog(session_id, request_turn_id, "planning", "Checking whether the model returned a safely executable Sentaurus run request.")
         validation_error = run_request_validation_error(run_request, visible_reply, text)
         if validation_error:
             append_progress(session_id, "run_validation", "failed", validation_error, 100)
-            append_thinking(session_id, request_message_id, "validation", "Run request needed repair before execution.", "running")
+            append_worklog(session_id, request_turn_id, "debug", "Run request needs repair before execution; attempting safe completion/correction.")
             repaired_reply, repaired_meta = repair_run_request_reply(text, reply, validation_error, session_id, request_message_id)
             meta = repaired_meta
             if repaired_reply:
@@ -1923,8 +2877,9 @@ def process_queue_file(path):
         else:
             append_progress(session_id, "llm", "completed", "LLM produced %s" % ("a Sentaurus run request" if run_request else "a chat reply"), 35)
         if run_request:
-            append_thinking(session_id, request_message_id, "execution", "Executing the validated Sentaurus request and collecting artifacts.")
-            reply, result, attempts, simulation_setup, stop_reason = run_with_autodebug(text, run_request, visible_reply, session_id, request_message_id, simulation_setup)
+            append_worklog(session_id, request_turn_id, "tool", "Run request passed validation; executing allowlisted Sentaurus flow and collecting outputs.")
+            reply, result, attempts, simulation_setup, stop_reason = run_with_autodebug(text, run_request, visible_reply, session_id, request_message_id, request_turn_id, simulation_setup)
+            simulation_setup = enrich_setup_from_postprocess(simulation_setup or setup_from_run_request(run_request), result)
             artifacts = result.get("artifacts") or []
             display_attachments = display_attachments_for_artifacts(result.get("id") or "", artifacts)
             meta["kind"] = "sentaurus_run"
@@ -1961,32 +2916,42 @@ def process_queue_file(path):
             meta["sessionId"] = session_id
             if simulation_setup:
                 sync_session_setup_to_output(session_id, simulation_setup)
-        append_thinking(session_id, request_message_id, "complete", "Final response is ready.", "completed", True)
+        duration_ms = int((time.time() - started_at) * 1000)
+        append_worklog(session_id, request_turn_id, "final", "Final response generated; conclusions and attachments are kept separate from folded worklog.")
         has_reply_text = bool(safe_text(reply, 4000).strip())
         publish_error_text = ""
         if publish_errors:
-            publish_error_text = "Failed to publish %s image attachment%s: %s" % (len(publish_errors), "" if len(publish_errors) == 1 else "s", "; ".join(publish_errors[:3]))
+            publish_error_text = "Failed to publish %s file attachment%s: %s" % (len(publish_errors), "" if len(publish_errors) == 1 else "s", "; ".join(publish_errors[:3]))
         if display_attachments:
             text_meta = meta.copy()
             text_meta["suppressAttachmentPreview"] = True
             if has_reply_text:
-                append_message("agent", reply, "vm-agent-worker", text_meta)
+                final_text = concise_run_final_reply(visible_reply, result, attempts, stop_reason) if run_request else safe_text(reply, 4000)
+                append_run_final(session_id, request_turn_id, final_text, result if run_request else {"status": "completed"}, duration_ms)
             if publish_error_text:
                 publish_meta = {"kind": "vm_agent_attachment_publish_error"}
                 if session_id:
                     publish_meta["sessionId"] = session_id
-                append_message("agent", publish_error_text, "vm-agent-worker", publish_meta)
-            attachment_meta = meta.copy()
-            attachment_meta["kind"] = "vm_agent_attachments"
-            append_message("agent", "Generated image attachment.", "vm-agent-worker", attachment_meta, "attach", display_attachments)
+                append_run_diagnostic(session_id, request_turn_id, publish_error_text, result.get("id") if run_request else "")
+            append_attachment_message(session_id, request_turn_id, display_attachments, meta)
         else:
             if has_reply_text or not publish_error_text:
-                append_message("agent", reply, "vm-agent-worker", meta)
+                if run_request:
+                    append_run_final(session_id, request_turn_id, concise_run_final_reply(visible_reply, result, attempts, stop_reason), result, duration_ms)
+                else:
+                    reply_meta = meta.copy()
+                    reply_meta["turnId"] = request_turn_id
+                    reply_meta["groupId"] = request_turn_id
+                    reply_meta["sessionId"] = session_id
+                    reply_meta["kind"] = reply_meta.get("kind") or "run_final"
+                    reply_meta["foldable"] = False
+                    reply_meta["collapsedByDefault"] = False
+                    append_message("agent", reply, "vm-agent-worker", reply_meta, "final")
             if publish_error_text:
                 publish_meta = {"kind": "vm_agent_attachment_publish_error"}
                 if session_id:
                     publish_meta["sessionId"] = session_id
-                append_message("agent", publish_error_text, "vm-agent-worker", publish_meta)
+                append_run_diagnostic(session_id, request_turn_id, publish_error_text, result.get("id") if run_request else "")
         shutil.move(path, os.path.join(DONE_DIR, os.path.basename(path)))
         audit("queue_processed", {"file": os.path.basename(path), "replyKind": meta.get("kind")})
     except Exception as exc:
@@ -2014,14 +2979,14 @@ def main():
     audit("worker_stopped", {})
 
 if __name__ == "__main__":
-    main()
-`;
+    main()`;
 
 const remoteControlScript = String.raw`# -*- coding: utf-8 -*-
 import base64
 import datetime
 import glob
 import getpass
+import hashlib
 import json
 import os
 import signal
@@ -2030,11 +2995,14 @@ import subprocess
 import sys
 import time
 import uuid
+import zlib
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.5.0"
+AGENT_VERSION = "0.6.0"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
+DFISE_EXTRACTOR_SOURCE_B64 = "__DFISE_EXTRACTOR_SOURCE_B64__"
+DFISE_EXTRACTOR_SHA256 = "__DFISE_EXTRACTOR_SHA256__"
 
 try:
     string_types = (basestring,)
@@ -2048,6 +3016,9 @@ DONE_DIR = os.path.join(ROOT, "processed")
 MESSAGES_PATH = os.path.join(ROOT, "messages.jsonl")
 AUDIT_PATH = os.path.join(ROOT, "audit.jsonl")
 WORKER_PATH = os.path.join(ROOT, "agent_worker.py")
+DFISE_EXTRACTOR_PATH = os.path.join(ROOT, "dfise_idvg_extract.py")
+CAPABILITIES_DIR = os.path.join(ROOT, "capabilities")
+DFISE_CAPABILITY_PATH = os.path.join(CAPABILITIES_DIR, "dfise-plt-postprocess-v1.json")
 PID_PATH = os.path.join(ROOT, "agent_worker.pid")
 LOG_PATH = os.path.join(ROOT, "agent_worker.log")
 CONFIG_EXAMPLE_PATH = os.path.join(ROOT, "config.example.json")
@@ -2072,6 +3043,26 @@ def load_json_b64(value):
     except AttributeError:
         text = raw
     return json.loads(text)
+
+def emit_payload(payload):
+    serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    if payload.get("historyCompacted"):
+        raw = serialized.encode("utf-8")
+        compressed = zlib.compress(raw, 6)
+        encoded = base64.b64encode(compressed)
+        try:
+            encoded = encoded.decode("ascii")
+        except AttributeError:
+            pass
+        print(json.dumps({
+            "ok": True,
+            "transportEncoding": "zlib-base64-json",
+            "payloadB64": encoded,
+            "compressedBytes": len(compressed),
+            "uncompressedBytes": len(raw),
+        }, ensure_ascii=True, sort_keys=True))
+    else:
+        print(serialized)
 
 def safe_text(value, limit=4000):
     if value is None:
@@ -2109,6 +3100,7 @@ def append_message(role, content, source, meta=None, id_prefix=None, display_att
 def read_messages(after=0, limit=50, session_id=""):
     cursor = 0
     messages = []
+    incremental = after > 0
     session_id = safe_text(session_id, 160).strip()
     if os.path.exists(MESSAGES_PATH):
         with open(MESSAGES_PATH, "r") as handle:
@@ -2129,9 +3121,282 @@ def read_messages(after=0, limit=50, session_id=""):
                         continue
                 item["sequence"] = cursor
                 messages.append(item)
-    if limit > 0 and len(messages) > limit:
+                if incremental and limit > 0 and len(messages) >= limit:
+                    return messages, cursor
+    if not incremental and limit > 0 and len(messages) > limit:
         messages = messages[-limit:]
     return messages, cursor
+
+def message_meta(item):
+    value = item.get("meta") if isinstance(item, dict) else {}
+    return value if isinstance(value, dict) else {}
+
+def message_kind(item):
+    return safe_text(message_meta(item).get("kind"), 120).strip()
+
+def message_stream_state(item):
+    meta = message_meta(item)
+    return safe_text(meta.get("streamState") or meta.get("status"), 120).strip().lower()
+
+def message_turn_id(item):
+    meta = message_meta(item)
+    return safe_text(meta.get("turnId") or meta.get("groupId"), 180).strip()
+
+def message_target_id(item, turn_id_value=""):
+    meta = message_meta(item)
+    target = safe_text(meta.get("targetMessageId") or meta.get("messageId") or meta.get("streamId"), 220).strip()
+    if target:
+        return target
+    return ("assistant_%s" % turn_id_value) if turn_id_value else ""
+
+def is_response_delta(item):
+    meta = message_meta(item)
+    return item.get("role") == "agent" and (message_kind(item) == "agent_response_delta" or meta.get("delta") is True)
+
+def is_response_terminal(item):
+    if item.get("role") != "agent":
+        return False
+    meta = message_meta(item)
+    kind = message_kind(item)
+    state = message_stream_state(item)
+    has_stream_identity = bool(message_target_id(item, message_turn_id(item)))
+    return (
+        kind in ["agent_response_done", "agent_response_error"]
+        or meta.get("done") is True
+        or (has_stream_identity and state in ["done", "completed", "final", "error"])
+    )
+
+def is_response_stream_message(item):
+    if item.get("role") != "agent":
+        return False
+    meta = message_meta(item)
+    kind = message_kind(item)
+    state = message_stream_state(item)
+    has_stream_identity = bool(message_target_id(item, message_turn_id(item)))
+    return (
+        is_response_delta(item)
+        or is_response_terminal(item)
+        or kind == "agent_response_stream"
+        or meta.get("done") is False
+        or (has_stream_identity and state in ["queued", "running", "streaming"])
+    )
+
+def attachment_key(attachment):
+    if not isinstance(attachment, dict):
+        return ""
+    parts = [
+        safe_text(attachment.get("source"), 220),
+        safe_text(attachment.get("runId"), 220),
+        safe_text(attachment.get("category"), 220),
+        safe_text(attachment.get("path"), 1000),
+    ]
+    primary = ":".join(parts)
+    if primary.replace(":", ""):
+        return primary
+    return ":".join([
+        safe_text(attachment.get("id"), 220),
+        safe_text(attachment.get("name"), 500),
+    ])
+
+def compacted_attachments(group):
+    attachments = []
+    seen = set()
+    for item in group:
+        values = item.get("attachments") if isinstance(item, dict) else None
+        if not isinstance(values, list):
+            continue
+        for attachment in values:
+            key = attachment_key(attachment)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            attachments.append(attachment)
+    return attachments
+
+def message_sequence(item):
+    value = item.get("sequence") if isinstance(item, dict) else 0
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+def compact_delta_content(deltas, max_content_chars):
+    content = ""
+    truncated = False
+    for item in deltas:
+        chunk = item.get("content") if isinstance(item.get("content"), string_types) else ""
+        if not chunk:
+            continue
+        meta = message_meta(item)
+        if meta.get("append") is True:
+            content += chunk
+        elif meta.get("append") is False or chunk.startswith(content):
+            content = chunk
+        elif content.startswith(chunk) or content.endswith(chunk):
+            continue
+        else:
+            content += chunk
+        if len(content) > max_content_chars:
+            content = content[:max_content_chars]
+            truncated = True
+            break
+    return content, truncated
+
+def compact_session_history(messages, max_content_chars=1048576):
+    groups = {}
+    stream_sequences = set()
+    for item in messages:
+        if not isinstance(item, dict) or not is_response_stream_message(item):
+            continue
+        turn_id_value = message_turn_id(item)
+        target_id = message_target_id(item, turn_id_value)
+        if not target_id:
+            continue
+        key = "%s:%s" % (turn_id_value, target_id)
+        groups.setdefault(key, []).append(item)
+        stream_sequences.add(message_sequence(item))
+
+    if not groups:
+        return list(messages), False
+
+    compacted = []
+    any_content_truncated = False
+    for key, group in groups.items():
+        group.sort(key=message_sequence)
+        terminal = None
+        for item in reversed(group):
+            if is_response_terminal(item):
+                terminal = item
+                break
+        deltas = [item for item in group if is_response_delta(item)]
+        first = group[0]
+        last = terminal or group[-1]
+        terminal_content = terminal.get("content") if terminal and isinstance(terminal.get("content"), string_types) else ""
+        if terminal_content:
+            content = terminal_content
+            content_truncated = False
+        else:
+            content, content_truncated = compact_delta_content(deltas, max_content_chars)
+        if not content and isinstance(last.get("content"), string_types):
+            content = last.get("content")
+        if len(content) > max_content_chars:
+            content = content[:max_content_chars]
+            content_truncated = True
+        any_content_truncated = any_content_truncated or content_truncated
+
+        turn_id_value = message_turn_id(last) or message_turn_id(first)
+        target_id = message_target_id(last, turn_id_value) or message_target_id(first, turn_id_value) or last.get("id")
+        merged_meta = {}
+        merged_meta.update(message_meta(first))
+        merged_meta.update(message_meta(last))
+        merged_meta["kind"] = "agent_response_done" if terminal else "agent_response_stream"
+        if turn_id_value:
+            merged_meta["turnId"] = turn_id_value
+        if target_id:
+            merged_meta["targetMessageId"] = target_id
+        merged_meta["streamState"] = "done" if terminal else "streaming"
+        merged_meta["done"] = bool(terminal)
+        merged_meta["compacted"] = True
+        merged_meta["deltaCount"] = len(deltas)
+        if content_truncated:
+            merged_meta["contentTruncated"] = True
+            merged_meta["contentLimitChars"] = max_content_chars
+
+        compacted_item = dict(last)
+        compacted_item["id"] = target_id or last.get("id")
+        compacted_item["role"] = "agent"
+        compacted_item["content"] = content
+        compacted_item["createdAt"] = first.get("createdAt") or last.get("createdAt")
+        if first.get("vmCreatedAt"):
+            compacted_item["vmCreatedAt"] = first.get("vmCreatedAt")
+        compacted_item["sequence"] = message_sequence(last)
+        compacted_item["meta"] = merged_meta
+        attachments = compacted_attachments(group)
+        if attachments:
+            compacted_item["attachments"] = attachments
+        elif "attachments" in compacted_item:
+            del compacted_item["attachments"]
+        compacted.append(compacted_item)
+
+    preserved = [
+        item for item in messages
+        if not isinstance(item, dict) or message_sequence(item) not in stream_sequences
+    ]
+    combined = preserved + compacted
+    combined.sort(key=message_sequence)
+    return combined, any_content_truncated
+
+def json_bytes(value):
+    encoded = json.dumps(value, ensure_ascii=True, sort_keys=True)
+    try:
+        return len(encoded.encode("utf-8"))
+    except AttributeError:
+        return len(encoded)
+
+def fit_message_to_budget(item, byte_budget):
+    if json_bytes(item) <= byte_budget:
+        return item, False
+    fitted = dict(item)
+    content = fitted.get("content") if isinstance(fitted.get("content"), string_types) else ""
+    meta = dict(message_meta(fitted))
+    meta["contentTruncated"] = True
+    meta["originalContentChars"] = len(content)
+    fitted["meta"] = meta
+    suffix = "\n\n[History message truncated to fit the transport budget.]"
+    low = 0
+    high = len(content)
+    while low < high:
+        middle = (low + high + 1) // 2
+        fitted["content"] = content[:middle] + suffix
+        if json_bytes(fitted) <= byte_budget:
+            low = middle
+        else:
+            high = middle - 1
+    fitted["content"] = content[:low] + suffix
+    return fitted, True
+
+def trim_history_response(messages, limit, byte_budget):
+    limited = list(messages)
+    truncated = False
+    continuation = None
+    if limit > 0 and len(limited) > limit:
+        limited = limited[-limit:]
+        truncated = True
+
+    retained_reversed = []
+    payload_bytes = 2
+    for item in reversed(limited):
+        remaining_budget = max(16384, byte_budget - payload_bytes - 1)
+        fitted_item, item_truncated = fit_message_to_budget(item, remaining_budget)
+        item_bytes = json_bytes(fitted_item) + (1 if retained_reversed else 0)
+        if retained_reversed and payload_bytes + item_bytes > byte_budget:
+            truncated = True
+            break
+        retained_reversed.append(fitted_item)
+        payload_bytes += item_bytes
+        truncated = truncated or item_truncated
+    retained = list(reversed(retained_reversed))
+    if len(retained) < len(limited):
+        truncated = True
+    if truncated and retained:
+        continuation = str(message_sequence(retained[0]))
+    return retained, truncated, continuation, payload_bytes
+
+def read_compacted_session_history(session_id, limit=5000, history_before=0, byte_budget=4194304):
+    raw_messages, cursor = read_messages(0, 0, session_id)
+    if history_before > 0:
+        raw_messages = [item for item in raw_messages if message_sequence(item) < history_before]
+    compacted, content_truncated = compact_session_history(raw_messages, max(65536, byte_budget // 2))
+    messages, truncated, continuation, payload_bytes = trim_history_response(compacted, limit, byte_budget)
+    truncated = truncated or content_truncated
+    return messages, cursor, {
+        "historyCompacted": True,
+        "rawCount": len(raw_messages),
+        "compactedCount": len(compacted),
+        "payloadBytes": payload_bytes,
+        "truncated": truncated,
+        "continuation": continuation,
+    }
 
 def message_count():
     _messages, cursor = read_messages(0, 0)
@@ -2367,9 +3632,13 @@ def read_pid():
         return None
     try:
         with open(PID_PATH, "r") as handle:
-            return int(handle.read().strip())
+            for line in handle:
+                line = line.strip()
+                if line:
+                    return int(line)
     except Exception:
         return None
+    return None
 
 def pid_alive(pid):
     if not pid:
@@ -2389,10 +3658,33 @@ def write_worker_files():
     ensure_dir(QUEUE_DIR)
     ensure_dir(DONE_DIR)
     ensure_dir(MANUALS_DIR)
+    ensure_dir(CAPABILITIES_DIR)
     worker_source = base64.b64decode(WORKER_SOURCE_B64)
     with open(WORKER_PATH, "wb") as handle:
         handle.write(worker_source)
     os.chmod(WORKER_PATH, 0o700)
+    extractor_source = base64.b64decode(DFISE_EXTRACTOR_SOURCE_B64)
+    extractor_hash = hashlib.sha256(extractor_source).hexdigest()
+    if extractor_hash != DFISE_EXTRACTOR_SHA256:
+        raise ValueError("DF-ISE extractor source hash mismatch")
+    with open(DFISE_EXTRACTOR_PATH, "wb") as handle:
+        handle.write(extractor_source)
+    os.chmod(DFISE_EXTRACTOR_PATH, 0o700)
+    with open(DFISE_CAPABILITY_PATH, "w") as handle:
+        handle.write(json.dumps({
+            "ruleId": "dfise-plt-postprocess-v1",
+            "extractorVersion": "dfise-idvg-extract/1",
+            "metricProfile": "tcad-idvg-v1",
+            "extractorSha256": extractor_hash,
+            "parserPath": DFISE_EXTRACTOR_PATH,
+            "rules": [
+                "Use the fixed dfise-idvg-v1 postprocess for readable DF-ISE .plt Id-Vg extraction.",
+                "Do not generate Inspect cv_* extraction or dynamic Tcl/Python parsers.",
+                "Read actual drain biases from file content and reject expected-bias mismatches.",
+                "Declare success only when all required finite metrics are present.",
+                "Publish non-image outputs as general files and PNG outputs as images."
+            ]
+        }, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
     if not os.path.exists(CONFIG_EXAMPLE_PATH):
         with open(CONFIG_EXAMPLE_PATH, "w") as handle:
             handle.write(json.dumps({
@@ -2445,7 +3737,7 @@ def start_worker(force_restart=False):
     time.sleep(0.2)
     return proc.pid
 
-def build_status():
+def build_status(message_count_value=None):
     instances = list_instances()
     running, pid = worker_running()
     llm_config = load_config()
@@ -2460,7 +3752,7 @@ def build_status():
         "instanceCount": len(instances),
         "latestInstance": instances[-1] if instances else None,
         "mailbox": "~/.sentaurus-web-agent/vm-agent",
-        "messageCount": message_count(),
+        "messageCount": message_count() if message_count_value is None else message_count_value,
         "workerRunning": running,
         "workerPid": pid if running else None,
         "llmConfigured": bool(llm_config.get("api_base") and llm_config.get("api_key")),
@@ -2475,12 +3767,16 @@ def build_status():
         "vmEpochMs": int(time.time() * 1000),
     }
 
-def enqueue_message(content, session_id=None, attachments=None, display_attachments=None):
+def enqueue_message(content, session_id=None, turn_id_value="", attachments=None, display_attachments=None):
     ensure_dir(QUEUE_DIR)
     meta = {"kind": "web_message", "queuedFor": "vm-agent-worker"}
     session_id = safe_text(session_id, 160).strip()
     if session_id:
         meta["sessionId"] = session_id
+    turn_id_value = safe_text(turn_id_value, 180).strip() or turn_id()
+    meta["turnId"] = turn_id_value
+    meta["groupId"] = turn_id_value
+    meta["protocolVersion"] = 2
     attachment_refs = normalize_attachment_refs(attachments)
     if attachment_refs:
         meta["attachmentCount"] = len(attachment_refs)
@@ -2501,7 +3797,11 @@ def handle(request):
     after = int(request.get("after") or 0)
     limit = int(request.get("limit") or 50)
     session_id = safe_text(request.get("sessionId"), 160).strip()
+    history_before = max(0, int(request.get("historyBefore") or 0))
+    response_byte_budget = max(65536, min(int(request.get("responseByteBudget") or 4194304), 16777216))
     messages = []
+    cursor = 0
+    history_meta = {}
 
     if operation == "start":
         pid = start_worker(True)
@@ -2511,23 +3811,35 @@ def handle(request):
         if not incoming.strip():
             raise ValueError("message is required")
         start_worker()
-        messages = [enqueue_message(incoming, session_id, request.get("attachments"), request.get("displayAttachments"))]
+        messages = [enqueue_message(incoming, session_id, request.get("turnId"), request.get("attachments"), request.get("displayAttachments"))]
     elif operation == "history":
-        messages, _cursor = read_messages(after, limit, session_id)
+        if after == 0 and session_id:
+            messages, cursor, history_meta = read_compacted_session_history(
+                session_id,
+                limit,
+                history_before,
+                response_byte_budget,
+            )
+        else:
+            messages, cursor = read_messages(after, limit, session_id)
     elif operation == "status":
-        messages, _cursor = read_messages(max(0, message_count() - limit), limit)
+        count = message_count()
+        messages, cursor = read_messages(max(0, count - limit), limit)
     else:
         raise ValueError("unsupported operation: %s" % operation)
 
-    status = build_status()
-    _all, cursor = read_messages(0, 0)
+    if cursor <= 0:
+        _all, cursor = read_messages(0, 0)
+    status = build_status(cursor)
     payload = status.copy()
     payload["messages"] = messages
     payload["cursor"] = cursor
+    payload["protocolVersion"] = 2
+    payload.update(history_meta)
     return payload
 
 try:
-    print(json.dumps(handle(load_json_b64(REQUEST_B64)), ensure_ascii=True, sort_keys=True))
+    emit_payload(handle(load_json_b64(REQUEST_B64)))
     print("REMOTE_AGENT_DONE")
 except Exception as exc:
     error_payload = {
@@ -2545,6 +3857,7 @@ except Exception as exc:
 
 const remoteArtifactDownloadScript = String.raw`# -*- coding: utf-8 -*-
 import base64
+import hashlib
 import json
 import os
 import re
@@ -2554,6 +3867,7 @@ REQUEST_B64 = "__ARTIFACT_REQUEST_B64__"
 HOME = os.path.expanduser("~")
 RUNS_DIR = os.path.join(HOME, "STDB", "web-agent-runs")
 MAX_BYTES = __MAX_VM_ARTIFACT_BYTES__
+STAGED_PATH = "__ARTIFACT_STAGED_PATH__"
 ALLOWED_EXT = set([".log", ".out", ".err", ".plt", ".tdr", ".grd", ".dat", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".json", ".cmd", ".des", ".par", ".scm", ".tcl", ".bnd", ".sat"])
 
 try:
@@ -2565,7 +3879,15 @@ def respond(payload):
     print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
     print("REMOTE_ARTIFACT_DONE")
 
+def cleanup_staged():
+    try:
+        if os.path.isfile(STAGED_PATH):
+            os.remove(STAGED_PATH)
+    except Exception:
+        pass
+
 def fail(message, status_code=400):
+    cleanup_staged()
     respond({"ok": False, "error": message, "statusCode": status_code})
     sys.exit(0)
 
@@ -2597,7 +3919,19 @@ def safe_segments(rel_path):
         parts.append(part)
     return parts
 
+def sha256_path(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
 try:
+    if not re.match(r"^/tmp/sentaurus-web-artifact-[A-Za-z0-9-]{12,120}$", STAGED_PATH):
+        fail("invalid artifact staging path", 500)
     request = load_request()
     run_id = safe_text(request.get("runId"), 180).strip()
     if not re.match(r"^run_[A-Za-z0-9_-]+$", run_id):
@@ -2606,8 +3940,8 @@ try:
     ext = os.path.splitext(parts[-1])[1].lower()
     if ext not in ALLOWED_EXT:
         fail("artifact extension is not allowlisted")
-    run_dir = os.path.abspath(os.path.join(RUNS_DIR, run_id))
-    target = os.path.abspath(os.path.join(run_dir, *parts))
+    run_dir = os.path.realpath(os.path.join(RUNS_DIR, run_id))
+    target = os.path.realpath(os.path.join(run_dir, *parts))
     if target != run_dir and not target.startswith(run_dir + os.sep):
         fail("artifact path escapes run directory")
     if not os.path.isfile(target):
@@ -2615,18 +3949,24 @@ try:
     size = os.path.getsize(target)
     if size > MAX_BYTES:
         fail("artifact is too large to download through the web relay", 413)
-    with open(target, "rb") as handle:
-        content = base64.b64encode(handle.read())
-    try:
-        content = content.decode("ascii")
-    except AttributeError:
-        pass
+    if os.path.lexists(STAGED_PATH):
+        fail("artifact staging path already exists", 500)
+    with open(target, "rb") as source:
+        with open(STAGED_PATH, "wb") as destination:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                destination.write(chunk)
+    staged_size = os.path.getsize(STAGED_PATH)
+    if staged_size != size or staged_size > MAX_BYTES:
+        fail("artifact staging size mismatch", 500)
     respond({
         "ok": True,
         "path": "/".join(parts),
         "fileName": os.path.basename(target),
-        "size": size,
-        "contentB64": content,
+        "size": staged_size,
+        "sha256": sha256_path(STAGED_PATH),
     })
 except SystemExit:
     raise
@@ -2634,43 +3974,144 @@ except Exception as exc:
     fail(str(exc), 500)
 `;
 
-function remoteAgentScript(request: RemoteAgentRequest): string {
-  const encodedRequest = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
-  const encodedWorker = Buffer.from(remoteWorkerScript, "utf8").toString("base64");
-  return remoteControlScript
+const remoteAgentsMdScript = String.raw`# -*- coding: utf-8 -*-
+import base64
+import datetime
+import hashlib
+import json
+import os
+import sys
+import tempfile
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
+
+REQUEST_B64 = "__REQUEST_B64__"
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
+TARGET_PATH = os.path.join(ROOT, "AGENTS.md")
+MAX_BYTES = __MAX_VM_AGENTS_MD_BYTES__
+
+def load_request():
+    raw = base64.b64decode(REQUEST_B64)
+    return json.loads(raw.decode("utf-8"))
+
+def ensure_dir(path):
+    if not os.path.isdir(path):
+        os.makedirs(path)
+
+def fail(message, status_code=400):
+    print(json.dumps({"ok": False, "error": message, "statusCode": status_code}, ensure_ascii=True, sort_keys=True))
+    sys.exit(0)
+
+def sha256_text(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+def emit_payload(content, exists):
+    payload = {
+        "ok": True,
+        "path": TARGET_PATH,
+        "exists": bool(exists),
+        "content": content,
+        "size": len(content.encode("utf-8")),
+        "sha256": sha256_text(content),
+    }
+    if exists and os.path.exists(TARGET_PATH):
+        stat = os.stat(TARGET_PATH)
+        payload["updatedAt"] = datetime.datetime.utcfromtimestamp(stat.st_mtime).replace(microsecond=0).isoformat() + "Z"
+    print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+
+try:
+    request = load_request()
+    operation = (request.get("operation") or "get").strip().lower()
+    if operation == "get":
+        if not os.path.exists(TARGET_PATH):
+            emit_payload("", False)
+        else:
+            with open(TARGET_PATH, "rb") as handle:
+                emit_payload(handle.read().decode("utf-8", "replace"), True)
+    elif operation == "put":
+        content = request.get("content")
+        if not isinstance(content, string_types):
+            fail("content must be a string")
+        content_bytes = content.encode("utf-8")
+        if len(content_bytes) > MAX_BYTES:
+            fail("AGENTS.md content exceeds the VM relay size limit", 413)
+        ensure_dir(ROOT)
+        fd, temp_path = tempfile.mkstemp(prefix="agents-md-", dir=ROOT)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content_bytes)
+            os.rename(temp_path, TARGET_PATH)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        emit_payload(content, True)
+    else:
+        fail("unsupported operation", 400)
+except SystemExit:
+    raise
+except Exception as exc:
+    fail(str(exc), 500)
+`;
+
+function remoteAgentsMdRequestScript(operation: "get" | "put", content = ""): string {
+  const encodedRequest = Buffer.from(JSON.stringify({ operation, content }), "utf8").toString("base64");
+  return remoteAgentsMdScript
     .replace("__REQUEST_B64__", encodedRequest)
-    .replace("__WORKER_SOURCE_B64__", encodedWorker);
+    .replace("__MAX_VM_AGENTS_MD_BYTES__", String(maxVmAgentsMdBytes));
 }
 
-function remoteArtifactScript(runId: string, artifactPath: string): string {
+function parseVmAgentAgentsMdPayload(raw: string): VmAgentAgentsMdPayload {
+  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const jsonLine = [...lines].reverse().find((line) => line.startsWith("{") && line.endsWith("}"));
+  if (!jsonLine) throw httpError(502, `VM AGENTS.md relay did not return JSON: ${raw.slice(0, 500)}`);
+  return JSON.parse(jsonLine) as VmAgentAgentsMdPayload;
+}
+
+export function remoteAgentScript(request: RemoteAgentRequest): string {
+  const encodedRequest = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
+  const workerSource = localWorkerSource.replace(
+    /DFISE_EXTRACTOR_SHA256\s*=\s*"[0-9a-f]+"/,
+    `DFISE_EXTRACTOR_SHA256 = "${dfiseExtractorSha256}"`
+  );
+  const encodedWorker = Buffer.from(workerSource, "utf8").toString("base64");
+  const encodedExtractor = Buffer.from(dfiseExtractorSource, "utf8").toString("base64");
+  return remoteControlScript
+    .replace("__REQUEST_B64__", encodedRequest)
+    .replace("__WORKER_SOURCE_B64__", encodedWorker)
+    .replace("__DFISE_EXTRACTOR_SOURCE_B64__", encodedExtractor)
+    .replace("__DFISE_EXTRACTOR_SHA256__", dfiseExtractorSha256);
+}
+
+export function remoteArtifactScript(runId: string, artifactPath: string, stagedPath: string): string {
   const encodedRequest = Buffer.from(JSON.stringify({ runId, path: artifactPath }), "utf8").toString("base64");
   return remoteArtifactDownloadScript
     .replace("__ARTIFACT_REQUEST_B64__", encodedRequest)
+    .replace("__ARTIFACT_STAGED_PATH__", stagedPath)
     .replace("__MAX_VM_ARTIFACT_BYTES__", String(maxVmArtifactBytes));
 }
 
-function parseRemoteJson(raw: string): RemoteAgentPayload {
+export function parseRemoteJson(raw: string): RemoteAgentPayload {
   const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const jsonLine = [...lines].reverse().find((line) => line.startsWith("{") && line.endsWith("}"));
   if (!jsonLine) throw new Error(`VM agent did not return JSON: ${raw.slice(0, 500)}`);
-  return JSON.parse(jsonLine) as RemoteAgentPayload;
-}
-
-type RemoteArtifactPayload = {
-  ok?: boolean;
-  error?: string;
-  statusCode?: number;
-  path?: string;
-  fileName?: string;
-  size?: number;
-  contentB64?: string;
-};
-
-function parseRemoteArtifactJson(raw: string): RemoteArtifactPayload {
-  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const jsonLine = [...lines].reverse().find((line) => line.startsWith("{") && line.endsWith("}"));
-  if (!jsonLine) throw httpError(502, `VM artifact download did not return JSON: ${raw.slice(0, 500)}`);
-  return JSON.parse(jsonLine) as RemoteArtifactPayload;
+  const parsed = JSON.parse(jsonLine) as RemoteAgentPayload & {
+    transportEncoding?: string;
+    payloadB64?: string;
+    compressedBytes?: number;
+    uncompressedBytes?: number;
+  };
+  if (parsed.transportEncoding !== "zlib-base64-json") return parsed;
+  if (typeof parsed.payloadB64 !== "string") throw new Error("VM agent compressed response is missing payloadB64");
+  const payload = JSON.parse(inflateSync(Buffer.from(parsed.payloadB64, "base64")).toString("utf8")) as RemoteAgentPayload;
+  return {
+    ...payload,
+    transportCompressedBytes: parsed.compressedBytes,
+    transportUncompressedBytes: parsed.uncompressedBytes
+  };
 }
 
 function httpError(statusCode: number, message: string): Error & { statusCode: number } {
@@ -2815,6 +4256,17 @@ function adjustedTimestamp(value: unknown, clockSkewMs: number | undefined, fall
   return typeof value === "string" && value.trim() ? value : fallback;
 }
 
+function normalizeMessageMeta(value: unknown): VmAgentMessage["meta"] {
+  if (!value || typeof value !== "object") return undefined;
+  const meta: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (item === null || typeof item === "string" || typeof item === "number" || typeof item === "boolean") {
+      meta[key] = item;
+    }
+  }
+  return Object.keys(meta).length > 0 ? meta as VmAgentMessage["meta"] : undefined;
+}
+
 function normalizeDisplayAttachments(value: unknown): VmAgentMessage["attachments"] {
   if (!Array.isArray(value)) return undefined;
   const attachments = value.flatMap((item): NonNullable<VmAgentMessage["attachments"]> => {
@@ -2843,7 +4295,7 @@ function normalizeDisplayAttachments(value: unknown): VmAgentMessage["attachment
   return attachments.length ? attachments : undefined;
 }
 
-function normalizeMessages(messages: unknown[] | undefined, payload: RemoteAgentPayload): VmAgentMessage[] {
+export function normalizeMessages(messages: unknown[] | undefined, payload: RemoteAgentPayload): VmAgentMessage[] {
   if (!Array.isArray(messages)) return [];
   const hostReceivedAt = payload.hostReceivedAt || new Date().toISOString();
   return messages.flatMap((message) => {
@@ -2860,10 +4312,152 @@ function normalizeMessages(messages: unknown[] | undefined, payload: RemoteAgent
       vmCreatedAt,
       hostReceivedAt,
       sequence,
-      meta: item.meta,
+      meta: normalizeMessageMeta(item.meta),
       attachments: normalizeDisplayAttachments(item.attachments)
     }];
   });
+}
+
+function normalizedMessageKind(message: VmAgentMessage): string {
+  return typeof message.meta?.kind === "string" ? message.meta.kind : "";
+}
+
+function normalizedStreamState(message: VmAgentMessage): string {
+  const value = message.meta?.streamState ?? message.meta?.status;
+  return typeof value === "string" ? value.toLowerCase() : "";
+}
+
+function normalizedTurnId(message: VmAgentMessage): string | undefined {
+  const value = message.meta?.turnId ?? message.meta?.groupId;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function normalizedTargetMessageId(message: VmAgentMessage, turnId?: string): string | undefined {
+  const target = message.meta?.targetMessageId ?? message.meta?.messageId ?? message.meta?.streamId;
+  if (typeof target === "string" && target.trim()) return target.trim();
+  return turnId ? `assistant_${turnId}` : undefined;
+}
+
+function isResponseDelta(message: VmAgentMessage): boolean {
+  return message.role === "agent" && (normalizedMessageKind(message) === "agent_response_delta" || message.meta?.delta === true);
+}
+
+function isResponseTerminal(message: VmAgentMessage): boolean {
+  const kind = normalizedMessageKind(message);
+  const state = normalizedStreamState(message);
+  const hasStreamIdentity = !!normalizedTargetMessageId(message, normalizedTurnId(message));
+  return message.role === "agent" && (
+    kind === "agent_response_done"
+    || kind === "agent_response_error"
+    || message.meta?.done === true
+    || (hasStreamIdentity && (state === "done" || state === "completed" || state === "final" || state === "error"))
+  );
+}
+
+function isResponseStreamMessage(message: VmAgentMessage): boolean {
+  if (message.role !== "agent") return false;
+  const kind = normalizedMessageKind(message);
+  const state = normalizedStreamState(message);
+  const hasStreamIdentity = !!normalizedTargetMessageId(message, normalizedTurnId(message));
+  return isResponseDelta(message)
+    || isResponseTerminal(message)
+    || kind === "agent_response_stream"
+    || message.meta?.done === false
+    || (hasStreamIdentity && (state === "queued" || state === "running" || state === "streaming"));
+}
+
+function messageSortValue(message: VmAgentMessage): number {
+  const parsed = Date.parse(message.createdAt);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sortMessagesBySequence(messages: VmAgentMessage[]): VmAgentMessage[] {
+  return [...messages].sort((a, b) => {
+    const aSequence = typeof a.sequence === "number" && Number.isFinite(a.sequence) ? a.sequence : null;
+    const bSequence = typeof b.sequence === "number" && Number.isFinite(b.sequence) ? b.sequence : null;
+    if (aSequence !== null && bSequence !== null && aSequence !== bSequence) return aSequence - bSequence;
+    return messageSortValue(a) - messageSortValue(b);
+  });
+}
+
+function attachmentKey(attachment: NonNullable<VmAgentMessage["attachments"]>[number]): string {
+  return [
+    attachment.source || "",
+    attachment.runId || "",
+    attachment.category || "",
+    attachment.path || "",
+    attachment.id || "",
+    attachment.name || ""
+  ].join(":");
+}
+
+function compactedAttachments(messages: VmAgentMessage[]): VmAgentMessage["attachments"] {
+  const terminal = [...messages].reverse().find((message) => isResponseTerminal(message) && message.attachments?.length);
+  if (terminal?.attachments?.length) return terminal.attachments;
+
+  const byKey = new Map<string, NonNullable<VmAgentMessage["attachments"]>[number]>();
+  for (const message of messages) {
+    for (const attachment of message.attachments || []) byKey.set(attachmentKey(attachment), attachment);
+  }
+  return byKey.size > 0 ? [...byKey.values()] : undefined;
+}
+
+function compactSessionHistory(messages: VmAgentMessage[]): VmAgentMessage[] {
+  const sorted = sortMessagesBySequence(messages);
+  const streamGroups = new Map<string, VmAgentMessage[]>();
+  const streamMessageIds = new Set<string>();
+
+  for (const message of sorted) {
+    if (!isResponseStreamMessage(message)) continue;
+    const turnId = normalizedTurnId(message);
+    const targetMessageId = normalizedTargetMessageId(message, turnId);
+    if (!targetMessageId) continue;
+    const groupKey = `${turnId || ""}:${targetMessageId}`;
+    const group = streamGroups.get(groupKey) || [];
+    group.push(message);
+    streamGroups.set(groupKey, group);
+    streamMessageIds.add(message.id);
+  }
+
+  if (streamGroups.size === 0) return sorted;
+
+  const compacted: VmAgentMessage[] = [];
+  for (const [groupKey, group] of streamGroups) {
+    const groupSorted = sortMessagesBySequence(group);
+    const terminal = [...groupSorted].reverse().find(isResponseTerminal);
+    const deltaMessages = groupSorted.filter(isResponseDelta);
+    const finalWithContent = terminal && terminal.content.trim() ? terminal : undefined;
+    const [turnId, targetMessageId] = groupKey.split(":");
+    const content = finalWithContent ? finalWithContent.content : deltaMessages.map((message) => message.content).join("");
+    const lastMessage = terminal || groupSorted.at(-1);
+    const firstMessage = groupSorted[0];
+    if (!lastMessage || !firstMessage || !content) continue;
+
+    compacted.push({
+      ...lastMessage,
+      id: targetMessageId || normalizedTargetMessageId(lastMessage, turnId) || lastMessage.id,
+      role: "agent",
+      content,
+      createdAt: firstMessage.createdAt,
+      vmCreatedAt: firstMessage.vmCreatedAt,
+      sequence: lastMessage.sequence,
+      meta: {
+        ...firstMessage.meta,
+        ...lastMessage.meta,
+        kind: terminal ? "agent_response_done" : "agent_response_stream",
+        turnId: turnId || normalizedTurnId(lastMessage),
+        targetMessageId: targetMessageId || normalizedTargetMessageId(lastMessage, turnId),
+        streamState: terminal ? "done" : "streaming",
+        done: !!terminal,
+        compacted: true,
+        deltaCount: deltaMessages.length
+      },
+      attachments: compactedAttachments(groupSorted)
+    });
+  }
+
+  const preserved = sorted.filter((message) => !streamMessageIds.has(message.id));
+  return sortMessagesBySequence([...preserved, ...compacted]);
 }
 
 function toStatus(payload: RemoteAgentPayload): VmAgentStatus {
@@ -2924,12 +4518,61 @@ function fallbackAgentMessage(content: string): VmAgentMessage {
   };
 }
 
-async function callVmAgent(request: RemoteAgentRequest): Promise<RemoteAgentPayload> {
-  const result = await runSshCommandWithInput("python", remoteAgentScript(request), 20_000);
+function createTurnId(): string {
+  const stamp = new Date().toISOString().replace(/[-:.]/g, "").slice(0, 15);
+  return `turn_${stamp}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function callVmAgent(request: RemoteAgentRequest, signal?: AbortSignal): Promise<RemoteAgentPayload> {
+  const timeoutMs = request.operation === "history" ? config.VM_AGENT_HISTORY_TIMEOUT_MS : 20_000;
+  const historyKey = request.operation === "history"
+    ? `${request.sessionId || "global"}:${request.after || 0}:${request.limit || 0}:${request.historyBefore || 0}`
+    : undefined;
+  const result = await runSshCommandWithInput("python", remoteAgentScript(request), timeoutMs, {
+    lane: request.operation === "history" ? "history" : "interactive",
+    queueDeadlineMs: request.operation === "history" ? (request.after ? 2_000 : 10_000) : 5_000,
+    dedupeKey: historyKey,
+    signal
+  });
   const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
   const hostEpochMs = Date.now();
   if (!result.ok) {
-    return hostTiming({ ok: false, error: result.error || result.stderr || "VM agent SSH call failed", raw: raw.slice(0, 500), messages: [], cursor: 0 }, hostEpochMs);
+    const error = result.error || result.stderr || "VM agent SSH call failed";
+    return hostTiming({
+      ok: false,
+      error,
+      raw: raw.slice(0, 500),
+      messages: [],
+      cursor: request.after || 0,
+      bridgeError: result.errorCode === "VM_SSH_QUEUE_TIMEOUT" ? "queue" : /timed out/i.test(error) ? "timeout" : "ssh",
+      retryable: true
+    }, hostEpochMs);
+  }
+  try {
+    return hostTiming(parseRemoteJson(raw), hostEpochMs);
+  } catch (err) {
+    return hostTiming({
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      raw: raw.slice(0, 500),
+      messages: [],
+      cursor: request.after || 0,
+      bridgeError: "invalid_response",
+      retryable: true
+    }, hostEpochMs);
+  }
+}
+
+async function callVmAgentQuickStatus(): Promise<RemoteAgentPayload> {
+  const result = await runSshCommandWithInputFast("python", quickStatusScript, 6_000, {
+    lane: "status",
+    queueDeadlineMs: 1_000,
+    dedupeKey: "vm-agent-status"
+  });
+  const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  const hostEpochMs = Date.now();
+  if (!result.ok) {
+    return hostTiming({ ok: false, error: result.error || result.stderr || "VM agent quick status SSH call failed", raw: raw.slice(0, 500), messages: [], cursor: 0 }, hostEpochMs);
   }
   try {
     return hostTiming(parseRemoteJson(raw), hostEpochMs);
@@ -2938,52 +4581,168 @@ async function callVmAgent(request: RemoteAgentRequest): Promise<RemoteAgentPayl
   }
 }
 
-export async function downloadVmRunArtifact(runId: string, artifactPath: string): Promise<VmRunArtifactDownload> {
+export async function downloadVmRunArtifact(runId: string, artifactPath: string, signal?: AbortSignal): Promise<VmRunArtifactDownload> {
   const safe = validateVmArtifactRequest(runId, artifactPath);
-  const result = await runSshCommandWithInput("python", remoteArtifactScript(safe.runId, safe.artifactPath), 90_000);
-  const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  const stagedPath = `/tmp/sentaurus-web-artifact-${Date.now()}-${randomUUID().replace(/-/g, "")}`;
+  const result = await runSshCommandWithInputDownload(
+    "python",
+    remoteArtifactScript(safe.runId, safe.artifactPath, stagedPath),
+    stagedPath,
+    maxVmArtifactBytes,
+    90_000,
+    {
+      lane: "files",
+      queueDeadlineMs: 20_000,
+      dedupeKey: `artifact:${safe.runId}:${safe.artifactPath}`,
+      signal
+    }
+  );
   if (!result.ok) {
-    throw httpError(502, result.error || result.stderr || "VM artifact SSH download failed");
+    throw httpError(result.statusCode || 502, result.error || result.stderr || "VM artifact SSH download failed");
   }
-  const payload = parseRemoteArtifactJson(raw);
-  if (payload.ok === false) {
-    const statusCode = typeof payload.statusCode === "number" ? payload.statusCode : 400;
-    throw httpError(statusCode, payload.error || "VM artifact download failed");
-  }
-  if (typeof payload.contentB64 !== "string" || typeof payload.path !== "string" || typeof payload.fileName !== "string") {
+  if (!result.data || !result.metadata) {
     throw httpError(502, "VM artifact download response was incomplete");
   }
-  const data = Buffer.from(payload.contentB64, "base64");
-  const size = typeof payload.size === "number" && Number.isFinite(payload.size) ? payload.size : data.byteLength;
   return {
-    path: payload.path,
-    fileName: payload.fileName,
-    size,
-    data
+    path: result.metadata.path,
+    fileName: result.metadata.fileName,
+    size: result.metadata.size,
+    data: result.data
+  };
+}
+
+export async function getVmAgentAgentsMd(signal?: AbortSignal): Promise<VmAgentAgentsMdResponse> {
+  const result = await runSshCommandWithInput("python", remoteAgentsMdRequestScript("get"), 20_000, {
+    lane: "files",
+    queueDeadlineMs: 10_000,
+    dedupeKey: "vm-agent-agents-md:get",
+    signal
+  });
+  const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  if (!result.ok) {
+    throw httpError(502, result.error || result.stderr || "VM AGENTS.md read failed");
+  }
+  const payload = parseVmAgentAgentsMdPayload(raw);
+  if (payload.ok === false) {
+    throw httpError(payload.statusCode || 502, payload.error || "VM AGENTS.md read failed");
+  }
+  return {
+    ok: true,
+    path: payload.path || "~/.sentaurus-web-agent/vm-agent/AGENTS.md",
+    exists: payload.exists === true,
+    content: typeof payload.content === "string" ? payload.content : "",
+    size: typeof payload.size === "number" && Number.isFinite(payload.size) ? payload.size : 0,
+    updatedAt: payload.updatedAt,
+    sha256: payload.sha256
+  };
+}
+
+export async function saveVmAgentAgentsMd(content: string, signal?: AbortSignal): Promise<VmAgentAgentsMdResponse> {
+  const normalized = typeof content === "string" ? content : "";
+  if (Buffer.byteLength(normalized, "utf8") > maxVmAgentsMdBytes) {
+    throw httpError(413, "AGENTS.md content exceeds the VM relay size limit");
+  }
+  const result = await runSshCommandWithInput("python", remoteAgentsMdRequestScript("put", normalized), 20_000, {
+    lane: "files",
+    queueDeadlineMs: 10_000,
+    dedupeKey: `vm-agent-agents-md:put:${createHash("sha256").update(normalized, "utf8").digest("hex")}`,
+    signal
+  });
+  const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  if (!result.ok) {
+    throw httpError(502, result.error || result.stderr || "VM AGENTS.md save failed");
+  }
+  const payload = parseVmAgentAgentsMdPayload(raw);
+  if (payload.ok === false) {
+    throw httpError(payload.statusCode || 502, payload.error || "VM AGENTS.md save failed");
+  }
+  return {
+    ok: true,
+    path: payload.path || "~/.sentaurus-web-agent/vm-agent/AGENTS.md",
+    exists: payload.exists !== false,
+    content: typeof payload.content === "string" ? payload.content : normalized,
+    size: typeof payload.size === "number" && Number.isFinite(payload.size) ? payload.size : Buffer.byteLength(normalized, "utf8"),
+    updatedAt: payload.updatedAt,
+    sha256: payload.sha256
   };
 }
 
 export async function getVmAgentStatus(): Promise<VmAgentStatus> {
-  const payload = await callVmAgent({ operation: "status", limit: 20 });
+  const payload = await callVmAgentQuickStatus();
   return payload.ok === false ? errorStatus(payload.error || "VM agent status check failed", payload.raw) : toStatus(payload);
 }
 
 export async function connectVmAgent(): Promise<{ status: VmAgentStatus; messages: VmAgentMessage[]; message?: VmAgentMessage; cursor: number }> {
-  const payload = await callVmAgent({ operation: "start" });
+  const payload = await callVmAgent({ operation: "start", includeFolded: true, protocolVersion: 2 });
   const status = payload.ok === false ? errorStatus(payload.error || "VM agent connect failed", payload.raw) : toStatus(payload);
   const messages = normalizeMessages(payload.messages, payload);
   return { status, messages, message: messages.find((item) => item.role === "agent"), cursor: payload.cursor || 0 };
 }
 
-export async function getVmAgentMessages(after = 0, limit = 50, sessionId?: string): Promise<{ status: VmAgentStatus; messages: VmAgentMessage[]; cursor: number }> {
-  const payload = await callVmAgent({ operation: "history", after, limit, sessionId });
-  const status = payload.ok === false ? errorStatus(payload.error || "VM agent history failed", payload.raw) : toStatus(payload);
-  return { status, messages: normalizeMessages(payload.messages, payload), cursor: payload.cursor || after };
+let lastKnownHistoryCursor = 0;
+
+export async function getVmAgentMessages(after = 0, limit = 50, sessionId?: string, signal?: AbortSignal): Promise<{
+  status: VmAgentStatus;
+  messages: VmAgentMessage[];
+  cursor: number;
+  truncated?: boolean;
+  continuation?: string;
+  rawCount?: number;
+  compactedCount?: number;
+  payloadBytes?: number;
+  historyCompacted?: boolean;
+  transportCompressedBytes?: number;
+  transportUncompressedBytes?: number;
+}> {
+  const payload = await callVmAgent({
+    operation: "history",
+    after,
+    limit,
+    sessionId,
+    includeFolded: true,
+    protocolVersion: 2,
+    responseByteBudget: config.VM_AGENT_HISTORY_MAX_RESPONSE_BYTES
+  }, signal);
+  if (payload.ok === false) {
+    const status = errorStatus(payload.error || "VM agent history failed", payload.raw);
+    const queueTimedOut = payload.bridgeError === "queue";
+    const timedOut = payload.bridgeError === "timeout" || /timed out/i.test(payload.error || "");
+    const cursor = Math.max(after, lastKnownHistoryCursor, typeof payload.cursor === "number" ? payload.cursor : 0);
+    throw new VmAgentHistoryError(
+      queueTimedOut ? "VM_SSH_QUEUE_TIMEOUT" : timedOut ? "VM_HISTORY_TIMEOUT" : "VM_HISTORY_BRIDGE_FAILED",
+      payload.error || "VM agent history failed",
+      queueTimedOut ? 503 : timedOut ? 504 : 502,
+      cursor,
+      status,
+      payload.retryable !== false
+    );
+  }
+  const status = toStatus(payload);
+  const messages = normalizeMessages(payload.messages, payload);
+  const shapedMessages = after === 0 && sessionId && payload.historyCompacted !== true
+    ? compactSessionHistory(messages)
+    : messages;
+  const cursor = typeof payload.cursor === "number" ? payload.cursor : after;
+  lastKnownHistoryCursor = Math.max(lastKnownHistoryCursor, cursor);
+  return {
+    status,
+    messages: shapedMessages,
+    cursor,
+    truncated: payload.truncated,
+    continuation: payload.continuation,
+    rawCount: payload.rawCount,
+    compactedCount: payload.compactedCount,
+    payloadBytes: payload.payloadBytes,
+    historyCompacted: payload.historyCompacted,
+    transportCompressedBytes: payload.transportCompressedBytes,
+    transportUncompressedBytes: payload.transportUncompressedBytes
+  };
 }
 
 export async function sendVmAgentMessage(message: string, sessionId?: string, attachments: VmAgentAttachmentRef[] = [], displayAttachments: VmAgentMessageAttachment[] = []): Promise<{ status: VmAgentStatus; message: VmAgentMessage; messages: VmAgentMessage[]; cursor: number }> {
   const enrichedAttachments = await enrichAttachmentsForVm(attachments);
-  const payload = await callVmAgent({ operation: "send", message, sessionId, attachments: enrichedAttachments, displayAttachments });
+  const turnId = createTurnId();
+  const payload = await callVmAgent({ operation: "send", message, sessionId, turnId, includeFolded: true, protocolVersion: 2, attachments: enrichedAttachments, displayAttachments });
   const status = payload.ok === false ? errorStatus(payload.error || "VM agent message failed", payload.raw) : toStatus(payload);
   const messages = normalizeMessages(payload.messages, payload);
   const representative = [...messages].reverse().find((item) => item.role === "agent") || messages[0] || fallbackAgentMessage("Message queued for the CentOS VM agent.");

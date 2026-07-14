@@ -19,7 +19,11 @@ if (-not (Test-Path ".env") -and (Test-Path ".env.example")) {
 Write-Host "Installing dependencies..."
 npm install
 
+Write-Host "Building shared workspace..."
+npm run prepare:shared
+
 Write-Host "Starting Sentaurus Agent..."
 Write-Host "Backend:  http://10.6.22.1:5175"
-Write-Host "Frontend: http://10.6.22.1:5174"
+Write-Host "Frontend: http://[::1]:5174"
+Write-Host "Web bind: [::]:5174"
 npm run dev

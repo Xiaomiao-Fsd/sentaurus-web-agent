@@ -98,9 +98,20 @@ export async function runRoutes(app: FastifyInstance): Promise<void> {
     let vmSync: VmSessionFileSyncStatus = { ok: false };
     try {
       const localPath = await resolveRunFile(request.params.id, "input", saved.name);
-      await syncInputFileToVmSession(request.params.id, saved.name, localPath);
-      vmSync = { ok: true, category: VM_SESSION_INPUT_CATEGORY, path: saved.name };
-      await appendRunLog(request.params.id, "job.log", `[${new Date().toISOString()}] synced input/${saved.name} to VM output/我的输入`);
+      const synced = await syncInputFileToVmSession(request.params.id, saved.name, localPath);
+      vmSync = {
+        ok: true,
+        category: VM_SESSION_INPUT_CATEGORY,
+        path: synced.path,
+        size: synced.size,
+        sha256: synced.sha256,
+        deduplicated: synced.deduplicated
+      };
+      await appendRunLog(
+        request.params.id,
+        "job.log",
+        `[${new Date().toISOString()}] synced input/${saved.name} to VM output/我的输入/${synced.path} size=${synced.size} sha256=${synced.sha256}${synced.deduplicated ? " deduplicated=true" : ""}`
+      );
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       vmSync = { ok: false, error: detail };

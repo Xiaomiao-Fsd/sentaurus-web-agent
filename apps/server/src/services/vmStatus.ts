@@ -1,6 +1,6 @@
 import type { VmStatus } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
-import { runSshCommand } from "./sshClient.js";
+import { runSshCommandFast } from "./sshClient.js";
 
 function parseTool(lines: string[], name: string): string | null {
   const marker = `TOOL:${name}`;
@@ -22,32 +22,13 @@ export async function getVmStatus(): Promise<VmStatus> {
     "hostname",
     "echo USER",
     "whoami",
-    "echo TOOL:sde",
-    "which sde",
-    "echo TOOL:sdevice",
-    "which sdevice",
-    "echo TOOL:sprocess",
-    "which sprocess",
-    "echo TOOL:swb",
-    "which swb",
-    "echo TOOL:inspect",
-    "which inspect",
-    "echo TOOL:svisual",
-    "which svisual",
-    "echo SENTAURUS_VERSION_START",
-    "timeout 5s sdevice -v | head -8",
-    "echo SENTAURUS_VERSION_END",
+    "for tool in sde sdevice sprocess swb inspect svisual; do echo TOOL:$tool; command -v $tool || true; done",
     "echo VM_STATUS_DONE"
   ].join("; ");
-  const result = await runSshCommand(command, 20_000);
+  const result = await runSshCommandFast(command, 6_000);
   const raw = [result.stdout, result.stderr].filter(Boolean).join("\n");
   const lines = raw.split(/\r?\n/);
   const ok = result.ok && lines.includes("SSH_OK");
-  const versionStart = lines.indexOf("SENTAURUS_VERSION_START");
-  const versionEnd = lines.indexOf("SENTAURUS_VERSION_END");
-  const version = versionStart >= 0 && versionEnd > versionStart
-    ? lines.slice(versionStart + 1, versionEnd).join("\n")
-    : undefined;
 
   return {
     ok,
@@ -55,7 +36,7 @@ export async function getVmStatus(): Promise<VmStatus> {
     sshTarget: config.SENTAURUS_SSH_TARGET,
     hostname: parseNextLine(lines, "HOSTNAME"),
     user: parseNextLine(lines, "USER"),
-    sentaurusVersion: version,
+    sentaurusVersion: undefined,
     tools: {
       sde: parseTool(lines, "sde"),
       sdevice: parseTool(lines, "sdevice"),

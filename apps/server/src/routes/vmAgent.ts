@@ -1,10 +1,27 @@
-import type { FastifyInstance } from "fastify";
-import type { VmAgentAttachmentRef, VmAgentAttachmentSource, VmAgentMessageAttachment, VmAgentMessageRequest, VmSessionOutputCategory } from "@sentaurus-agent/shared";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type {
+  VmAgentAgentsMdUpdateRequest,
+  VmAgentAttachmentRef,
+  VmAgentAttachmentSource,
+  VmAgentMessageAttachment,
+  VmAgentMessageRequest,
+  VmSessionOutputCategory
+} from "@sentaurus-agent/shared";
 import { config } from "../config.js";
 import { requireAuth } from "../security/auth.js";
 import { safeFileName, safeRelativePath, safeRunId } from "../security/pathSafe.js";
 import { isChatImageContentType, isChatImageName } from "../services/imageAttachments.js";
-import { connectVmAgent, downloadVmRunArtifact, getVmAgentMessages, getVmAgentStatus, sendVmAgentMessage } from "../services/vmAgent.js";
+import {
+  connectVmAgent,
+  downloadVmRunArtifact,
+  getVmAgentAgentsMd,
+  getVmAgentMessages,
+  getVmAgentStatus,
+  isVmAgentHistoryError,
+  saveVmAgentAgentsMd,
+  sendVmAgentMessage
+} from "../services/vmAgent.js";
+import { validateVmAgentInstructionsContent } from "../services/vmAgentInstructions.js";
 import { contentTypeForName, downloadVmSessionFile, listVmSessionFiles, vmSessionOutputCategories } from "../services/vmSessionFiles.js";
 
 function parseCursor(value: unknown): number {
@@ -13,11 +30,14 @@ function parseCursor(value: unknown): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
-function parseLimit(value: unknown, fallback = 50): number {
+const defaultHistoryLimit = 50;
+const maxHistoryLimit = 5000;
+
+function parseLimit(value: unknown, fallback = defaultHistoryLimit): number {
   if (typeof value !== "string") return fallback;
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.min(parsed, 1000);
+  return Math.min(parsed, maxHistoryLimit);
 }
 
 function parseSessionId(value: unknown): string | undefined {
@@ -48,6 +68,26 @@ function contentDispositionAttachment(name: string): string {
 const attachmentSources = new Set<VmAgentAttachmentSource>(["run-input", "vm-session-file", "vm-run-artifact"]);
 const maxContextAttachments = 8;
 const maxDisplayAttachments = 12;
+
+export type VmAgentRouteOptions = {
+  getVmAgentMessages?: typeof getVmAgentMessages;
+  getVmAgentAgentsMd?: typeof getVmAgentAgentsMd;
+  saveVmAgentAgentsMd?: typeof saveVmAgentAgentsMd;
+};
+
+function clientAbortSignal(request: FastifyRequest, reply: FastifyReply): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  request.raw.once("aborted", abort);
+  reply.raw.once("close", abort);
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      request.raw.off("aborted", abort);
+      reply.raw.off("close", abort);
+    }
+  };
+}
 
 function parseAttachmentSize(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
@@ -162,10 +202,34 @@ function validateDisplayAttachments(value: unknown): VmAgentMessageAttachment[] 
   return value.map(validateDisplayAttachment);
 }
 
-export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
+export async function vmAgentRoutes(app: FastifyInstance, options: VmAgentRouteOptions = {}): Promise<void> {
+  const loadVmAgentMessages = options.getVmAgentMessages ?? getVmAgentMessages;
+  const loadVmAgentAgentsMd = options.getVmAgentAgentsMd ?? getVmAgentAgentsMd;
+  const persistVmAgentAgentsMd = options.saveVmAgentAgentsMd ?? saveVmAgentAgentsMd;
   app.get("/api/vm/agent/status", async (request) => {
     requireAuth(request);
     return getVmAgentStatus();
+  });
+
+  app.get("/api/vm/agent/agents-md", async (request, reply) => {
+    requireAuth(request);
+    const client = clientAbortSignal(request, reply);
+    try {
+      return await loadVmAgentAgentsMd(client.signal);
+    } finally {
+      client.cleanup();
+    }
+  });
+
+  app.put<{ Body: VmAgentAgentsMdUpdateRequest }>("/api/vm/agent/agents-md", async (request, reply) => {
+    requireAuth(request);
+    const content = validateVmAgentInstructionsContent(request.body?.content);
+    const client = clientAbortSignal(request, reply);
+    try {
+      return await persistVmAgentAgentsMd(content, client.signal);
+    } finally {
+      client.cleanup();
+    }
   });
 
   app.post("/api/vm/agent/connect", async (request) => {
@@ -174,14 +238,31 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     return { ok: result.status.ok, ...result };
   });
 
-  app.get<{ Querystring: { after?: string; limit?: string; sessionId?: string } }>("/api/vm/agent/messages", async (request) => {
+  app.get<{ Querystring: { after?: string; limit?: string; sessionId?: string } }>("/api/vm/agent/messages", async (request, reply) => {
     requireAuth(request);
-    const result = await getVmAgentMessages(
-      parseCursor(request.query.after),
-      parseLimit(request.query.limit),
-      parseSessionId(request.query.sessionId)
-    );
-    return { ok: result.status.ok, ...result };
+    const client = clientAbortSignal(request, reply);
+    try {
+      const result = await loadVmAgentMessages(
+        parseCursor(request.query.after),
+        parseLimit(request.query.limit),
+        parseSessionId(request.query.sessionId),
+        client.signal
+      );
+      return { ok: true, ...result };
+    } catch (err) {
+      if (!isVmAgentHistoryError(err)) throw err;
+      return reply.code(err.statusCode).send({
+        ok: false,
+        error: err.code,
+        message: err.message,
+        retryable: err.retryable,
+        cursor: err.cursor,
+        status: err.status,
+        messages: []
+      });
+    } finally {
+      client.cleanup();
+    }
   });
 
   app.post<{ Body: VmAgentMessageRequest }>("/api/vm/agent/messages", async (request) => {
@@ -214,17 +295,27 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
       error.statusCode = 400;
       throw error;
     }
-    const artifact = await downloadVmRunArtifact(request.params.runId, artifactPath);
-    reply.header("content-type", contentTypeForName(artifact.fileName));
-    reply.header("content-length", String(artifact.data.byteLength));
-    reply.header("x-vm-artifact-path", encodedHeaderValue(artifact.path));
-    reply.header("content-disposition", contentDispositionAttachment(artifact.fileName));
-    return reply.send(artifact.data);
+    const client = clientAbortSignal(request, reply);
+    try {
+      const artifact = await downloadVmRunArtifact(request.params.runId, artifactPath, client.signal);
+      reply.header("content-type", contentTypeForName(artifact.fileName));
+      reply.header("content-length", String(artifact.data.byteLength));
+      reply.header("x-vm-artifact-path", encodedHeaderValue(artifact.path));
+      reply.header("content-disposition", contentDispositionAttachment(artifact.fileName));
+      return reply.send(artifact.data);
+    } finally {
+      client.cleanup();
+    }
   });
 
-  app.get<{ Params: { sessionId: string }; Querystring: { token?: string } }>("/api/vm/agent/sessions/:sessionId/files", async (request) => {
+  app.get<{ Params: { sessionId: string }; Querystring: { token?: string } }>("/api/vm/agent/sessions/:sessionId/files", async (request, reply) => {
     requireAuth(request);
-    return listVmSessionFiles(request.params.sessionId);
+    const client = clientAbortSignal(request, reply);
+    try {
+      return await listVmSessionFiles(request.params.sessionId, client.signal);
+    } finally {
+      client.cleanup();
+    }
   });
 
   app.get<{ Params: { sessionId: string }; Querystring: { category?: string; path?: string; token?: string } }>("/api/vm/agent/sessions/:sessionId/files/download", async (request, reply) => {
@@ -234,13 +325,18 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
       error.statusCode = 400;
       throw error;
     }
-    const file = await downloadVmSessionFile(request.params.sessionId, request.query.category, request.query.path);
-    reply.header("content-type", file.contentType);
-    reply.header("content-length", String(file.data.byteLength));
-    reply.header("x-vm-session-category", encodedHeaderValue(file.category));
-    reply.header("x-vm-session-path", encodedHeaderValue(file.path));
-    reply.header("content-disposition", contentDispositionAttachment(file.fileName));
-    return reply.send(file.data);
+    const client = clientAbortSignal(request, reply);
+    try {
+      const file = await downloadVmSessionFile(request.params.sessionId, request.query.category, request.query.path, client.signal);
+      reply.header("content-type", file.contentType);
+      reply.header("content-length", String(file.data.byteLength));
+      reply.header("x-vm-session-category", encodedHeaderValue(file.category));
+      reply.header("x-vm-session-path", encodedHeaderValue(file.path));
+      reply.header("content-disposition", contentDispositionAttachment(file.fileName));
+      return reply.send(file.data);
+    } finally {
+      client.cleanup();
+    }
   });
 
   app.get<{ Querystring: { after?: string; token?: string } }>("/api/vm/agent/messages/stream", async (request, reply) => {
@@ -252,10 +348,19 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
       vary: "origin",
       connection: "keep-alive"
     });
+    reply.raw.flushHeaders();
 
     let cursor = parseCursor(request.query.after);
     let running = false;
+    const streamController = new AbortController();
+    let interval: ReturnType<typeof setInterval> | undefined;
+    const closeStream = () => {
+      streamController.abort();
+      if (interval) clearInterval(interval);
+    };
+    request.raw.once("close", closeStream);
     const send = (event: string, data: unknown) => {
+      if (streamController.signal.aborted || reply.raw.destroyed) return;
       reply.raw.write(`event: ${event}\n`);
       reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
     };
@@ -263,7 +368,7 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
       if (running) return;
       running = true;
       try {
-        const result = await getVmAgentMessages(cursor);
+        const result = await loadVmAgentMessages(cursor, 50, undefined, streamController.signal);
         cursor = result.cursor;
         if (result.messages.length > 0) {
           send("messages", result);
@@ -278,7 +383,6 @@ export async function vmAgentRoutes(app: FastifyInstance): Promise<void> {
     };
 
     await tick();
-    const interval = setInterval(() => void tick(), 1000);
-    request.raw.on("close", () => clearInterval(interval));
+    if (!streamController.signal.aborted) interval = setInterval(() => void tick(), 1000);
   });
 }

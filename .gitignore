@@ -24,6 +24,8 @@ data/*
 !data/uploads/.gitkeep
 apps/server/data/
 .tools/
+.openclaw-codex-task.txt
+*.pre-ipv6
 
 # logs
 *.log

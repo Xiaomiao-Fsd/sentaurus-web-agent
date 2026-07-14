@@ -10,6 +10,51 @@ export type VmStatus = {
   raw?: string;
 };
 
+export type VmAgentMessageKind =
+  | "worklog_summary"
+  | "file_operation"
+  | "tool_run"
+  | "run_progress"
+  | "run_final"
+  | "run_diagnostic"
+  | "vm_agent_attachments"
+  | "agent_response_stream"
+  | "agent_response_delta"
+  | "agent_response_done"
+  | "agent_response_error"
+  | "agent_trace"
+  | string;
+
+export type VmAgentMessageMeta = {
+  kind?: VmAgentMessageKind;
+  sessionId?: string;
+  runId?: string;
+  turnId?: string;
+  groupId?: string;
+  streamId?: string;
+  targetMessageId?: string;
+  messageId?: string;
+  phase?: string;
+  foldable?: boolean;
+  collapsedByDefault?: boolean;
+  publicWorklog?: boolean;
+  displayLanguage?: string;
+  operation?: string;
+  path?: string;
+  category?: string;
+  tool?: string;
+  commandLabel?: string;
+  status?: string;
+  exitCode?: number;
+  durationMs?: number;
+  worklogDurationMs?: number;
+  append?: boolean;
+  delta?: boolean;
+  done?: boolean;
+  streamState?: "queued" | "running" | "streaming" | "done" | "completed" | "error" | string;
+  summaryOfGroup?: boolean;
+} & Record<string, unknown>;
+
 export type VmAgentMessage = {
   id: string;
   role: "user" | "agent" | "system";
@@ -18,7 +63,7 @@ export type VmAgentMessage = {
   vmCreatedAt?: string;
   hostReceivedAt?: string;
   sequence?: number;
-  meta?: Record<string, string | number | boolean | null>;
+  meta?: VmAgentMessageMeta;
   attachments?: VmAgentAttachment[];
 };
 
@@ -72,11 +117,27 @@ export type VmAgentMessageResponse = {
   cursor: number;
 };
 
+export type VmAgentHistoryErrorCode =
+  | "VM_HISTORY_TIMEOUT"
+  | "VM_HISTORY_BRIDGE_FAILED"
+  | "VM_SSH_QUEUE_TIMEOUT";
+
 export type VmAgentHistoryResponse = {
   ok: boolean;
   status: VmAgentStatus;
   messages: VmAgentMessage[];
   cursor: number;
+  truncated?: boolean;
+  continuation?: string;
+  rawCount?: number;
+  compactedCount?: number;
+  payloadBytes?: number;
+  historyCompacted?: boolean;
+  transportCompressedBytes?: number;
+  transportUncompressedBytes?: number;
+  error?: VmAgentHistoryErrorCode;
+  message?: string;
+  retryable?: boolean;
 };
 
 export type ChatMessage = {
@@ -96,7 +157,15 @@ export type ChatResponse = {
   message: ChatMessage;
 };
 
-export type RunStatus = "created" | "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export type RunStatus =
+  | "created"
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "incomplete"
+  | "failed-postcondition"
+  | "failed"
+  | "cancelled";
 
 export type RunFileKind = "input" | "logs" | "artifacts";
 
@@ -120,8 +189,110 @@ export type SimulationSetup = {
   simulationGoals?: string;
   expectedOutputs?: string[];
   notes?: string;
+  extractorVersion?: string;
+  metricProfile?: string;
+  postprocessStatus?: "ok" | "incomplete" | "invalid-input" | "failed" | string;
+  postprocessErrorCode?: string;
+  inputHashes?: Record<string, string>;
+  actualBiases?: {
+    lowVd?: number;
+    highVd?: number;
+  };
   updatedAt: string;
   updatedBy: "vm-agent" | "user" | "system";
+};
+
+export type DfiseIdvgMetricProfile = "tcad-idvg-v1";
+
+export type DfiseIdvgPostprocessRequest = {
+  kind: "dfise-idvg-v1";
+  lowInput: string;
+  highInput: string;
+  expectedLowVd?: number;
+  expectedHighVd?: number;
+  biasToleranceV?: number;
+  vthCurrentAperUm?: number;
+  ssCurrentMinAperUm?: number;
+  ssCurrentMaxAperUm?: number;
+  minimumPointCount?: number;
+  outputPrefix: string;
+  metricProfile?: DfiseIdvgMetricProfile;
+};
+
+export type DfiseIdvgErrorCode =
+  | "BIAS_MISMATCH"
+  | "BIAS_ORDER_INVALID"
+  | "DATASET_NOT_FOUND"
+  | "EXTRACTOR_INTERNAL_ERROR"
+  | "EXTRACTOR_VERSION_MISMATCH"
+  | "INSUFFICIENT_POINTS"
+  | "INVALID_ARGUMENT"
+  | "MALFORMED_DATA_BLOCK"
+  | "NO_VALID_POINTS"
+  | "NONFINITE_METRIC"
+  | "SS_WINDOW_NOT_COVERED"
+  | "UNSUPPORTED_METRIC_PROFILE"
+  | "UNSUPPORTED_SS_METHOD"
+  | "VTH_NOT_COVERED";
+
+export type DfiseIdvgInputProvenance = {
+  path: string;
+  sha256: string;
+  size: number;
+  actualVd: number;
+  datasetCount: number;
+  functionCount?: number;
+  columnResolution?: "dataset-name" | "function-signature-fallback" | string;
+  validPointCount: number;
+  duplicateCount: number;
+  vgMin: number;
+  vgMax: number;
+  idMin: number;
+  idMax: number;
+  selectedDataBlock: number;
+};
+
+export type DfiseIdvgPostprocessResult = {
+  status: "ok" | "incomplete" | "invalid-input" | "failed";
+  metricProfile: DfiseIdvgMetricProfile;
+  extractorVersion: "dfise-idvg-extract/1" | string;
+  units?: {
+    gateVoltage: "V" | string;
+    drainVoltage: "V" | string;
+    drainCurrent: "A/um" | string;
+    vth: "V" | string;
+    ss: "mV/dec" | string;
+    dibl: "mV/V" | string;
+  };
+  inputs?: {
+    low: DfiseIdvgInputProvenance;
+    high: DfiseIdvgInputProvenance;
+  };
+  metrics?: {
+    vthLowV: number;
+    vthHighV: number;
+    ssLowMvPerDec: number;
+    ssHighMvPerDec: number;
+    diblMvPerV: number;
+    ssLowWindowPointCount?: number;
+    ssHighWindowPointCount?: number;
+    ssLowAdjacentPairCount?: number;
+    ssHighAdjacentPairCount?: number;
+  };
+  outputs?: {
+    csv: string;
+    metricsJson: string;
+    metricsDat: string;
+    report: string;
+    plot: string;
+  };
+  error?: {
+    code: DfiseIdvgErrorCode | string;
+    message: string;
+    details?: Record<string, unknown>;
+  };
+  warnings?: string[];
+  generatedAt?: string;
 };
 
 export type VmRunArtifact = {
@@ -181,6 +352,30 @@ export type VmAgentMessageRequest = {
   displayAttachments?: VmAgentMessageAttachment[];
 };
 
+export type VmAgentAgentsMdResponse = {
+  ok: boolean;
+  path: string;
+  exists: boolean;
+  content: string;
+  size: number;
+  updatedAt?: string;
+  sha256?: string;
+};
+
+export type VmAgentAgentsMdUpdateRequest = {
+  content: string;
+};
+
+export type VmAgentInstructionsResponse = {
+  ok: boolean;
+  content: string;
+  fileName: "AGENTS.md";
+  path: string;
+  size: number;
+  maxBytes: number;
+  updatedAt: string | null;
+};
+
 export const VM_SESSION_OUTPUT_CATEGORIES = ["我的输入", "仿真结果文件", "仿真日志文件", "仿真参数文件", "其它文件"] as const;
 
 export type VmSessionOutputCategory = typeof VM_SESSION_OUTPUT_CATEGORIES[number];
@@ -191,6 +386,9 @@ export type VmSessionFileSyncStatus = {
   ok: boolean;
   category?: VmSessionOutputCategory;
   path?: string;
+  size?: number;
+  sha256?: string;
+  deduplicated?: boolean;
   error?: string;
 };
 

@@ -1,4 +1,5 @@
 import type {
+  VmAgentAgentsMdResponse,
   VmAgentConnectResponse,
   VmAgentAttachmentRef,
   VmAgentHistoryResponse,
@@ -27,11 +28,26 @@ export async function sendVmAgentMessage(
   return requestJson("/api/vm/agent/messages", { method: "POST", body: JSON.stringify({ message, sessionId, attachments, displayAttachments }) });
 }
 
-export async function getVmAgentMessages(after = 0, options: { limit?: number; sessionId?: string } = {}): Promise<VmAgentHistoryResponse> {
+export async function getVmAgentAgentsMd(signal?: AbortSignal): Promise<VmAgentAgentsMdResponse> {
+  return requestJson("/api/vm/agent/agents-md", { signal });
+}
+
+export async function saveVmAgentAgentsMd(content: string, signal?: AbortSignal): Promise<VmAgentAgentsMdResponse> {
+  return requestJson("/api/vm/agent/agents-md", {
+    method: "PUT",
+    body: JSON.stringify({ content }),
+    signal
+  });
+}
+
+export async function getVmAgentMessages(
+  after = 0,
+  options: { limit?: number; sessionId?: string; signal?: AbortSignal } = {}
+): Promise<VmAgentHistoryResponse> {
   const params = new URLSearchParams({ after: String(after) });
   if (options.limit) params.set("limit", String(options.limit));
   if (options.sessionId) params.set("sessionId", options.sessionId);
-  return requestJson(`/api/vm/agent/messages?${params.toString()}`);
+  return requestJson(`/api/vm/agent/messages?${params.toString()}`, { signal: options.signal });
 }
 
 export function vmAgentMessageStreamUrl(after = 0): string {
@@ -42,8 +58,8 @@ export function vmRunArtifactDownloadUrl(runId: string, artifactPath: string): s
   return apiUrl(`/api/vm/agent/runs/${encodeURIComponent(runId)}/artifacts?path=${encodeURIComponent(artifactPath)}&token=${tokenQuery()}`);
 }
 
-export async function getVmSessionFiles(sessionId: string): Promise<VmSessionFilesResponse> {
-  return requestJson(`/api/vm/agent/sessions/${encodeURIComponent(sessionId)}/files`);
+export async function getVmSessionFiles(sessionId: string, signal?: AbortSignal): Promise<VmSessionFilesResponse> {
+  return requestJson(`/api/vm/agent/sessions/${encodeURIComponent(sessionId)}/files`, { signal });
 }
 
 export function vmSessionFileDownloadUrl(sessionId: string, category: VmSessionOutputCategory, filePath: string): string {
