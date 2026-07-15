@@ -33,8 +33,8 @@ export function assertSecureAuthConfig(host: string, authToken: string): void {
 
 const schema = z.object({
   PORT: z.coerce.number().int().positive().default(5175),
-  HOST: z.string().default("10.6.22.1"),
-  CORS_ORIGIN: z.string().default("http://10.6.22.1:5174"),
+  HOST: z.string().default("::1"),
+  CORS_ORIGIN: z.string().default("http://[::1]:5174"),
   AUTH_TOKEN: z.string().min(8).default("change-me-local-only"),
   LLM_API_BASE: z.string().url().optional(),
   LLM_API_KEY: z.string().optional(),

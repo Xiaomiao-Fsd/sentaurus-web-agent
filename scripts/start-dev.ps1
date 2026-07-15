@@ -23,7 +23,8 @@ Write-Host "Building shared workspace..."
 npm run prepare:shared
 
 Write-Host "Starting Sentaurus Agent..."
-Write-Host "Backend:  http://10.6.22.1:5175"
+Write-Host "Backend:  http://[::1]:5175"
 Write-Host "Frontend: http://[::1]:5174"
 Write-Host "Web bind: [::]:5174"
+Remove-Item Env:VITE_API_BASE -ErrorAction SilentlyContinue
 npm run dev

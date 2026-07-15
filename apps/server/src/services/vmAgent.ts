@@ -3674,18 +3674,21 @@ def llm_configured():
     config = load_config()
     return bool(config.get("api_base") and config.get("api_key"))
 
-def read_pid():
+def read_worker_pids():
     if not os.path.exists(PID_PATH):
-        return None
+        return []
+    values = []
     try:
         with open(PID_PATH, "r") as handle:
             for line in handle:
                 line = line.strip()
                 if line:
-                    return int(line)
+                    pid = int(line)
+                    if pid not in values:
+                        values.append(pid)
     except Exception:
-        return None
-    return None
+        return []
+    return values
 
 def pid_alive(pid):
     if not pid:
@@ -3697,8 +3700,8 @@ def pid_alive(pid):
         return False
 
 def worker_running():
-    pid = read_pid()
-    return pid_alive(pid), pid
+    pids = [pid for pid in read_worker_pids() if pid_alive(pid)]
+    return bool(pids), (pids[0] if pids else None)
 
 def write_worker_files():
     ensure_dir(ROOT)
@@ -3783,25 +3786,31 @@ def stop_worker(pid):
         pass
 
 def start_worker(force_restart=False):
+    pids = [pid for pid in read_worker_pids() if pid_alive(pid)]
+    if pids and not force_restart:
+        return pids[0]
+    worker_count = max(1, len(pids))
+    for pid in pids:
+        stop_worker(pid)
     write_worker_files()
     if os.path.exists(STOP_PATH):
         os.unlink(STOP_PATH)
-    running, pid = worker_running()
-    if running and force_restart:
-        stop_worker(pid)
-        running, pid = worker_running()
-    if running:
-        return pid
     log = open(LOG_PATH, "ab")
     kwargs = {"stdout": log, "stderr": log, "cwd": ROOT, "close_fds": True}
     if hasattr(os, "setsid"):
         kwargs["preexec_fn"] = os.setsid
-    proc = subprocess.Popen([sys.executable or "python", WORKER_PATH], **kwargs)
+    started_pids = []
+    try:
+        for _index in range(worker_count):
+            proc = subprocess.Popen([sys.executable or "python", WORKER_PATH], **kwargs)
+            started_pids.append(proc.pid)
+    finally:
+        log.close()
     with open(PID_PATH, "w") as handle:
-        handle.write(str(proc.pid))
-    audit("worker_started", {"pid": proc.pid})
+        handle.write("\n".join([str(pid) for pid in started_pids]) + "\n")
+    audit("worker_started", {"pid": started_pids[0], "pids": started_pids, "count": len(started_pids)})
     time.sleep(0.2)
-    return proc.pid
+    return started_pids[0]
 
 def build_status(message_count_value=None):
     instances = list_instances()

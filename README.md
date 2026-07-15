@@ -49,7 +49,7 @@ Open:
 
 - Web UI (IPv6 loopback): <http://[::1]:5174>
 - Web UI bind address: `[::]:5174`
-- Backend health: <http://10.6.22.1:5175/api/health>
+- Backend health (IPv6 loopback): <http://[::1]:5175/api/health>
 
 The web UI asks for the `AUTH_TOKEN` from `.env` before calling protected APIs.
 Any non-loopback `HOST` requires a non-default `AUTH_TOKEN` with at least 24 characters; the server refuses to start otherwise.

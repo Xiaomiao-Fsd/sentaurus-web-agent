@@ -5,7 +5,7 @@ $sshDir = Join-Path $env:USERPROFILE ".ssh"
 $publicKeyPath = Join-Path $sshDir "sentaurus_vm_ed25519.pub"
 $privateKeyPath = Join-Path $sshDir "sentaurus_vm_ed25519"
 $sshTarget = "sentaurus-centos7"
-$backendUrl = "http://10.6.22.1:5175"
+$backendUrl = "http://[::1]:5175"
 
 function Write-Section($title) {
   Write-Host ""

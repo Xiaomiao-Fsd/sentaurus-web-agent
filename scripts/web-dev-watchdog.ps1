@@ -1,7 +1,7 @@
 param(
   [ValidateSet("status", "ensure", "start", "stop")]
   [string]$Mode = "status",
-  [string]$HostAddress = "10.6.22.1",
+  [string]$HostAddress = "[::1]",
   [int]$FrontendPort = 5174,
   [int]$BackendPort = 5175,
   [int]$StartupTimeoutSeconds = 45
@@ -169,8 +169,7 @@ function Start-WebDev {
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
   $outLog = Join-Path $logDir "web-dev-$stamp.out.log"
   $errLog = Join-Path $logDir "web-dev-$stamp.err.log"
-  $apiBase = "http://${HostAddress}:${BackendPort}"
-  $command = "Set-Location -LiteralPath '$projectRoot'; `$env:VITE_API_BASE='$apiBase'; npm run dev"
+  $command = "Set-Location -LiteralPath '$projectRoot'; Remove-Item Env:VITE_API_BASE -ErrorAction SilentlyContinue; npm run dev"
 
   $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
     "-NoProfile",

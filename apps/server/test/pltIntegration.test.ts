@@ -296,6 +296,99 @@ test("capability and fixed worker context persist together", () => {
   }
 });
 
+test("sending to a running worker does not rewrite deployed runtime files", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vm-running-deploy-guard-"));
+  try {
+    const { control } = generatedRemoteSources();
+    const dispatchMarker = "\ntry:\n    emit_payload(handle(load_json_b64(REQUEST_B64)))";
+    const dispatchIndex = control.lastIndexOf(dispatchMarker);
+    assert.ok(dispatchIndex > 0, "control script dispatch marker should exist");
+    const harnessPath = path.join(tempDir, "running_guard.py");
+    fs.writeFileSync(harnessPath, `${control.slice(0, dispatchIndex)}
+ensure_dir(ROOT)
+ensure_dir(CAPABILITIES_DIR)
+sentinels = {
+    WORKER_PATH: b"running-worker-sentinel\\n",
+    DFISE_EXTRACTOR_PATH: b"running-extractor-sentinel\\n",
+    DFISE_CAPABILITY_PATH: b"running-capability-sentinel\\n",
+}
+for target, content in sentinels.items():
+    with open(target, "wb") as handle:
+        handle.write(content)
+def tracked_worker_pids():
+    return [4242]
+read_worker_pids = tracked_worker_pids
+pid_alive = lambda pid: True
+before = dict((target, hashlib.sha256(content).hexdigest()) for target, content in sentinels.items())
+pid = start_worker(False)
+after = dict((target, hashlib.sha256(open(target, "rb").read()).hexdigest()) for target in sentinels)
+print(json.dumps({"pid": pid, "unchanged": before == after}, sort_keys=True))
+`, "utf8");
+    const execution = spawnSync("python", [harnessPath], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: tempDir, USERPROFILE: tempDir }
+    });
+    assert.equal(execution.status, 0, execution.stderr || execution.stdout);
+    const result = JSON.parse(execution.stdout.trim().split(/\r?\n/).at(-1) || "{}");
+    assert.equal(result.pid, 4242);
+    assert.equal(result.unchanged, true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("forced deployment replaces every tracked worker and preserves worker count", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vm-multi-worker-restart-"));
+  try {
+    const { control } = generatedRemoteSources();
+    const dispatchMarker = "\ntry:\n    emit_payload(handle(load_json_b64(REQUEST_B64)))";
+    const dispatchIndex = control.lastIndexOf(dispatchMarker);
+    assert.ok(dispatchIndex > 0, "control script dispatch marker should exist");
+    const harnessPath = path.join(tempDir, "multi_worker_restart.py");
+    fs.writeFileSync(harnessPath, `${control.slice(0, dispatchIndex)}
+ensure_dir(ROOT)
+events = []
+read_worker_pids = lambda: [101, 202]
+pid_alive = lambda pid: True
+stop_worker = lambda pid: events.append("stop:%s" % pid)
+write_worker_files = lambda: events.append("write")
+audit = lambda event, detail: events.append("audit:%s" % event)
+time.sleep = lambda seconds: None
+new_pids = iter([301, 302])
+class FakeProc(object):
+    def __init__(self, pid):
+        self.pid = pid
+def fake_popen(args, **kwargs):
+    pid = next(new_pids)
+    events.append("start:%s" % pid)
+    return FakeProc(pid)
+subprocess.Popen = fake_popen
+pid = start_worker(True)
+with open(PID_PATH, "r") as handle:
+    pid_file = [line.strip() for line in handle if line.strip()]
+print(json.dumps({"pid": pid, "pidFile": pid_file, "events": events}, sort_keys=True))
+`, "utf8");
+    const execution = spawnSync("python", [harnessPath], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: tempDir, USERPROFILE: tempDir }
+    });
+    assert.equal(execution.status, 0, execution.stderr || execution.stdout);
+    const result = JSON.parse(execution.stdout.trim().split(/\r?\n/).at(-1) || "{}");
+    assert.equal(result.pid, 301);
+    assert.deepEqual(result.pidFile, ["301", "302"]);
+    assert.deepEqual(result.events, [
+      "stop:101",
+      "stop:202",
+      "write",
+      "start:301",
+      "start:302",
+      "audit:worker_started"
+    ]);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("artifact attachments keep general files separate from image previews", () => {
   const result = runWorkerAction({
     kind: "attachments",
