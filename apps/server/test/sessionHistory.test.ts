@@ -180,11 +180,25 @@ test("selected full history compacts streams before the envelope without losing 
       meta: { sessionId, turnId: "turn-1", targetMessageId: "assistant-1", kind: "agent_response_delta", append: true }
     },
     {
-      id: "progress-1",
+      id: "reasoning-delta-1",
       role: "agent",
-      content: "running",
+      content: "Plan ",
       createdAt: "2026-07-10T00:00:02Z",
-      meta: { sessionId, turnId: "turn-1", kind: "progress", runId: "vm-run-1", outputCategory: "simulation data" }
+      meta: { sessionId, turnId: "turn-1", kind: "agent_reasoning_summary_delta", targetMessageId: "reasoning-1", summaryIndex: 0, append: true, delta: true }
+    },
+    {
+      id: "reasoning-done-1",
+      role: "agent",
+      content: "Plan safely",
+      createdAt: "2026-07-10T00:00:02Z",
+      meta: { sessionId, turnId: "turn-1", kind: "agent_reasoning_summary_done", targetMessageId: "reasoning-1", summaryIndex: 0, done: true, streamState: "done" }
+    },
+    {
+      id: "legacy-reasoning-config-echo",
+      role: "agent",
+      content: "d",
+      createdAt: "2026-07-10T00:00:02Z",
+      meta: { sessionId, turnId: "turn-1", kind: "agent_reasoning_summary", summaryIndex: 2, thinkingStatus: "completed" }
     },
     {
       id: "done-1",
@@ -229,26 +243,27 @@ test("selected full history compacts streams before the envelope without losing 
   assert.ok(envelopeLine);
   assert.equal(JSON.parse(envelopeLine).transportEncoding, "zlib-base64-json");
   assert.equal(payload.historyCompacted, true);
-  assert.equal(payload.rawCount, 4);
-  assert.equal(payload.compactedCount, 3);
-  assert.equal(payload.cursor, 5);
+  assert.equal(payload.rawCount, 6);
+  assert.equal(payload.compactedCount, 4);
+  assert.equal(payload.cursor, 7);
 
   const returned = payload.messages as Array<Record<string, any>>;
-  assert.equal(returned.length, 3);
+  assert.equal(returned.length, 4);
+  assert.equal(returned.some((message) => message.id === "legacy-reasoning-config-echo"), false);
   assert.equal(returned.some((message) => message.meta.sessionId === otherSessionId), false);
-  const progress = returned.find((message) => message.meta.kind === "progress");
-  assert.equal(progress?.meta.runId, "vm-run-1");
-  assert.equal(progress?.meta.outputCategory, "simulation data");
+  assert.deepEqual(
+    returned.filter((message) => String(message.meta.kind).startsWith("agent_reasoning_summary_")).map((message) => message.meta.kind),
+    ["agent_reasoning_summary_delta", "agent_reasoning_summary_done"]
+  );
   const assistant = returned.find((message) => message.id === "assistant-1");
   assert.equal(assistant?.content, "Hello world");
   assert.equal(assistant?.meta.vmRunArtifactsJson, "[{\"path\":\"result.plt\"}]");
   assert.equal(assistant?.attachments?.[0]?.path, "result.plt");
 
   const normalized = normalizeMessages(payload.messages, payload);
-  const normalizedProgress = normalized.find((message) => message.meta?.kind === "progress");
-  assert.equal(normalizedProgress?.meta?.sessionId, sessionId);
-  assert.equal(normalizedProgress?.meta?.runId, "vm-run-1");
-  assert.equal(normalizedProgress?.meta?.outputCategory, "simulation data");
+  const normalizedReasoning = normalized.filter((message) => String(message.meta?.kind).startsWith("agent_reasoning_summary_"));
+  assert.equal(normalizedReasoning.length, 2);
+  assert.equal(normalizedReasoning[0]?.meta?.targetMessageId, "reasoning-1");
   const normalizedAssistant = normalized.find((message) => message.id === "assistant-1");
   assert.equal(normalizedAssistant?.meta?.vmRunArtifactsJson, "[{\"path\":\"result.plt\"}]");
   assert.equal(normalizedAssistant?.attachments?.[0]?.source, "vm-run-artifact");
@@ -259,7 +274,7 @@ test("after>0 returns the first raw page and advances only to the last returned 
   const sessionId = "run_incremental";
   const messages = [
     { id: "m1", role: "user", content: "one", meta: { sessionId, kind: "user_message" } },
-    { id: "m2", role: "agent", content: "progress", meta: { sessionId, kind: "progress" } },
+    { id: "m2", role: "agent", content: "reason", meta: { sessionId, turnId: "turn-1", kind: "agent_reasoning_summary_delta", append: true, delta: true, targetMessageId: "r1" } },
     { id: "m3", role: "agent", content: "delta", meta: { sessionId, kind: "agent_response_delta", append: true, targetMessageId: "a1" } },
     { id: "m4", role: "agent", content: "worklog", meta: { sessionId, kind: "worklog_summary" } },
     { id: "m5", role: "agent", content: "done", meta: { sessionId, kind: "agent_response_done", done: true, targetMessageId: "a1" } }
@@ -276,7 +291,7 @@ test("after>0 returns the first raw page and advances only to the last returned 
   assert.equal(first.payload.cursor, 3);
   assert.deepEqual(
     (first.payload.messages as Array<Record<string, any>>).map((message) => [message.sequence, message.meta.kind]),
-    [[2, "progress"], [3, "agent_response_delta"]]
+    [[2, "agent_reasoning_summary_delta"], [3, "agent_response_delta"]]
   );
 
   const second = await withHistoryFixture(messages, {

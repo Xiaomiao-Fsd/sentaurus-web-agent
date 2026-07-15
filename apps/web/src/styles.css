@@ -248,7 +248,6 @@ code {
 .mobile-session-strip,
 .mobile-composer-toolbar,
 .mobile-attach-row,
-.mobile-progress-backdrop,
 .drawer-panel-head,
 .drawer-backdrop {
   display: none;
@@ -635,144 +634,6 @@ code {
   padding: 0.24rem 0.5rem;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.progress-panel {
-  display: grid;
-  gap: 0.55rem;
-  border-bottom: 1px solid var(--color-border);
-  padding: 0.75rem 1.25rem 0.85rem;
-  background: #ffffff;
-  transition: padding 180ms ease, background-color 180ms ease;
-}
-
-.progress-panel.collapsed {
-  padding-block: 0.62rem;
-}
-
-.progress-panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-}
-
-.progress-panel-header > div:first-child {
-  display: grid;
-  gap: 0.15rem;
-  min-width: 0;
-}
-
-.progress-panel-header h2 {
-  overflow: hidden;
-  font-size: 1rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.progress-panel-controls {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 0.5rem;
-}
-
-.progress-panel-controls > span {
-  flex: 0 0 auto;
-  color: var(--color-muted);
-  font-size: 0.78rem;
-  font-weight: 800;
-}
-
-.progress-toggle {
-  min-height: 32px;
-  border-radius: 9px;
-  padding: 0.34rem 0.62rem;
-}
-
-.progress-table-wrap {
-  max-height: 178px;
-  overflow: auto;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  opacity: 1;
-  transform: translateY(0);
-  transition: max-height 220ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 170ms ease, transform 220ms ease, border-color 170ms ease;
-}
-
-.progress-panel.collapsed .progress-table-wrap {
-  max-height: 0;
-  overflow: hidden;
-  border-color: transparent;
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(-6px);
-}
-
-.progress-table {
-  width: 100%;
-  min-width: 720px;
-  border-collapse: collapse;
-  font-size: 0.8rem;
-}
-
-.progress-table th,
-.progress-table td {
-  border-bottom: 1px solid var(--color-border);
-  padding: 0.48rem 0.6rem;
-  text-align: left;
-  vertical-align: top;
-}
-
-.progress-table th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: #f8fafc;
-  color: var(--color-muted);
-  font-size: 0.72rem;
-  text-transform: uppercase;
-}
-
-.progress-table tr:last-child td {
-  border-bottom: 0;
-}
-
-.progress-table td:nth-child(1),
-.progress-table td:nth-child(4) {
-  white-space: nowrap;
-}
-
-.progress-table td:nth-child(5) {
-  min-width: 260px;
-  max-width: 520px;
-}
-
-.progress-table td span {
-  display: inline-flex;
-  border-radius: 999px;
-  padding: 0.16rem 0.46rem;
-  background: #e2e8f0;
-  color: #334155;
-  font-size: 0.72rem;
-  font-weight: 900;
-}
-
-.progress-running td span,
-.progress-queued td span {
-  background: #ffedd5;
-  color: #9a3412;
-}
-
-.progress-completed td span {
-  background: #dcfce7;
-  color: #166534;
-}
-
-.progress-failed td span {
-  background: #fee2e2;
-  color: #991b1b;
 }
 
 .message-list {
@@ -2289,7 +2150,6 @@ button.link-button {
 
 .app-surface,
 .inspector-card,
-.progress-table-wrap,
 .composer-box,
 .empty-chat,
 .session-menu,
@@ -2457,7 +2317,6 @@ button.link-button {
 }
 
 .chat-header,
-.progress-panel,
 .chat-composer {
   background: hsl(var(--card) / 0.86);
   backdrop-filter: blur(14px);
@@ -2627,13 +2486,10 @@ button.link-button {
 
 @media (prefers-reduced-motion: reduce) {
   .app-shell,
-  .progress-panel,
-  .progress-table-wrap,
   .output-category-body,
   .output-category-chevron,
   .session-sidebar,
   .composer-tools,
-  .mobile-progress-backdrop,
   .session-menu,
   .session-menu-body,
   .menu-form,
@@ -2865,93 +2721,6 @@ button.link-button {
   .composer-box button {
     flex: 1 1 130px;
     width: 100%;
-  }
-
-  .progress-panel {
-    position: relative;
-    z-index: 12;
-    gap: 0;
-    padding: 0.38rem 0.72rem;
-  }
-
-  .progress-panel:not(.collapsed) {
-    z-index: 90;
-  }
-
-  .progress-panel.collapsed {
-    padding-block: 0.38rem;
-  }
-
-  .progress-panel-header {
-    align-items: center;
-    gap: 0.55rem;
-  }
-
-  .progress-panel-header > div:first-child {
-    display: flex;
-    align-items: center;
-    gap: 0.42rem;
-    overflow: hidden;
-  }
-
-  .progress-panel-header .eyebrow {
-    display: none;
-  }
-
-  .progress-panel-header h2 {
-    font-size: 0.82rem;
-  }
-
-  .progress-panel-controls > span {
-    display: none;
-  }
-
-  .progress-panel-controls {
-    flex-wrap: wrap;
-  }
-
-  .progress-toggle {
-    min-height: 30px;
-    border-radius: 999px;
-    padding: 0.3rem 0.56rem;
-    font-size: 0.72rem;
-  }
-
-  .mobile-progress-backdrop {
-    display: block;
-    position: fixed;
-    inset: 0;
-    z-index: 70;
-    min-height: 0;
-    border: 0;
-    border-radius: 0;
-    padding: 0;
-    background: rgba(15, 23, 42, 0.28);
-    box-shadow: none;
-  }
-
-  .mobile-progress-backdrop:hover {
-    filter: none;
-    transform: none;
-  }
-
-  .progress-panel:not(.collapsed) .progress-table-wrap {
-    position: fixed;
-    right: 0.72rem;
-    bottom: calc(5.2rem + env(safe-area-inset-bottom));
-    left: 0.72rem;
-    z-index: 100;
-    max-height: min(62dvh, 420px);
-    border-radius: 16px;
-    background: #ffffff;
-    box-shadow: var(--shadow-float);
-    opacity: 1;
-    pointer-events: auto;
-    transform: translateY(0);
-  }
-
-  .progress-panel:not(.collapsed) .progress-table {
-    min-width: 640px;
   }
 
   .message-list {

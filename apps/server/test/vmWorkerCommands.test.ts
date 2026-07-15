@@ -46,6 +46,7 @@ with open(ENV_PATH, "w") as handle:
 config_56 = load_config()
 payload = responses_request_payload("user", config_56, config_56.get("model"), "system")
 parsed_response = parse_responses_result({
+    "reasoning": {"summary": "detailed"},
     "output": [
         {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Public decision summary"}], "content": [{"text": "SECRET_RAW_REASONING"}]},
         {"type": "message", "content": [{"type": "output_text", "text": "Final answer"}]},
@@ -66,6 +67,7 @@ print("WORKER_MODEL_RESULT=" + json.dumps({
     "hard56": config_56.get("context_hard_tokens"),
     "reasoning": payload.get("reasoning", {}).get("effort"),
     "reasoningSummaryMode": payload.get("reasoning", {}).get("summary"),
+    "stream": payload.get("stream"),
     "parsedText": parsed_response.get("text"),
     "parsedSummaries": parsed_response.get("reasoningSummaries"),
     "rawReasoningHidden": "SECRET_RAW_REASONING" not in parsed_response.get("text", ""),
@@ -100,12 +102,98 @@ print("WORKER_MODEL_RESULT=" + json.dumps({
       rawReasoningHidden: true,
       reasoning: "max",
       reasoningSummaryMode: "auto",
+      stream: true,
       target54: 231200,
       target56: 300050,
       timeout: 600,
       window54: 272000,
       window56: 353000
     });
+  } finally {
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+test("VM worker streams reasoning summary items without progress messages", async () => {
+  const temporaryHome = await mkdtemp(path.join(os.tmpdir(), "sentaurus-worker-stream-test-"));
+  const scriptPath = path.join(temporaryHome, "worker_stream_test.py");
+  const harness = String.raw`
+ensure_dir(ROOT)
+publisher = create_reasoning_stream_publisher("session_stream", "turn_stream", "planning")
+events = [
+    {"type": "response.reasoning_summary_part.added", "item_id": "reasoning-1", "summary_index": 0, "part": {"type": "summary_text", "text": ""}},
+    {"type": "response.reasoning_summary_text.delta", "item_id": "reasoning-1", "summary_index": 0, "delta": "Plan"},
+    {"type": "response.reasoning_summary_text.delta", "item_id": "reasoning-1", "summary_index": 0, "delta": " safely"},
+    {"type": "response.reasoning_summary_text.done", "item_id": "reasoning-1", "summary_index": 0, "text": "Plan safely"},
+    {"type": "response.completed", "response": {
+        "reasoning": {"summary": "detailed"},
+        "output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Plan safely"}]},
+            {"type": "message", "content": [{"type": "output_text", "text": "Final answer"}]},
+        ],
+    }},
+]
+stream_lines = []
+for event in events:
+    stream_lines.append("data: " + json.dumps(event) + "\n")
+    stream_lines.append("\n")
+parsed = parse_responses_stream(stream_lines, publisher)
+messages = read_all_messages()
+reasoning_messages = [item for item in messages if item.get("meta", {}).get("kind", "").startswith("agent_reasoning_summary_")]
+print("WORKER_STREAM_RESULT=" + json.dumps({
+    "kinds": [item.get("meta", {}).get("kind") for item in reasoning_messages],
+    "contents": [item.get("content") for item in reasoning_messages],
+    "targets": [item.get("meta", {}).get("targetMessageId") for item in reasoning_messages],
+    "turnIds": [item.get("meta", {}).get("turnId") for item in reasoning_messages],
+    "parsedText": parsed.get("text"),
+    "parsedSummaries": parsed.get("reasoningSummaries"),
+    "reasoningEventCount": parsed.get("reasoningEventCount"),
+    "reasoningTextEventCount": parsed.get("reasoningTextEventCount"),
+    "reasoningExcludedFromContext": all(not non_progress_session_message(item) for item in reasoning_messages),
+    "progressEmitterRemoved": "append_progress" not in globals(),
+}, ensure_ascii=True, sort_keys=True))
+`;
+
+  try {
+    await writeFile(scriptPath, `${embeddedWorkerSource()}\n${harness}`, "utf8");
+    const { stdout } = await execFileAsync(process.env.PYTHON || "python", [scriptPath], {
+      env: {
+        ...process.env,
+        HOME: temporaryHome,
+        USERPROFILE: temporaryHome,
+        SENTAURUS_VM_AGENT_IMPORT_ONLY: "1"
+      },
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 20_000
+    });
+    const line = stdout.split(/\r?\n/).find((item) => item.startsWith("WORKER_STREAM_RESULT="));
+    assert.ok(line, `worker stream harness did not return its result: ${stdout.slice(0, 500)}`);
+    const result = JSON.parse(line.slice("WORKER_STREAM_RESULT=".length)) as {
+      kinds: string[];
+      contents: string[];
+      targets: string[];
+      turnIds: string[];
+      parsedText: string;
+      parsedSummaries: string[];
+      reasoningEventCount: number;
+      reasoningTextEventCount: number;
+      reasoningExcludedFromContext: boolean;
+      progressEmitterRemoved: boolean;
+    };
+    assert.deepEqual(result.kinds, [
+      "agent_reasoning_summary_delta",
+      "agent_reasoning_summary_delta",
+      "agent_reasoning_summary_done"
+    ]);
+    assert.deepEqual(result.contents, ["Plan", " safely", "Plan safely"]);
+    assert.equal(new Set(result.targets).size, 1);
+    assert.deepEqual(result.turnIds, ["turn_stream", "turn_stream", "turn_stream"]);
+    assert.equal(result.parsedText, "Final answer");
+    assert.deepEqual(result.parsedSummaries, ["Plan safely"]);
+    assert.equal(result.reasoningEventCount, 4);
+    assert.equal(result.reasoningTextEventCount, 3);
+    assert.equal(result.reasoningExcludedFromContext, true);
+    assert.equal(result.progressEmitterRemoved, true);
   } finally {
     await rm(temporaryHome, { recursive: true, force: true });
   }
@@ -311,7 +399,7 @@ with open(corrupt_workflow_path, "r") as handle:
 ensure_dir(QUEUE_DIR)
 ensure_dir(DONE_DIR)
 blocked_run_calls = []
-def reply_for(_text, _session_id="", _current_message_id=""):
+def reply_for(_text, _session_id="", _current_message_id="", _on_reasoning_event=None):
     if _session_id == "session_race":
         apply_workflow_action(_session_id, "plan.enter")
         return "<SENTAURUS_RUN_REQUEST>{\"title\":\"blocked\",\"files\":[{\"name\":\"main.cmd\",\"content\":\"File {}\"}],\"steps\":[{\"tool\":\"sdevice\",\"input\":\"main.cmd\"}]}</SENTAURUS_RUN_REQUEST>", {"kind": "llm"}

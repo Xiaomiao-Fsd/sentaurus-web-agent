@@ -55,7 +55,6 @@ import {
   assertHistoryResponse,
   completedSessionHistoryState,
   failedSessionHistoryState,
-  filterConcurrentWorkerArtifacts,
   historyErrorDetails,
   IDLE_SESSION_HISTORY,
   isCurrentHistoryRequest,
@@ -63,6 +62,7 @@ import {
   loadingSessionHistoryState,
   shouldLoadSelectedSessionHistory
 } from "./sessionHistory.js";
+import { isAgentStreamingDraft, mergeMessageList, messageKind } from "./messageStreams.js";
 import { vmSessionFilesCompletionState } from "./vmSessionFilesState.js";
 import type { SessionHistoryState } from "./sessionHistory.js";
 import { errorMessage, formatBytes, formatCompactNumber, formatDate, formatFullDate, normalizeAuthToken, shortId } from "./utils/format.js";
@@ -83,19 +83,6 @@ type ContextStats = {
   messageCount: number;
   percent: number;
   maxTokens: number;
-};
-
-type ProgressStatus = "running" | "completed" | "failed" | "queued" | "info";
-
-type ProgressRow = {
-  id: string;
-  createdAt: string;
-  vmCreatedAt?: string;
-  stage: string;
-  status: ProgressStatus;
-  detail: string;
-  progress: number | null;
-  runId: string | null;
 };
 
 type SessionVmArtifact = VmRunArtifact & {
@@ -232,56 +219,19 @@ function isProgressMessage(message: VmAgentMessage): boolean {
 }
 
 function isThinkingMessage(message: VmAgentMessage): boolean {
-  return message.meta?.kind === "agent_thinking" || message.meta?.kind === "agent_reasoning_summary";
-}
-
-function messageKind(message: VmAgentMessage): string {
-  return typeof message.meta?.kind === "string" ? message.meta.kind : "";
+  return message.meta?.kind === "agent_thinking"
+    || message.meta?.kind === "agent_reasoning_summary"
+    || message.meta?.kind === "agent_reasoning_summary_delta"
+    || message.meta?.kind === "agent_reasoning_summary_done";
 }
 
 function isWorklogKind(kind: string): boolean {
-  return kind === "worklog_summary" || kind === "file_operation" || kind === "tool_run" || kind === "run_progress" || kind === "run_diagnostic" || kind === "progress";
+  return kind === "worklog_summary" || kind === "file_operation" || kind === "tool_run" || kind === "run_progress" || kind === "run_diagnostic";
 }
 
 function isFoldableWorklogMessage(message: VmAgentMessage): boolean {
   const kind = messageKind(message);
   return message.role !== "user" && (message.meta?.foldable === true || isWorklogKind(kind));
-}
-
-function streamState(message: VmAgentMessage): string {
-  const value = message.meta?.streamState ?? message.meta?.status;
-  return typeof value === "string" ? value.toLowerCase() : "";
-}
-
-function isAgentStreamDelta(message: VmAgentMessage): boolean {
-  const kind = messageKind(message);
-  return message.role === "agent" && (kind === "agent_response_delta" || message.meta?.delta === true);
-}
-
-function isAgentStreamDone(message: VmAgentMessage): boolean {
-  if (message.role !== "agent") return false;
-  const kind = messageKind(message);
-  const state = streamState(message);
-  return kind === "agent_response_done"
-    || kind === "agent_response_error"
-    || message.meta?.done === true
-    || state === "done"
-    || state === "completed"
-    || state === "final"
-    || state === "error";
-}
-
-function isAgentStreamingDraft(message: VmAgentMessage): boolean {
-  if (message.role !== "agent") return false;
-  if (isAgentStreamDelta(message)) return true;
-  if (isAgentStreamDone(message)) return false;
-  const kind = messageKind(message);
-  const state = streamState(message);
-  return kind === "agent_response_stream"
-    || message.meta?.done === false
-    || state === "queued"
-    || state === "running"
-    || state === "streaming";
 }
 
 function messageTurnId(message: VmAgentMessage): string | null {
@@ -296,15 +246,6 @@ function suppressAttachmentPreview(message: VmAgentMessage): boolean {
 function metaString(message: VmAgentMessage, key: string): string | null {
   const value = message.meta?.[key];
   return typeof value === "string" && value.trim() ? value : null;
-}
-
-function streamTargetMessageId(message: VmAgentMessage): string | null {
-  if (message.role !== "agent") return null;
-  if (!isAgentStreamDelta(message) && !isAgentStreamingDraft(message) && !isAgentStreamDone(message)) return null;
-  return metaString(message, "targetMessageId")
-    || metaString(message, "messageId")
-    || metaString(message, "streamId")
-    || message.id;
 }
 
 function parseJsonValue<T>(value: string | null): T | null {
@@ -647,52 +588,6 @@ function formatDuration(ms: number): string {
   return `${seconds}s`;
 }
 
-function progressStatus(value: unknown): ProgressStatus {
-  return value === "completed" || value === "failed" || value === "queued" || value === "info" ? value : "running";
-}
-
-function progressLabel(stage: string): string {
-  const labels: Record<string, string> = {
-    received: "Received",
-    skill: "Skill",
-    llm_context: "Context",
-    llm: "LLM",
-    reply: "Reply",
-    final: "Final",
-    runner: "Runner",
-    autodebug: "Auto-debug",
-    repair_llm: "Repair LLM",
-    run_validation: "Run validation",
-    runner_prepare: "Prepare",
-    sentaurus_step: "Sentaurus",
-    artifacts: "Artifacts",
-    worker: "Worker"
-  };
-  return labels[stage] || stage.replace(/_/g, " ");
-}
-
-function progressRowsForSession(messages: VmAgentMessage[], sessionId: string | null): ProgressRow[] {
-  if (!sessionId) return [];
-  return messages.flatMap((message) => {
-    if (!messageBelongsToSession(message, sessionId) || !isProgressMessage(message)) return [];
-    const meta = message.meta || {};
-    const stage = typeof meta.progressStage === "string" ? meta.progressStage : "progress";
-    const detail = typeof meta.progressDetail === "string" ? meta.progressDetail : message.content;
-    const rawProgress = typeof meta.progress === "number" ? meta.progress : null;
-    const runId = typeof meta.runId === "string" ? meta.runId : null;
-    return [{
-      id: message.id,
-      createdAt: message.createdAt,
-      vmCreatedAt: message.vmCreatedAt,
-      stage,
-      status: progressStatus(meta.progressStatus),
-      detail,
-      progress: rawProgress === null ? null : Math.max(0, Math.min(100, rawProgress)),
-      runId
-    }];
-  });
-}
-
 function thinkingMessagesForSession(messages: VmAgentMessage[], sessionId: string | null): VmAgentMessage[] {
   if (!sessionId) return [];
   return messages.filter((message) => messageBelongsToSession(message, sessionId) && isThinkingMessage(message)).slice(-8);
@@ -744,56 +639,6 @@ function newSystemMessage(content: string, sessionId: string | null): VmAgentMes
     createdAt: new Date().toISOString(),
     meta: sessionId ? { sessionId } : undefined
   };
-}
-
-function messageSequence(message: VmAgentMessage): number | null {
-  return typeof message.sequence === "number" && Number.isFinite(message.sequence) ? message.sequence : null;
-}
-
-function messageTime(message: VmAgentMessage): number {
-  const parsed = Date.parse(message.createdAt);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function mergeMessageList(prev: VmAgentMessage[], next: VmAgentMessage[] | undefined): VmAgentMessage[] {
-  if (!next?.length) return prev;
-  const byId = new Map(prev.map((message) => [message.id, message]));
-  for (const message of next) {
-    const targetMessageId = streamTargetMessageId(message);
-    if (targetMessageId) {
-      const existing = byId.get(targetMessageId);
-      const appendContent = isAgentStreamDelta(message) || message.meta?.append === true;
-      const mergedContent = existing && appendContent
-        ? `${existing.content}${message.content}`
-        : message.content || existing?.content || "";
-      byId.set(targetMessageId, {
-        ...existing,
-        ...message,
-        id: targetMessageId,
-        role: "agent",
-        content: mergedContent,
-        createdAt: existing?.createdAt || message.createdAt,
-        sequence: existing?.sequence ?? message.sequence,
-        meta: {
-          ...existing?.meta,
-          ...message.meta,
-          kind: isAgentStreamDone(message) ? messageKind(message) || "agent_response_done" : "agent_response_stream",
-          done: isAgentStreamDone(message)
-        },
-        attachments: message.attachments || existing?.attachments
-      });
-      continue;
-    }
-    const existing = byId.get(message.id);
-    byId.set(message.id, existing ? { ...existing, ...message, meta: { ...existing.meta, ...message.meta } } : message);
-  }
-  const sorted = [...byId.values()].sort((a, b) => {
-    const aSequence = messageSequence(a);
-    const bSequence = messageSequence(b);
-    if (aSequence !== null && bSequence !== null && aSequence !== bSequence) return aSequence - bSequence;
-    return messageTime(a) - messageTime(b);
-  });
-  return filterConcurrentWorkerArtifacts(sorted);
 }
 
 function formatClockSkew(value?: number): string {
@@ -1001,7 +846,6 @@ export default function App() {
   const [pendingReplySessionId, setPendingReplySessionId] = useState<string | null>(null);
   const [pendingReplyRetryCount, setPendingReplyRetryCount] = useState(0);
   const [vmAgentStreamState, setVmAgentStreamState] = useState("idle");
-  const [progressCollapsed, setProgressCollapsed] = useState(true);
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
   const [mobileLeftPanelOpen, setMobileLeftPanelOpen] = useState(false);
@@ -1117,7 +961,7 @@ export default function App() {
   const currentMessages = useMemo(() => messagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
   const visibleMessages = useMemo(() => currentMessages.filter((message) => {
     if (isThinkingMessage(message)) return false;
-    if (isProgressMessage(message)) return !!messageTurnId(message);
+    if (isProgressMessage(message)) return false;
     return true;
   }), [currentMessages]);
   const chatItems = useMemo(() => chatItemsForMessages(visibleMessages), [visibleMessages]);
@@ -1126,7 +970,6 @@ export default function App() {
     && item.group.messages.some((message) => message.role === "user")
     && !turnHasFinalResult(item.group)
   )), [chatItems]);
-  const progressRows = useMemo(() => progressRowsForSession(vmAgentMessages, selectedRunId).slice(-12), [selectedRunId, vmAgentMessages]);
   const thinkingMessages = useMemo(() => thinkingMessagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
   const messageSimulationSetup = useMemo(() => latestSimulationSetupFromMessages(currentMessages), [currentMessages]);
   const currentSimulationSetup = messageSimulationSetup || runDetail?.run.simulationSetup || selectedRun?.simulationSetup || null;
@@ -1137,7 +980,6 @@ export default function App() {
     const latest = [...currentMessages].reverse().find((message) => message.meta?.kind === "sentaurus_run");
     return latest ? `${latest.id}:${latest.meta?.vmRunArtifactCount ?? ""}:${latest.meta?.autoDebugAttemptCount ?? ""}` : "";
   }, [currentMessages]);
-  const latestProgress = progressRows.at(-1);
   const globalMessages = useMemo(() => globalAgentMessages(vmAgentMessages).slice(-6), [vmAgentMessages]);
   const contextStats = useMemo(() => estimateContextUsage(visibleMessages), [visibleMessages]);
   const query = sessionSearch.trim().toLowerCase();
@@ -1819,7 +1661,7 @@ export default function App() {
         </summary>
         <div className="thinking-steps">
           {thinkingMessages.length === 0 ? (
-            <p>Waiting for the VM worker to publish progress.</p>
+            <p>Waiting for the model to publish a reasoning summary.</p>
           ) : thinkingMessages.map((message) => (
             <div className={`thinking-row ${metaString(message, "thinkingStatus") || "running"}`} key={message.id}>
               <span>{thinkingStageLabel(message)}</span>
@@ -2038,13 +1880,6 @@ export default function App() {
 
   function formatWorklogEvent(message: VmAgentMessage): ReactNode {
     const kind = messageKind(message);
-    if (kind === "progress") {
-      const stage = metaString(message, "progressStage") || "progress";
-      const status = metaString(message, "progressStatus") || "running";
-      const detail = metaString(message, "progressDetail") || message.content;
-      const progress = typeof message.meta?.progress === "number" ? ` · ${message.meta.progress}%` : "";
-      return <span>{progressLabel(stage)} · {status}{progress}<br />{renderInlineCode(detail)}</span>;
-    }
     if (kind === "file_operation") {
       return <span>{message.content || `${metaString(message, "operation") || "Touched"} ${metaString(message, "path") || "file"}`}</span>;
     }
@@ -2093,7 +1928,7 @@ export default function App() {
               <div className="worklog-events">
                 {messages.map((message) => {
                   const kind = messageKind(message);
-                  const status = metaString(message, "status") || metaString(message, "progressStatus");
+                  const status = metaString(message, "status");
                   return (
                     <div className={`worklog-event kind-${kind || "event"} ${status || ""}`} key={message.id}>
                       <span>{kind ? kind.replace(/_/g, " ") : "event"}</span>
@@ -2440,7 +2275,7 @@ export default function App() {
     mobileLeftPanelOpen ? "mobile-left-open" : "",
     mobileRightPanelOpen ? "mobile-right-open" : ""
   ].filter(Boolean).join(" ");
-  const mobileSessionStatus = latestProgress ? `${progressLabel(latestProgress.stage)} ${latestProgress.status}` : selectedRun?.status || vmAgentStreamState;
+  const mobileSessionStatus = selectedRun?.status || vmAgentStreamState;
   const pendingAttachmentCount = pendingAttachments.length + pendingVmAttachments.length;
   const composerStatus = pendingAttachmentCount
     ? `${pendingAttachmentCount} attachment${pendingAttachmentCount === 1 ? "" : "s"} ready`
@@ -2591,7 +2426,6 @@ export default function App() {
               <span>stream: {vmAgentStreamState}</span>
               {selectedRunId && <span>history: {selectedHistoryPhase}</span>}
               {selectedRun && <span>{selectedRun.status}</span>}
-              {latestProgress && <span>{progressLabel(latestProgress.stage)}: {latestProgress.status}</span>}
               {clockSkewWarning && <span>VM clock skew: {clockSkewLabel}</span>}
               <span>context: {formatCompactNumber(contextStats.estimatedTokens)} / {formatCompactNumber(contextStats.maxTokens)} est. tokens</span>
             </div>
@@ -2622,61 +2456,6 @@ export default function App() {
             </button>
           </div>
         </header>
-
-        {!progressCollapsed && (
-          <button
-            aria-label="Close progress"
-            className="mobile-progress-backdrop"
-            onClick={() => setProgressCollapsed(true)}
-            type="button"
-          />
-        )}
-        <section className={`progress-panel ${progressCollapsed ? "collapsed" : ""}`} aria-label="Agent progress">
-          <div className="progress-panel-header">
-            <div>
-              <p className="eyebrow">Progress</p>
-              <h2>{latestProgress ? `${progressLabel(latestProgress.stage)} / ${latestProgress.status}` : "Idle"}</h2>
-            </div>
-            <div className="progress-panel-controls">
-              <span>{progressRows.length} event{progressRows.length === 1 ? "" : "s"}</span>
-              <button
-                aria-controls="agent-progress-table"
-                aria-expanded={!progressCollapsed}
-                className="secondary progress-toggle"
-                onClick={() => setProgressCollapsed((collapsed) => !collapsed)}
-                type="button"
-              >
-                {progressCollapsed ? "Show" : "Hide"}
-              </button>
-            </div>
-          </div>
-          <div className="progress-table-wrap" id="agent-progress-table" aria-hidden={progressCollapsed}>
-            <table className="progress-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Stage</th>
-                  <th>Status</th>
-                  <th>Progress</th>
-                  <th>Detail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {progressRows.length === 0 ? (
-                  <tr><td colSpan={5}>No progress events yet.</td></tr>
-                ) : progressRows.map((row) => (
-                  <tr className={`progress-${row.status}`} key={row.id}>
-                    <td title={row.vmCreatedAt ? `VM time: ${row.vmCreatedAt}` : undefined}>{formatDate(row.createdAt)}</td>
-                    <td>{progressLabel(row.stage)}</td>
-                    <td><span>{row.status}</span></td>
-                    <td>{row.progress === null ? "-" : `${row.progress}%`}</td>
-                    <td title={row.runId || undefined}>{row.detail}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
 
         <div className="message-list">
           {selectedRunId && selectedHistoryPhase === "loading" && (

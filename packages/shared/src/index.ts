@@ -22,6 +22,9 @@ export type VmAgentMessageKind =
   | "agent_response_delta"
   | "agent_response_done"
   | "agent_response_error"
+  | "agent_reasoning_summary"
+  | "agent_reasoning_summary_delta"
+  | "agent_reasoning_summary_done"
   | "agent_trace"
   | string;
 
@@ -52,6 +55,10 @@ export type VmAgentMessageMeta = {
   delta?: boolean;
   done?: boolean;
   streamState?: "queued" | "running" | "streaming" | "done" | "completed" | "error" | string;
+  thinkingStage?: string;
+  thinkingStatus?: string;
+  summaryIndex?: number;
+  providerItemId?: string;
   summaryOfGroup?: boolean;
 } & Record<string, unknown>;
 

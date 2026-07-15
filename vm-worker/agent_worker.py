@@ -28,7 +28,7 @@ except ImportError:
     fcntl = None
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.8.0"
+AGENT_VERSION = "0.9.0"
 DFISE_EXTRACTOR_VERSION = "dfise-idvg-extract/1"
 DFISE_METRIC_PROFILE = "tcad-idvg-v1"
 DFISE_MIN_SS_WINDOW_POINTS = 7
@@ -464,36 +464,6 @@ def append_message(role, content, source, meta=None, id_prefix=None, display_att
     audit("message", {"id": message.get("id"), "role": role, "source": source, "kind": (meta or {}).get("kind")})
     return message
 
-def append_progress(session_id, stage, status, detail, progress=None, run_id=""):
-    meta = {
-        "kind": "progress",
-        "sessionId": safe_text(session_id, 160),
-        "progressStage": safe_text(stage, 80),
-        "progressStatus": safe_text(status, 40),
-        "progressDetail": safe_text(detail, 500),
-    }
-    if progress is not None:
-        try:
-            meta["progress"] = max(0, min(100, int(progress)))
-        except Exception:
-            pass
-    if run_id:
-        meta["runId"] = safe_text(run_id, 180)
-    content = "Progress: %s %s - %s" % (stage, status, detail)
-    return append_message("system", content, "vm-agent-progress", meta, "progress")
-
-def append_thinking(session_id, request_message_id, stage, detail, status="running", collapsed=False):
-    meta = {
-        "kind": "agent_thinking",
-        "sessionId": safe_text(session_id, 160),
-        "requestMessageId": safe_text(request_message_id, 180),
-        "thinkingStage": safe_text(stage, 80),
-        "thinkingStatus": safe_text(status, 40),
-        "collapsedByDefault": bool(collapsed),
-    }
-    content = "%s: %s" % (safe_text(stage, 80), safe_text(detail, 900))
-    return append_message("system", content, "vm-agent-thinking", meta, "thinking")
-
 def base_worklog_meta(kind, session_id, turn_id_value, phase, run_id=""):
     meta = {
         "kind": kind,
@@ -525,7 +495,70 @@ def append_reasoning_summary(session_id, turn_id_value, phase, text, run_id="", 
         meta["summaryIndex"] = summary_index
     return append_message("agent", content, "vm-agent-thinking", meta, "reasoning")
 
+def create_reasoning_stream_publisher(session_id, turn_id_value, phase, run_id=""):
+    targets = {}
+    buffers = {}
+
+    def stream_key(event):
+        item_id = safe_text(event.get("item_id") or event.get("itemId"), 220).strip() or "reasoning"
+        try:
+            summary_index = int(event.get("summary_index") if event.get("summary_index") is not None else event.get("summaryIndex") or 0)
+        except Exception:
+            summary_index = 0
+        return "%s:%s" % (item_id, summary_index), item_id, summary_index
+
+    def target_for(key):
+        if key not in targets:
+            targets[key] = message_id("reasoning_item")
+            buffers[key] = ""
+        return targets[key]
+
+    def publish(event):
+        if not isinstance(event, dict):
+            return None
+        kind = safe_text(event.get("type"), 120).strip()
+        if not kind.startswith("response.reasoning_summary_"):
+            return None
+        key, provider_item_id, summary_index = stream_key(event)
+        target_id = target_for(key)
+        if kind == "response.reasoning_summary_text.delta":
+            delta = unicode_text(event.get("delta"), 4000)
+            if not delta:
+                return None
+            buffers[key] = unicode_text(buffers.get(key, "") + delta, 2400)
+            meta = base_worklog_meta("agent_reasoning_summary_delta", session_id, turn_id_value, phase, run_id)
+            meta.update({
+                "targetMessageId": target_id,
+                "providerItemId": provider_item_id,
+                "summaryIndex": summary_index,
+                "thinkingStage": safe_text(phase, 80) or "summary",
+                "thinkingStatus": "streaming",
+                "streamState": "streaming",
+                "append": True,
+                "delta": True,
+                "done": False,
+            })
+            return append_message("agent", delta, "vm-agent-thinking", meta, "reasoning_delta")
+        if kind == "response.reasoning_summary_text.done":
+            text = unicode_text(event.get("text"), 2400).strip() or buffers.get(key, "").strip()
+            meta = base_worklog_meta("agent_reasoning_summary_done", session_id, turn_id_value, phase, run_id)
+            meta.update({
+                "targetMessageId": target_id,
+                "providerItemId": provider_item_id,
+                "summaryIndex": summary_index,
+                "thinkingStage": safe_text(phase, 80) or "summary",
+                "thinkingStatus": "completed",
+                "streamState": "done",
+                "done": True,
+            })
+            return append_message("agent", text, "vm-agent-thinking", meta, "reasoning_done")
+        return None
+
+    return publish
+
 def append_reasoning_summaries_from_meta(session_id, turn_id_value, phase, meta, run_id=""):
+    if isinstance(meta, dict) and meta.get("reasoningSummariesStreamed"):
+        return 0
     encoded = meta.get("reasoningSummariesJson") if isinstance(meta, dict) else ""
     if not encoded:
         return 0
@@ -623,7 +656,7 @@ def read_all_messages():
 
 def non_progress_session_message(item):
     meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-    if meta.get("kind") in ["progress", "agent_thinking", "agent_reasoning_summary"]:
+    if meta.get("kind") in ["progress", "agent_thinking", "agent_reasoning_summary", "agent_reasoning_summary_delta", "agent_reasoning_summary_done"]:
         return False
     if item.get("source") == "vm-agent-progress":
         return False
@@ -2076,13 +2109,13 @@ def build_validation_repair_prompt(user_text, original_reply, validation_error):
         "Do not promise to run or extract later unless those steps are included in the same run request.",
     ])
 
-def repair_run_request_reply(user_text, original_reply, validation_error, session_id="", current_message_id=""):
+def repair_run_request_reply(user_text, original_reply, validation_error, session_id="", current_message_id="", on_reasoning_event=None):
     config = load_config()
     if not llm_configured(config):
         return None, {"kind": "run_request_validation_error", "llmConfigured": False}
     repair_prompt = build_validation_repair_prompt(user_text, original_reply, validation_error)
     try:
-        reply, meta = run_with_timeout(llm_hard_timeout_seconds(config), "VM agent run-request repair", call_llm, repair_prompt, config, session_id, current_message_id)
+        reply, meta = run_with_timeout(llm_hard_timeout_seconds(config), "VM agent run-request repair", call_llm, repair_prompt, config, session_id, current_message_id, on_reasoning_event)
         meta["kind"] = "llm"
         meta["runRequestRepair"] = True
         meta["validationError"] = safe_text(validation_error, 1000)
@@ -2278,42 +2311,32 @@ def execute_run_request(request, session_id="", turn_id_value=""):
     write_utf8(os.path.join(run_dir, "run_request.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
     append_file_operation(session_id, turn_id_value, "created", "run_request.json", OUTPUT_CATEGORY_PARAMS, 0, run_id)
     audit("sentaurus_run_started", {"runId": run_id, "title": title, "sessionId": session_id})
-    append_progress(session_id, "runner_prepare", "completed", "Prepared run directory %s with %s file(s)" % (run_id, len(written)), 50, run_id)
     step_results = []
     postprocess_results = []
     ok = True
-    step_count = max(1, len(steps))
     for index, step in enumerate(steps, 1):
         tool = safe_text(step.get("tool"), 40).strip().lower()
         entry = safe_file_name(step.get("input") or step.get("entry") or step.get("entryFile"))
-        step_start_progress = 55 + int(((index - 1) / float(step_count)) * 35)
-        append_progress(session_id, "sentaurus_step", "running", "Step %s/%s: %s %s" % (index, step_count, tool, entry), step_start_progress, run_id)
         append_tool_run(session_id, turn_id_value, tool, "%s %s" % (tool, entry), "running", None, None, run_id)
         result = run_step(run_dir, step, index)
         step_results.append(result)
         duration_ms = int(float(result.get("seconds") or 0) * 1000)
         if result.get("exitCode") != 0:
             ok = False
-            append_progress(session_id, "sentaurus_step", "failed", "Step %s/%s: %s %s exit %s" % (index, step_count, result.get("tool"), result.get("input"), result.get("exitCode")), step_start_progress, run_id)
             append_tool_run(session_id, turn_id_value, result.get("tool") or tool, "%s %s" % (result.get("tool") or tool, result.get("input") or entry), "failed", result.get("exitCode"), duration_ms, run_id)
             if result.get("stderrTail"):
                 append_run_diagnostic(session_id, turn_id_value, "Sentaurus step failed: %s %s exit %s. Log tail: %s" % (result.get("tool") or tool, result.get("input") or entry, result.get("exitCode"), safe_text(result.get("stderrTail").replace("\n", " | "), 500)), run_id)
             break
-        append_progress(session_id, "sentaurus_step", "completed", "Step %s/%s: %s %s exit 0 in %ss" % (index, step_count, result.get("tool"), result.get("input"), result.get("seconds")), min(95, step_start_progress + max(1, int(35 / float(step_count)))), run_id)
         append_tool_run(session_id, turn_id_value, result.get("tool") or tool, "%s %s" % (result.get("tool") or tool, result.get("input") or entry), "succeeded", result.get("exitCode"), duration_ms, run_id)
     if ok:
         for index, spec in enumerate(postprocess, 1):
-            append_progress(session_id, "postprocess", "running", "Postprocess %s/%s: fixed dfise-idvg-v1 extractor" % (index, len(postprocess)), 92, run_id)
             append_tool_run(session_id, turn_id_value, "dfise-idvg-v1", "fixed tcad-idvg-v1 postprocess", "running", None, None, run_id)
             result = run_dfise_postprocess(run_dir, session_id, spec, index)
             postprocess_results.append(result)
             semantic_ok = result.get("status") == "ok" and result.get("exitCode") == 0
             append_tool_run(session_id, turn_id_value, "dfise-idvg-v1", "fixed tcad-idvg-v1 postprocess", "succeeded" if semantic_ok else "failed", result.get("exitCode"), int(float(result.get("seconds") or 0) * 1000), run_id)
-            if semantic_ok:
-                append_progress(session_id, "postprocess", "completed", "Fixed DF-ISE extraction completed with all required metrics", 98, run_id)
-            else:
+            if not semantic_ok:
                 ok = False
-                append_progress(session_id, "postprocess", "failed", "Fixed DF-ISE extraction returned %s (%s)" % (result.get("status"), result.get("errorCode") or "unknown"), 98, run_id)
                 append_run_diagnostic(session_id, turn_id_value, "DF-ISE postprocess failed semantic validation: %s %s" % (result.get("errorCode") or "unknown", result.get("errorMessage") or ""), run_id)
                 break
     manifest["postprocessResults"] = postprocess_results
@@ -2339,7 +2362,6 @@ def execute_run_request(request, session_id="", turn_id_value=""):
     for artifact in artifacts[:16]:
         append_file_operation(session_id, turn_id_value, "produced", artifact.get("path"), None, artifact.get("size"), run_id)
     audit("sentaurus_run_finished", {"runId": run_id, "ok": ok, "status": manifest.get("status"), "steps": step_results, "postprocess": postprocess_results})
-    append_progress(session_id, "artifacts", "completed" if ok else "failed", "Collected %s artifact/log file(s)" % len(artifacts), 100 if ok else 95, run_id)
     return manifest
 
 def metric_number(value, precision=8):
@@ -2683,14 +2705,12 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
     latest_setup = initial_setup
     stop_reason = ""
     for attempt_no in range(1, max_attempts + 1):
-        append_progress(session_id, "runner", "running", "Attempt %s/%s: executing allowlisted Sentaurus run request" % (attempt_no, max_attempts), 45, "")
         append_worklog(session_id, turn_id_value, "tool", "Starting Sentaurus attempt %s/%s and recording files/tool steps." % (attempt_no, max_attempts))
         result = execute_run_request(run_request, session_id, turn_id_value)
         result["autoDebugAttempt"] = attempt_no
         attempts.append(result)
         if result.get("status") == "succeeded":
             if attempt_no > 1:
-                append_progress(session_id, "autodebug", "completed", "Auto-debug succeeded on attempt %s/%s" % (attempt_no, max_attempts), 100, result.get("id"))
                 append_run_diagnostic(session_id, turn_id_value, "Auto-debug succeeded after attempt %s." % attempt_no, result.get("id"))
             return format_autodebug_reply(visible_reply, attempts, "", repair_notes), result, attempts, latest_setup, ""
         if attempt_no >= max_attempts:
@@ -2699,11 +2719,11 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
         if not is_recoverable_run_failure(result):
             stop_reason = "failure was not considered safely recoverable"
             break
-        append_progress(session_id, "autodebug", "running", "Attempt %s failed; diagnosing logs and repairing deck" % attempt_no, 95, result.get("id"))
         append_worklog(session_id, turn_id_value, "debug", "Run attempt failed; reading failed-step logs and trying to generate a safe repair deck.", result.get("id"))
         repair_prompt = build_repair_prompt(original_user_text, run_request, result, attempts)
         try:
-            repair_reply, _repair_meta = run_with_timeout(llm_hard_timeout_seconds(config), "VM agent auto-debug repair LLM call", call_llm, repair_prompt, config, session_id, current_message_id)
+            repair_reasoning = create_reasoning_stream_publisher(session_id, turn_id_value, "debug", result.get("id"))
+            repair_reply, _repair_meta = run_with_timeout(llm_hard_timeout_seconds(config), "VM agent auto-debug repair LLM call", call_llm, repair_prompt, config, session_id, current_message_id, repair_reasoning)
             append_reasoning_summaries_from_meta(session_id, turn_id_value, "debug", _repair_meta, result.get("id"))
             repair_setup, repair_without_setup = extract_json_tag(repair_reply, "SIMULATION_SETUP")
             if repair_setup:
@@ -2713,19 +2733,15 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
                 repair_notes.append(repair_visible)
             if not next_run_request:
                 stop_reason = "repair LLM did not produce a corrected run request"
-                append_progress(session_id, "repair_llm", "failed", stop_reason, 100, result.get("id"))
                 append_run_diagnostic(session_id, turn_id_value, "Auto-debug did not return a new executable run request.", result.get("id"))
                 break
             run_request = apply_locked_idvg_contract(next_run_request, contract)
-            append_progress(session_id, "repair_llm", "completed", "Repair request ready for attempt %s/%s" % (attempt_no + 1, max_attempts), 45, result.get("id"))
             append_worklog(session_id, turn_id_value, "debug", "Generated repaired run request; preparing next attempt.", result.get("id"))
         except Exception as exc:
             stop_reason = "repair LLM failed: %s" % safe_text(str(exc), 500)
-            append_progress(session_id, "repair_llm", "failed", stop_reason, 100, result.get("id"))
             append_run_diagnostic(session_id, turn_id_value, "Auto-debug repair call failed: %s" % safe_text(str(exc), 500), result.get("id"))
             break
     final = attempts[-1] if attempts else {}
-    append_progress(session_id, "autodebug", "failed", stop_reason or "auto-debug stopped without a successful run", 100, final.get("id"))
     append_run_diagnostic(session_id, turn_id_value, "Auto-debug stopped: %s" % (stop_reason or "no successful run"), final.get("id"))
     return format_autodebug_reply(visible_reply, attempts, stop_reason, repair_notes), final, attempts, latest_setup, stop_reason
 
@@ -3015,13 +3031,19 @@ def parse_responses_result(data):
             seen_summaries.add(text)
             summaries.append(text)
     for item in data.get("output", []) or []:
-        for summary in item.get("summary", []) or []:
+        item_summaries = item.get("summary")
+        if not isinstance(item_summaries, list):
+            item_summaries = []
+        for summary in item_summaries:
             if isinstance(summary, dict):
                 add_summary(summary.get("text") or summary.get("content"))
             else:
                 add_summary(summary)
     reasoning = data.get("reasoning") if isinstance(data.get("reasoning"), dict) else {}
-    for summary in reasoning.get("summary", []) or []:
+    reasoning_summaries = reasoning.get("summary")
+    if not isinstance(reasoning_summaries, list):
+        reasoning_summaries = []
+    for summary in reasoning_summaries:
         if isinstance(summary, dict):
             add_summary(summary.get("text") or summary.get("content"))
         else:
@@ -3048,6 +3070,79 @@ def parse_responses_result(data):
 def parse_responses_text(data):
     return parse_responses_result(data).get("text") or ""
 
+def iter_responses_sse(response):
+    event_name = ""
+    data_lines = []
+    plain_lines = []
+
+    def decode_event(name, lines):
+        if not lines:
+            return None
+        payload = u"\n".join(lines).strip()
+        if not payload or payload == "[DONE]":
+            return None
+        event = json.loads(payload)
+        if isinstance(event, dict) and name and not event.get("type"):
+            event["type"] = name
+        return event
+
+    for raw_line in response:
+        try:
+            line = raw_line.decode("utf-8", "replace")
+        except AttributeError:
+            line = raw_line
+        line = line.rstrip("\r\n")
+        if not line:
+            event = decode_event(event_name, data_lines)
+            if event is not None:
+                yield event
+            event_name = ""
+            data_lines = []
+        elif line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+        elif line.startswith(":"):
+            continue
+        elif line.strip():
+            plain_lines.append(line)
+    event = decode_event(event_name, data_lines)
+    if event is not None:
+        yield event
+    if plain_lines:
+        value = json.loads(u"\n".join(plain_lines))
+        if isinstance(value, dict):
+            yield value
+
+def parse_responses_stream(response, on_reasoning_event=None):
+    completed_response = None
+    output_text_parts = []
+    reasoning_event_count = 0
+    reasoning_text_event_count = 0
+    for event in iter_responses_sse(response):
+        kind = safe_text(event.get("type"), 160).strip()
+        if kind.startswith("response.reasoning_summary_"):
+            reasoning_event_count += 1
+            if kind in ["response.reasoning_summary_text.delta", "response.reasoning_summary_text.done"]:
+                reasoning_text_event_count += 1
+            if on_reasoning_event is not None:
+                on_reasoning_event(event)
+        elif kind == "response.output_text.delta":
+            output_text_parts.append(unicode_text(event.get("delta"), 1000000))
+        elif kind == "response.output_text.done" and not output_text_parts:
+            output_text_parts.append(unicode_text(event.get("text"), 1000000))
+        elif kind == "response.completed":
+            completed_response = event.get("response") if isinstance(event.get("response"), dict) else event
+        elif kind in ["response.failed", "response.error", "error"]:
+            error = event.get("error") if isinstance(event.get("error"), dict) else {}
+            raise Exception(safe_text(error.get("message") or event.get("message") or "LLM streaming response failed", 1000))
+    parsed = parse_responses_result(completed_response or {})
+    if not parsed.get("text") and output_text_parts:
+        parsed["text"] = u"".join(output_text_parts).strip()
+    parsed["reasoningEventCount"] = reasoning_event_count
+    parsed["reasoningTextEventCount"] = reasoning_text_event_count
+    return parsed
+
 def responses_request_payload(user_text, config, model, system):
     reasoning = {"effort": config.get("reasoning_effort") or DEFAULT_REASONING_EFFORT}
     summary_mode = safe_text(config.get("reasoning_summary") or DEFAULT_REASONING_SUMMARY, 40).strip().lower()
@@ -3056,6 +3151,7 @@ def responses_request_payload(user_text, config, model, system):
     return {
         "model": model,
         "reasoning": reasoning,
+        "stream": True,
         "input": [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
@@ -3065,7 +3161,7 @@ def responses_request_payload(user_text, config, model, system):
 def llm_hard_timeout_seconds(config):
     return int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS) + 15
 
-def call_llm_model(user_text, config, model, system):
+def call_llm_model(user_text, config, model, system, on_reasoning_event=None):
     user_text = unicode_text(user_text, 1000000)
     system = unicode_text(system, 1000000)
     model = safe_text(model, 200)
@@ -3079,9 +3175,10 @@ def call_llm_model(user_text, config, model, system):
             request = urllib2.Request(responses_url(config.get("api_base")), body, {
                 "content-type": "application/json",
                 "authorization": "Bearer %s" % config.get("api_key"),
-                "user-agent": "sentaurus-vm-agent/0.8.0",
+                "accept": "text/event-stream",
+                "user-agent": "sentaurus-vm-agent/0.9.0",
             })
-            return urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS)).read()
+            return urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS))
         try:
             response = send_responses_request(payload)
         except Exception as exc:
@@ -3094,15 +3191,12 @@ def call_llm_model(user_text, config, model, system):
                 summary_downgraded = True
             else:
                 raise
-        try:
-            text = response.decode("utf-8", "replace")
-        except AttributeError:
-            text = response
-        parsed = parse_responses_result(json.loads(text))
+        parsed = parse_responses_stream(response, on_reasoning_event)
         if not parsed.get("text"):
             raise Exception("LLM returned no content")
         parsed["reasoningSummaryRequested"] = summary_requested
         parsed["reasoningSummaryDowngraded"] = summary_downgraded
+        parsed["reasoningSummariesStreamed"] = bool(on_reasoning_event is not None and parsed.get("reasoningTextEventCount"))
         return parsed
 
     payload = {
@@ -3117,7 +3211,7 @@ def call_llm_model(user_text, config, model, system):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.8.0",
+        "user-agent": "sentaurus-vm-agent/0.9.0",
     })
     response = urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS)).read()
     try:
@@ -3184,9 +3278,9 @@ def build_llm_system_prompt(snapshot, recent_session_context, manual_context, cu
         "Before saying previous files, run directories, decks, or results are unavailable, inspect the recent browser-session context below. "
         "If the user says 'continue', 'that project', or similar, resolve it from the same-session context whenever possible. "
         "User-facing replies should be Chinese by default unless the user asks otherwise. "
-        "Do not reveal hidden chain-of-thought. If progress visibility is useful, write concise public worklog summaries in Chinese. "
+        "Do not reveal hidden chain-of-thought. Use concise public worklogs only for observable tool, file, and run activity; provider reasoning summaries are streamed separately. "
         "Public worklog summaries must describe observable actions, decisions, and status, not private reasoning traces. "
-        "Final answers should be concise and separated from progress, diagnostics, and attachments. "
+        "Final answers should be concise and separated from worklogs, diagnostics, and attachments. "
         u"Publish real outputs with <VM_SESSION_FILE>. PNG/JPEG/WebP/GIF/SVG are image previews; CSV/JSON/DAT/TXT/PLT/PDF and other allowlisted artifacts are general downloadable files. A run artifact may use {\"category\":\"仿真结果文件\",\"name\":\"safe-name.csv\",\"runId\":\"run_...\",\"artifactPath\":\"artifacts/safe-name.csv\"}; a safe ~/STDB file may use sourcePath. Do not send non-images through image-only assumptions. "
         "The browser and host backend only relay messages; API credentials stay inside this VM. "
         u"Current VM skill snapshot: " + unicode_text(json.dumps(snapshot, ensure_ascii=True, sort_keys=True), 200000) + u"\n\n" +
@@ -3199,7 +3293,7 @@ def build_llm_system_prompt(snapshot, recent_session_context, manual_context, cu
         u"VM-local Sentaurus manual/context excerpts:\n" + unicode_text(manual_context, 400000)
     )
 
-def call_llm(user_text, config, session_id="", current_message_id=""):
+def call_llm(user_text, config, session_id="", current_message_id="", on_reasoning_event=None):
     snapshot = skill_snapshot()
     manual_context = read_manual_context(user_text)
     recent_session_context = session_context(session_id, current_message_id)
@@ -3228,7 +3322,7 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
     errors = []
     for index, model in enumerate(models):
         try:
-            model_result = call_llm_model(user_text, config, model, system)
+            model_result = call_llm_model(user_text, config, model, system, on_reasoning_event)
             reply = model_result.get("text") or ""
             meta = {
                 "kind": "llm",
@@ -3245,6 +3339,8 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
                 meta["fallbackCount"] = index
             if model_result.get("reasoningSummaries"):
                 meta["reasoningSummariesJson"] = json.dumps(model_result.get("reasoningSummaries"), ensure_ascii=True)
+            if model_result.get("reasoningSummariesStreamed"):
+                meta["reasoningSummariesStreamed"] = True
             if model_result.get("reasoningSummaryDowngraded"):
                 meta["reasoningSummaryDowngraded"] = True
             return reply, meta
@@ -3277,7 +3373,7 @@ def strip_structured_reply_blocks(reply):
         return "Structured execution content was suppressed for this read-only response."
     return safe_text(reply, 4000).strip()
 
-def side_investigation_reply(side_prompt, config, session_id="", current_message_id=""):
+def side_investigation_reply(side_prompt, config, session_id="", current_message_id="", on_reasoning_event=None):
     question = safe_text(side_prompt, 4000).strip()
     if not question:
         return u"Usage: /side <question>. This runs a side investigation without replacing the main thread.", {"kind": "side_investigation", "llmConfigured": llm_configured(config)}
@@ -3308,7 +3404,7 @@ def side_investigation_reply(side_prompt, config, session_id="", current_message
     errors = []
     for index, model in enumerate(models):
         try:
-            model_result = call_llm_model(question, config, model, system)
+            model_result = call_llm_model(question, config, model, system, on_reasoning_event)
             reply = model_result.get("text") or ""
             meta = {
                 "kind": "side_investigation",
@@ -3325,6 +3421,8 @@ def side_investigation_reply(side_prompt, config, session_id="", current_message
                 meta["fallbackCount"] = index
             if model_result.get("reasoningSummaries"):
                 meta["reasoningSummariesJson"] = json.dumps(model_result.get("reasoningSummaries"), ensure_ascii=True)
+            if model_result.get("reasoningSummariesStreamed"):
+                meta["reasoningSummariesStreamed"] = True
             if model_result.get("reasoningSummaryDowngraded"):
                 meta["reasoningSummaryDowngraded"] = True
             return u"[Side]\n" + strip_structured_reply_blocks(reply), meta
@@ -3334,7 +3432,7 @@ def side_investigation_reply(side_prompt, config, session_id="", current_message
             audit("side_llm_model_failed", {"model": model, "error": error_text})
     raise Exception("; ".join(errors) or "no LLM model candidates configured")
 
-def handle_local_command(text, config, session_id="", current_message_id=""):
+def handle_local_command(text, config, session_id="", current_message_id="", on_reasoning_event=None):
     command = parse_local_command(text)
     if not command:
         return None
@@ -3349,13 +3447,13 @@ def handle_local_command(text, config, session_id="", current_message_id=""):
     if name == "plan":
         return local_plan_reply(session_id, args)
     if name == "side":
-        return run_with_timeout(llm_hard_timeout_seconds(config), "VM agent side investigation", side_investigation_reply, args, config, session_id, current_message_id)
+        return run_with_timeout(llm_hard_timeout_seconds(config), "VM agent side investigation", side_investigation_reply, args, config, session_id, current_message_id, on_reasoning_event)
     return local_help_reply(), {"kind": "local_help", "llmConfigured": llm_configured(config)}
 
-def reply_for(text, session_id="", current_message_id=""):
+def reply_for(text, session_id="", current_message_id="", on_reasoning_event=None):
     config = load_config()
     try:
-        command_reply = handle_local_command(text, config, session_id, current_message_id)
+        command_reply = handle_local_command(text, config, session_id, current_message_id, on_reasoning_event)
         if command_reply:
             return command_reply
     except Exception as exc:
@@ -3367,7 +3465,7 @@ def reply_for(text, session_id="", current_message_id=""):
             "or config.json. Sentaurus safe skills are already available; ask for status/tools to test them."
         ), {"kind": "config_required", "llmConfigured": False}
     try:
-        return run_with_timeout(llm_hard_timeout_seconds(config), "VM agent LLM call", call_llm, text, config, session_id, current_message_id)
+        return run_with_timeout(llm_hard_timeout_seconds(config), "VM agent LLM call", call_llm, text, config, session_id, current_message_id, on_reasoning_event)
     except Exception as exc:
         return "VM agent LLM call failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": True, "modelCandidates": ",".join(config.get("models") or [])}
 
@@ -3391,6 +3489,7 @@ def open_queue_file_for_processing(path):
 
 def process_queue_file(path):
     session_id = ""
+    request_turn_id = ""
     queue_handle = None
     try:
         queue_handle = open_queue_file_for_processing(path)
@@ -3407,7 +3506,6 @@ def process_queue_file(path):
         attachments = item.get("contextAttachments") if isinstance(item.get("contextAttachments"), list) else item.get("attachments") if isinstance(item.get("attachments"), list) else []
         display_attachments = []
         audit("queue_processing_started", {"file": os.path.basename(path), "sessionId": session_id, "workerPid": os.getpid()})
-        append_progress(session_id, "received", "running", "Worker picked up queued request", 5)
         append_worklog(session_id, request_turn_id, "planning", "Received this request; preparing context and attachments before deciding whether Sentaurus execution is needed.")
         if attachments:
             append_worklog(session_id, request_turn_id, "file", "Reading %s attachment reference(s); readable text enters context, images/binaries stay metadata-only." % len(attachments))
@@ -3420,19 +3518,16 @@ def process_queue_file(path):
         workflow = read_session_workflow(session_id) if safe_session_key(session_id) else default_session_workflow("")
         plan_mode = not command and workflow.get("plan", {}).get("mode") == "plan"
         if command and command.get("name") == "side":
-            append_progress(session_id, "side", "running", "Running an independent side investigation", 20)
             append_worklog(session_id, request_turn_id, "planning", "Running a side investigation while keeping the main thread and durable goal unchanged.")
         elif command:
-            append_progress(session_id, "skill", "running", "Handling local slash-command skill", 20)
             append_worklog(session_id, request_turn_id, "planning", "Handling this local VM skill request without exposing API credentials.")
         elif plan_mode:
-            append_progress(session_id, "plan", "running", "Building a read-only execution plan", 20)
             append_worklog(session_id, request_turn_id, "planning", "Plan mode is active; inspecting context while simulation and file mutations remain locked.")
         else:
-            append_progress(session_id, "llm_context", "running", "Building session history and manual context", 12)
             append_worklog(session_id, request_turn_id, "planning", "Building same-session history context and Sentaurus manual context.")
         append_worklog(session_id, request_turn_id, "planning", "Calling the VM-local configured model to generate a reply or safe run request.")
-        reply, meta = reply_for(text, session_id, request_message_id)
+        reasoning_publisher = create_reasoning_stream_publisher(session_id, request_turn_id, "planning")
+        reply, meta = reply_for(text, session_id, request_message_id, reasoning_publisher)
         append_reasoning_summaries_from_meta(session_id, request_turn_id, "planning", meta)
         if not command and not plan_mode and safe_session_key(session_id):
             latest_workflow = read_session_workflow(session_id)
@@ -3481,9 +3576,7 @@ def process_queue_file(path):
                 published_display_attachments.append(publish_vm_session_file(session_id, spec))
                 if published_display_attachments[-1]:
                     append_file_operation(session_id, request_turn_id, "published", published_display_attachments[-1].get("path"), published_display_attachments[-1].get("category"), published_display_attachments[-1].get("size"), session_id)
-                append_progress(session_id, "attachment_publish", "completed", "Published file %s to session output" % safe_text(spec.get("name") or os.path.basename(safe_text(spec.get("sourcePath"), 500)), 180), 100)
             except Exception as exc:
-                append_progress(session_id, "attachment_publish", "failed", "Failed to publish file: %s" % safe_text(str(exc), 300), 100)
                 publish_errors.append(safe_text(str(exc), 300))
                 append_run_diagnostic(session_id, request_turn_id, "File publish failed: %s" % safe_text(str(exc), 300))
                 audit("vm_session_file_publish_failed", {"sessionId": session_id, "error": safe_text(str(exc), 500), "spec": spec})
@@ -3501,9 +3594,9 @@ def process_queue_file(path):
             append_worklog(session_id, request_turn_id, "planning", "Checking whether the model returned a safely executable Sentaurus run request.")
             validation_error = run_request_validation_error(run_request, visible_reply, text)
             if validation_error:
-                append_progress(session_id, "run_validation", "failed", validation_error, 100)
                 append_worklog(session_id, request_turn_id, "debug", "Run request needs repair before execution; attempting safe completion/correction.")
-                repaired_reply, repaired_meta = repair_run_request_reply(text, reply, validation_error, session_id, request_message_id)
+                repair_reasoning = create_reasoning_stream_publisher(session_id, request_turn_id, "debug")
+                repaired_reply, repaired_meta = repair_run_request_reply(text, reply, validation_error, session_id, request_message_id, repair_reasoning)
                 meta = repaired_meta
                 append_reasoning_summaries_from_meta(session_id, request_turn_id, "debug", repaired_meta)
                 if repaired_reply:
@@ -3526,18 +3619,6 @@ def process_queue_file(path):
         elif run_request:
             simulation_setup = setup_from_run_request(run_request)
             meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
-        if meta.get("kind") in ["plan_updated", "plan_response"]:
-            append_progress(session_id, "plan", "completed", "Plan response is ready; execution remains locked until approval", 100)
-        elif meta.get("kind") == "plan_error":
-            append_progress(session_id, "plan", "failed", "Plan command or response could not be applied", 100)
-        elif meta.get("kind") in ["command_error", "goal_error"]:
-            append_progress(session_id, "skill", "failed", "Local workflow command could not be applied", 100)
-        elif meta.get("kind") == "sentaurus_skill":
-            append_progress(session_id, "skill", "completed", "Local skill reply is ready", 100)
-        elif meta.get("kind") == "llm_error":
-            append_progress(session_id, "llm", "failed", "LLM call failed; see agent message", 100)
-        else:
-            append_progress(session_id, "llm", "completed", "LLM produced %s" % ("a Sentaurus run request" if run_request else "a chat reply"), 35)
         if run_request:
             append_worklog(session_id, request_turn_id, "tool", "Run request passed validation; executing allowlisted Sentaurus flow and collecting outputs.")
             reply, result, attempts, simulation_setup, stop_reason = run_with_autodebug(text, run_request, visible_reply, session_id, request_message_id, request_turn_id, simulation_setup)
@@ -3554,14 +3635,11 @@ def process_queue_file(path):
             meta["vmRunArtifactsJson"] = json.dumps(artifacts, ensure_ascii=True, sort_keys=True)
             meta["autoDebugAttemptCount"] = len(attempts)
             meta["autoDebugAttemptsJson"] = json.dumps(attempts_meta(attempts), ensure_ascii=True, sort_keys=True)
-            append_progress(session_id, "final", "completed" if result.get("status") == "succeeded" else "failed", "Final simulation result appended to chat", 100, result.get("id") or "")
             if stop_reason:
                 meta["autoDebugStoppedReason"] = stop_reason
             if simulation_setup:
                 meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
         elif meta.get("kind") != "llm_error":
-            if meta.get("kind") not in ["command_error", "goal_error", "plan_error"]:
-                append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
             reply = visible_reply or reply
         display_attachments = (published_display_attachments + display_attachments)[:12]
         if published_display_attachments:
@@ -3626,7 +3704,9 @@ def process_queue_file(path):
         error_meta = {"kind": "worker_error"}
         if session_id:
             error_meta["sessionId"] = session_id
-            append_progress(session_id, "worker", "failed", "Worker failed to process queued message", 100)
+        if request_turn_id:
+            error_meta["turnId"] = request_turn_id
+            error_meta["groupId"] = request_turn_id
         append_message("system", "VM agent worker failed to process a message: %s" % safe_text(str(exc), 1000), "vm-agent-worker", error_meta)
         try:
             shutil.move(path, os.path.join(DONE_DIR, "failed_" + os.path.basename(path)))

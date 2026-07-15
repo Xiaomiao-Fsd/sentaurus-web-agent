@@ -734,10 +734,10 @@ test("SSE disconnect aborts its SSH history consumer", async () => {
 });
 
 
-test("VM context budget constants and compression guard persist", () => {
-  const source = fs.readFileSync(path.join(repoRoot, "apps/server/src/services/vmAgent.ts"), "utf8");
-  assert.match(source, /VM_CONTEXT_WINDOW_TOKENS = 1000000/);
-  assert.match(source, /VM_CONTEXT_TARGET_TOKENS = 850000/);
+test("deployed VM worker context budgets and compression guard persist", () => {
+  const source = fs.readFileSync(path.join(repoRoot, "agent_worker.py"), "utf8");
+  assert.match(source, /NON_GPT_56_CONTEXT_WINDOW_TOKENS = 272000/);
+  assert.match(source, /GPT_56_CONTEXT_WINDOW_TOKENS = 353000/);
   assert.ok(source.includes("context_tokens = estimate_context_tokens(system) + estimate_context_tokens(user_text)"));
-  assert.match(source, /Same-session context compressed to fit the 1.0M-token model window/);
+  assert.match(source, /Same-session context compressed to fit the configured model window/);
 });

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import type { VmAgentHistoryResponse } from "@sentaurus-agent/shared";
+import { mergeMessageList } from "../src/messageStreams.js";
 import {
   assertHistoryResponse,
   completedSessionHistoryState,
@@ -130,6 +131,23 @@ test("concurrent worker artifacts collapse to one final without hiding unrelated
     "attach-1",
     "real-error"
   ]);
+});
+
+test("frontend merges reasoning deltas into one completed thinking item", () => {
+  const base = { role: "agent" as const, createdAt: "2026-07-15T00:00:00Z" };
+  const messages = [
+    { ...base, id: "delta-1", content: "Plan", meta: { kind: "agent_reasoning_summary_delta", sessionId: "run-a", turnId: "turn-a", targetMessageId: "reasoning-1", append: true, delta: true, thinkingStatus: "streaming" } },
+    { ...base, id: "delta-2", content: " safely", meta: { kind: "agent_reasoning_summary_delta", sessionId: "run-a", turnId: "turn-a", targetMessageId: "reasoning-1", append: true, delta: true, thinkingStatus: "streaming" } },
+    { ...base, id: "done", content: "Plan safely", meta: { kind: "agent_reasoning_summary_done", sessionId: "run-a", turnId: "turn-a", targetMessageId: "reasoning-1", done: true, streamState: "done", thinkingStatus: "completed" } },
+    { ...base, id: "legacy-echo", content: "d", meta: { kind: "agent_reasoning_summary", sessionId: "run-a", turnId: "turn-a", summaryIndex: 2, thinkingStatus: "completed" } }
+  ];
+  const merged = mergeMessageList([], messages);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0]?.id, "reasoning-1");
+  assert.equal(merged[0]?.content, "Plan safely");
+  assert.equal(merged[0]?.meta?.kind, "agent_reasoning_summary");
+  assert.equal(merged[0]?.meta?.thinkingStatus, "completed");
+  assert.equal(merged[0]?.meta?.done, true);
 });
 
 
