@@ -100,6 +100,29 @@ test("typed postprocess rejects arbitrary parser or script fields", () => {
   assert.match(result.error, /unsupported field/);
 });
 
+test("typed postprocess preserves two-point SS and an independent DIBL current", () => {
+  const result = runWorkerAction({
+    kind: "normalize",
+    spec: {
+      kind: "dfise-idvg-v1",
+      lowInput: "idvg_low.plt",
+      highInput: "idvg_high.plt",
+      ssMethod: "two-point-log-interpolation-v1",
+      ssCurrentMinAperUm: 1e-9,
+      ssCurrentMaxAperUm: 1e-8,
+      vthCurrentAperUm: 1e-6,
+      diblCurrentAperUm: 1e-7,
+      outputPrefix: "idvg_custom"
+    }
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.value.ssMethod, "two-point-log-interpolation-v1");
+  assert.equal(result.value.ssCurrentMinAperUm, 1e-9);
+  assert.equal(result.value.ssCurrentMaxAperUm, 1e-8);
+  assert.equal(result.value.vthCurrentAperUm, 1e-6);
+  assert.equal(result.value.diblCurrentAperUm, 1e-7);
+});
+
 test("runner rejects exit-zero payloads whose declared outputs are missing", () => {
   const action: Record<string, unknown> = {};
   const result = runWorkerAction(action, (tempDir) => {
@@ -130,11 +153,12 @@ test("runner rejects exit-zero payloads whose declared outputs are missing", () 
       "    'status': 'ok',",
       "    'metricProfile': 'tcad-idvg-v1',",
       "    'extractorVersion': 'dfise-idvg-extract/1',",
+      "    'methods': {'ss': 'max-adjacent-slope-v1'},",
       "    'inputs': {",
       "        'low': {'sha256': digest(low), 'actualVd': 0.05, 'validPointCount': 20},",
       "        'high': {'sha256': digest(high), 'actualVd': 0.8, 'validPointCount': 20},",
       "    },",
-      "    'metrics': {'vthLowV': 0.2, 'vthHighV': 0.1, 'ssLowMvPerDec': 70.0, 'ssHighMvPerDec': 75.0, 'diblMvPerV': 133.333333333, 'ssLowWindowPointCount': 7, 'ssHighWindowPointCount': 7, 'ssLowAdjacentPairCount': 6, 'ssHighAdjacentPairCount': 6},",
+      "    'metrics': {'vthLowV': 0.2, 'vthHighV': 0.1, 'ssLowMvPerDec': 70.0, 'ssHighMvPerDec': 75.0, 'diblMvPerV': 133.333333333, 'vgLowAtDiblCurrentV': 0.2, 'vgHighAtDiblCurrentV': 0.1, 'ssLowWindowPointCount': 7, 'ssHighWindowPointCount': 7, 'ssLowAdjacentPairCount': 6, 'ssHighAdjacentPairCount': 6},",
       "    'outputs': {",
       "        'csv': prefix + '_extracted.csv',",
       "        'metricsJson': prefix + '_metrics.json',",
@@ -197,11 +221,12 @@ test("runner maps sparse finite SS support to structured incomplete", () => {
       "    'status': 'ok',",
       "    'metricProfile': 'tcad-idvg-v1',",
       "    'extractorVersion': 'dfise-idvg-extract/1',",
+      "    'methods': {'ss': 'max-adjacent-slope-v1'},",
       "    'inputs': {",
       "        'low': {'sha256': digest(low), 'actualVd': 0.05, 'validPointCount': 20},",
       "        'high': {'sha256': digest(high), 'actualVd': 0.8, 'validPointCount': 20},",
       "    },",
-      "    'metrics': {'vthLowV': 0.2, 'vthHighV': 0.1, 'ssLowMvPerDec': 70.0, 'ssHighMvPerDec': 94.0, 'diblMvPerV': 133.333333333, 'ssLowWindowPointCount': 23, 'ssHighWindowPointCount': 4, 'ssLowAdjacentPairCount': 22, 'ssHighAdjacentPairCount': 3},",
+      "    'metrics': {'vthLowV': 0.2, 'vthHighV': 0.1, 'ssLowMvPerDec': 70.0, 'ssHighMvPerDec': 94.0, 'diblMvPerV': 133.333333333, 'vgLowAtDiblCurrentV': 0.2, 'vgHighAtDiblCurrentV': 0.1, 'ssLowWindowPointCount': 23, 'ssHighWindowPointCount': 4, 'ssLowAdjacentPairCount': 22, 'ssHighAdjacentPairCount': 3},",
       "    'outputs': {",
       "        'csv': prefix + '_extracted.csv',",
       "        'metricsJson': prefix + '_metrics.json',",
@@ -264,7 +289,7 @@ test("capability and fixed worker context persist together", () => {
     assert.match(worker, /do not generate Inspect cv_\* extraction or dynamic Tcl\/Python parsers/i);
     assert.match(worker, /user_text = unicode_text\(user_text, 1000000\)/);
     assert.match(worker, /system = unicode_text\(system, 1000000\)/);
-    assert.equal((worker.match(/json\.dumps\(payload, ensure_ascii=True\)/g) || []).length, 2);
+    assert.equal((worker.match(/json\.dumps\((?:payload|request_payload), ensure_ascii=True\)/g) || []).length, 2);
     assert.match(worker, /unicode_text\(recent_session_context, 400000\)/);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -281,9 +306,9 @@ test("artifact attachments keep general files separate from image previews", () 
     ]
   });
   assert.deepEqual(result.map((item: Record<string, unknown>) => [item.name, item.kind]), [
+    ["plot.png", "image"],
     ["result.csv", "file"],
-    ["result.plt", "file"],
-    ["plot.png", "image"]
+    ["result.plt", "file"]
   ]);
 });
 

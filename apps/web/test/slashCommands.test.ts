@@ -18,7 +18,8 @@ test("slash command suggestions filter and apply stable templates", () => {
   const suggestions = slashCommandSuggestions("/s");
   assert.deepEqual(suggestions.map((item) => item.command), ["/side"]);
   assert.equal(applySlashCommandSuggestion("   /s", suggestions[0]!), "   /side ");
-  assert.deepEqual(slashCommandSuggestions("/").map((item) => item.command), ["/goal", "/side", "/help"]);
+  assert.deepEqual(slashCommandSuggestions("/").map((item) => item.command), ["/goal", "/plan", "/side", "/help"]);
+  assert.equal(applySlashCommandSuggestion("/p", slashCommandSuggestions("/p")[0]!), "/plan ");
   assert.equal(applySlashCommandSuggestion("/h", slashCommandSuggestions("/h")[0]!), "/help");
 });
 

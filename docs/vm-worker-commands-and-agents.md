@@ -6,12 +6,27 @@ The CentOS VM worker supports session-scoped commands sent through the normal We
 
 - `/goal` shows the current session goal.
 - `/goal set <text>` and `/goal <text>` set or replace the goal.
-- `/goal complete` marks the current goal completed and removes it from later normal prompts.
+- `/goal pause`, `/goal resume`, and `/goal block [reason]` update the goal lifecycle.
+- `/goal complete` marks the current goal complete and removes it from later normal prompts.
 - `/goal clear` removes the saved goal.
+- `/plan` enters read-only plan mode. The next normal message may inspect context and propose a structured plan, but cannot publish files or start a Sentaurus run.
+- `/plan show` displays the persisted plan and step states.
+- `/plan approve` approves the plan and returns to execution mode without starting a simulation by itself.
+- `/plan exit` leaves plan mode without approval; `/plan clear` also removes its persisted steps.
+- `/plan step <id> <pending|in_progress|completed>` updates one step. At most one step can be `in_progress`.
 - `/side <task>` runs the task through the existing sequential worker queue with main conversation history and the active session goal excluded. Side request, progress, and result messages carry `contextScope: "side"` and a `sideTaskId`; those messages remain visible in the Web session but are excluded from later normal prompt history.
 - `/help` lists these commands and the existing VM status/tool commands.
 
-Goals are stored at `~/.sentaurus-web-agent/vm-agent/goals.json`. The worker writes this file atomically. An active goal is injected into later normal model prompts for the same Web session.
+Goal and plan state are stored per session under `~/.sentaurus-web-agent/vm-agent/workflows/`. The worker compatibly loads an existing per-session file from `goals/` and writes it into the workflow record on the next update. Updates use an atomic replacement, a session lock, and an optimistic `revision`; an active goal is injected into later normal model prompts for the same Web session.
+
+Authenticated host endpoints:
+
+```text
+GET   /api/vm/agent/sessions/:sessionId/workflow
+PATCH /api/vm/agent/sessions/:sessionId/workflow
+```
+
+PATCH accepts a typed workflow action plus optional `expectedRevision`. It never accepts a VM path or shell command. A stale revision returns HTTP 409 so multiple clients cannot silently overwrite one another.
 
 ## Global instructions
 

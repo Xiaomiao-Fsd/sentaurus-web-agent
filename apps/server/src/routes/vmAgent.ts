@@ -6,6 +6,10 @@ import type {
   VmAgentMessageAttachment,
   VmAgentMessageRequest,
   VmAgentModelUpdateRequest,
+  VmAgentPlanStep,
+  VmAgentPlanStepStatus,
+  VmAgentWorkflowAction,
+  VmAgentWorkflowUpdateRequest,
   VmSessionOutputCategory
 } from "@sentaurus-agent/shared";
 import { config } from "../config.js";
@@ -26,6 +30,7 @@ import {
 } from "../services/vmAgent.js";
 import { validateVmAgentInstructionsContent } from "../services/vmAgentInstructions.js";
 import { parseVmAgentModelId } from "../services/vmAgentModels.js";
+import { getVmAgentWorkflow, updateVmAgentWorkflow } from "../services/vmAgentWorkflow.js";
 import { contentTypeForName, downloadVmSessionFile, listVmSessionFiles, vmSessionOutputCategories } from "../services/vmSessionFiles.js";
 
 function parseCursor(value: unknown): number {
@@ -79,7 +84,140 @@ export type VmAgentRouteOptions = {
   saveVmAgentAgentsMd?: typeof saveVmAgentAgentsMd;
   getVmAgentModels?: typeof getVmAgentModels;
   setVmAgentModel?: typeof setVmAgentModel;
+  getVmAgentWorkflow?: typeof getVmAgentWorkflow;
+  updateVmAgentWorkflow?: typeof updateVmAgentWorkflow;
 };
+
+const workflowActions = new Set<VmAgentWorkflowAction>([
+  "goal.set",
+  "goal.pause",
+  "goal.resume",
+  "goal.block",
+  "goal.complete",
+  "goal.clear",
+  "plan.enter",
+  "plan.set",
+  "plan.step",
+  "plan.approve",
+  "plan.exit",
+  "plan.clear"
+]);
+
+function validateWorkflowUpdate(value: unknown): VmAgentWorkflowUpdateRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    const error = new Error("workflow update body must be an object") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  const item = value as Record<string, unknown>;
+  const action = item.action;
+  if (typeof action !== "string" || !workflowActions.has(action as VmAgentWorkflowAction)) {
+    const error = new Error("workflow action is unsupported") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  const expectedRevision = item.expectedRevision;
+  if (expectedRevision !== undefined && (
+    !Number.isInteger(expectedRevision) || (expectedRevision as number) < 0
+  )) {
+    const error = new Error("expectedRevision must be a non-negative integer") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+  const revision = expectedRevision === undefined ? {} : { expectedRevision: expectedRevision as number };
+  const payload = item.payload;
+  const requirePayload = (): Record<string, unknown> => {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      const error = new Error("workflow payload must be an object") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    return payload as Record<string, unknown>;
+  };
+  const invalid = (message: string): never => {
+    const error = new Error(message) as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  };
+
+  if (action === "goal.set") {
+    const objective = requirePayload().objective;
+    if (typeof objective !== "string" || !objective.trim() || objective.trim().length > 2000) {
+      invalid("goal objective must be between 1 and 2000 characters");
+    }
+    return { action, ...revision, payload: { objective: (objective as string).trim() } };
+  }
+  if (action === "goal.block") {
+    if (payload === undefined) return { action, ...revision };
+    const reason = requirePayload().reason;
+    if (reason !== undefined && (typeof reason !== "string" || reason.trim().length > 1000)) {
+      invalid("goal block reason must be a string up to 1000 characters");
+    }
+    return {
+      action,
+      ...revision,
+      payload: { ...(typeof reason === "string" && reason.trim() ? { reason: reason.trim() } : {}) }
+    };
+  }
+  if (action === "plan.set") {
+    const plan = requirePayload();
+    if (!Array.isArray(plan.steps) || plan.steps.length > 64) {
+      invalid("plan steps must be an array with at most 64 entries");
+    }
+    const statuses = new Set<VmAgentPlanStepStatus>(["pending", "in_progress", "completed"]);
+    const steps: VmAgentPlanStep[] = (plan.steps as unknown[]).map((raw: unknown) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) invalid("each plan step must be an object");
+      const step = raw as Record<string, unknown>;
+      if (typeof step.id !== "string" || !/^[A-Za-z0-9_.:-]{1,80}$/.test(step.id)) {
+        invalid("plan step id contains unsupported characters");
+      }
+      if (typeof step.step !== "string" || !step.step.trim() || step.step.trim().length > 1000) {
+        invalid("plan step text must be between 1 and 1000 characters");
+      }
+      if (typeof step.status !== "string" || !statuses.has(step.status as VmAgentPlanStepStatus)) {
+        invalid("plan step status is unsupported");
+      }
+      return {
+        id: step.id as string,
+        step: (step.step as string).trim(),
+        status: step.status as VmAgentPlanStepStatus
+      };
+    });
+    const inProgressCount = steps.filter((step) => step.status === "in_progress").length;
+    if (inProgressCount > 1) invalid("plan may contain at most one in_progress step");
+    if (plan.explanation !== undefined && (
+      typeof plan.explanation !== "string" || plan.explanation.trim().length > 4000
+    )) {
+      invalid("plan explanation must be a string up to 4000 characters");
+    }
+    return {
+      action,
+      ...revision,
+      payload: {
+        steps,
+        ...(typeof plan.explanation === "string" && plan.explanation.trim()
+          ? { explanation: plan.explanation.trim() }
+          : {})
+      }
+    };
+  }
+  if (action === "plan.step") {
+    const step = requirePayload();
+    if (typeof step.stepId !== "string" || !/^[A-Za-z0-9_.:-]{1,80}$/.test(step.stepId)) {
+      invalid("plan step id contains unsupported characters");
+    }
+    const statuses = new Set<VmAgentPlanStepStatus>(["pending", "in_progress", "completed"]);
+    if (typeof step.status !== "string" || !statuses.has(step.status as VmAgentPlanStepStatus)) {
+      invalid("plan step status is unsupported");
+    }
+    return {
+      action,
+      ...revision,
+      payload: { stepId: step.stepId as string, status: step.status as VmAgentPlanStepStatus }
+    };
+  }
+  return { action: action as Exclude<VmAgentWorkflowAction, "goal.set" | "goal.block" | "plan.set" | "plan.step">, ...revision };
+}
 
 function clientAbortSignal(request: FastifyRequest, reply: FastifyReply): { signal: AbortSignal; cleanup: () => void } {
   const controller = new AbortController();
@@ -214,6 +352,8 @@ export async function vmAgentRoutes(app: FastifyInstance, options: VmAgentRouteO
   const persistVmAgentAgentsMd = options.saveVmAgentAgentsMd ?? saveVmAgentAgentsMd;
   const loadVmAgentModels = options.getVmAgentModels ?? getVmAgentModels;
   const persistVmAgentModel = options.setVmAgentModel ?? setVmAgentModel;
+  const loadVmAgentWorkflow = options.getVmAgentWorkflow ?? getVmAgentWorkflow;
+  const persistVmAgentWorkflow = options.updateVmAgentWorkflow ?? updateVmAgentWorkflow;
   app.get("/api/vm/agent/status", async (request) => {
     requireAuth(request);
     return getVmAgentStatus();
@@ -310,6 +450,42 @@ export async function vmAgentRoutes(app: FastifyInstance, options: VmAgentRouteO
     );
     return { ok: result.status.ok, ...result };
   });
+
+  app.get<{ Params: { sessionId: string } }>("/api/vm/agent/sessions/:sessionId/workflow", async (request, reply) => {
+    requireAuth(request);
+    const sessionId = parseSessionId(request.params.sessionId);
+    if (!sessionId) {
+      const error = new Error("sessionId is required") as Error & { statusCode?: number };
+      error.statusCode = 400;
+      throw error;
+    }
+    const client = clientAbortSignal(request, reply);
+    try {
+      return await loadVmAgentWorkflow(sessionId, client.signal);
+    } finally {
+      client.cleanup();
+    }
+  });
+
+  app.patch<{ Params: { sessionId: string }; Body: VmAgentWorkflowUpdateRequest }>(
+    "/api/vm/agent/sessions/:sessionId/workflow",
+    async (request, reply) => {
+      requireAuth(request);
+      const sessionId = parseSessionId(request.params.sessionId);
+      if (!sessionId) {
+        const error = new Error("sessionId is required") as Error & { statusCode?: number };
+        error.statusCode = 400;
+        throw error;
+      }
+      const update = validateWorkflowUpdate(request.body);
+      const client = clientAbortSignal(request, reply);
+      try {
+        return await persistVmAgentWorkflow(sessionId, update, client.signal);
+      } finally {
+        client.cleanup();
+      }
+    }
+  );
 
   app.get<{ Params: { runId: string }; Querystring: { path?: string; token?: string } }>("/api/vm/agent/runs/:runId/artifacts", async (request, reply) => {
     requireAuth(request);

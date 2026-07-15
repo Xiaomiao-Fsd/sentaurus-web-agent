@@ -1,5 +1,9 @@
 {
   "llmApiBase": "https://your-openai-compatible-base/v1", 
   "llmApiKey": "put-real-key-here-inside-vm-only", 
-  "llmModel": "gpt-5.5"
+  "llmModel": "gpt-5.5",
+  "llmModels": ["gpt-5.5"],
+  "llmApiStyle": "openai-responses",
+  "llmReasoningEffort": "max",
+  "llmReasoningSummary": "auto"
 }

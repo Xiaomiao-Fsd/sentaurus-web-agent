@@ -1,5 +1,5 @@
 {
-  "extractorSha256": "e44a9e6ebc22b04b6ec77474fd6188336283cf73e237a1006666a1765fbfac4e", 
+  "extractorSha256": "caacde7dd0539de4af82b1de963df921bc4d49cbc7bcf41b262541c55fd0c1b0",
   "extractorVersion": "dfise-idvg-extract/1", 
   "metricProfile": "tcad-idvg-v1", 
   "parserPath": "/home/TCAD2022/.sentaurus-web-agent/vm-agent/dfise_idvg_extract.py", 
@@ -8,6 +8,8 @@
     "Use the fixed dfise-idvg-v1 postprocess for readable DF-ISE .plt Id-Vg extraction.", 
     "Do not generate Inspect cv_* extraction or dynamic Tcl/Python parsers.", 
     "Read actual drain biases from file content and reject expected-bias mismatches.", 
+    "Support max-adjacent-slope-v1 and two-point-log-interpolation-v1 SS definitions.",
+    "Allow the DIBL constant-current target to differ from the Vth target.",
     "Declare success only when all required finite metrics are present.", 
     "Publish non-image outputs as general files and PNG outputs as images."
   ]

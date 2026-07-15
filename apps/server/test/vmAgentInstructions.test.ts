@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import Fastify from "fastify";
 import type { VmAgentInstructionsResponse } from "@sentaurus-agent/shared";
 import { config } from "../src/config.js";
 import { vmAgentRoutes } from "../src/routes/vmAgent.js";
+import { remoteAgentScript } from "../src/services/vmAgent.js";
 import {
   validateVmAgentInstructionsContent,
   VM_AGENT_INSTRUCTIONS_MAX_BYTES
@@ -18,6 +20,34 @@ const response: VmAgentInstructionsResponse = {
   maxBytes: VM_AGENT_INSTRUCTIONS_MAX_BYTES,
   updatedAt: "2026-07-14T00:00:00Z"
 };
+
+test("default VM AGENTS.md templates stay aligned and cover the simulation workflow", () => {
+  const serverTemplate = readFileSync(new URL("../remote/AGENTS.md", import.meta.url), "utf8");
+  const installerTemplate = readFileSync(new URL("../../../vm-worker/AGENTS.example.md", import.meta.url), "utf8");
+
+  assert.equal(serverTemplate, installerTemplate);
+  assert.ok(Buffer.byteLength(serverTemplate, "utf8") <= VM_AGENT_INSTRUCTIONS_MAX_BYTES);
+
+  const connectScript = remoteAgentScript({ operation: "start" });
+  const encodedTemplate = connectScript.match(/^AGENTS_SOURCE_B64 = "([A-Za-z0-9+/=]+)"$/m)?.[1];
+  assert.ok(encodedTemplate);
+  assert.equal(Buffer.from(encodedTemplate, "base64").toString("utf8"), serverTemplate);
+  assert.match(connectScript, /if not os\.path\.lexists\(AGENTS_PATH\):/);
+  assert.match(connectScript, /os\.O_WRONLY \| os\.O_CREAT \| os\.O_EXCL/);
+
+  for (const requiredSection of [
+    "## 3. 完成定义",
+    "SDE -> mesh -> SDevice -> extraction/plot",
+    "`dfise-idvg-v1`",
+    "## 7. 绘图与数据质量",
+    "## 8. 数据对比规则",
+    "## 9. 论文阅读与仿真复现",
+    "## 10. 模糊需求与参数优化",
+    "## 12. 最终回复格式"
+  ]) {
+    assert.match(serverTemplate, new RegExp(requiredSection.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+});
 
 test("AGENTS.md validation uses UTF-8 bytes and rejects invalid bodies", () => {
   assert.equal(validateVmAgentInstructionsContent("plain text"), "plain text");

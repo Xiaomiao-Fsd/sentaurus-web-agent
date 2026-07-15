@@ -23,6 +23,10 @@ chmod 600 ~/.sentaurus-web-agent/vm-agent/.env
 
 Never commit or publish the resulting `.env` or `config.json`.
 
+Responses-style providers may set `LLM_REASONING_SUMMARY=auto` (or `concise`/`detailed`). The worker publishes only provider-approved summaries and observable execution summaries; it never stores raw hidden reasoning. If the endpoint rejects the summary option, the request is retried without it.
+
+The fixed `dfise-idvg-v1` postprocessor supports both the legacy `max-adjacent-slope-v1` SS method and `two-point-log-interpolation-v1` with explicit current bounds. `diblCurrentAperUm` can be set independently from `vthCurrentAperUm`, and successful metrics are included directly in the final chat reply.
+
 ## Autostart
 
 The launcher supports `start`, `status`, `stop`, and `restart`. To run it after reboot:

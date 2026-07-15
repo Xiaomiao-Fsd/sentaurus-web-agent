@@ -1,5 +1,5 @@
 export type SlashCommandSuggestion = {
-  command: "/goal" | "/side" | "/help";
+  command: "/goal" | "/plan" | "/side" | "/help";
   label: string;
   description: string;
   template: string;
@@ -10,9 +10,16 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   {
     command: "/goal",
     label: "/goal",
-    description: "Show, set, or clear the durable goal for this session.",
+    description: "Show or update the durable goal lifecycle for this session.",
     template: "/goal ",
-    usage: "/goal [set|complete|clear] [text]"
+    usage: "/goal [set|pause|resume|block|complete|clear] [text]"
+  },
+  {
+    command: "/plan",
+    label: "/plan",
+    description: "Enter or manage read-only planning before execution.",
+    template: "/plan ",
+    usage: "/plan [show|enter|approve|exit|clear|step]"
   },
   {
     command: "/side",

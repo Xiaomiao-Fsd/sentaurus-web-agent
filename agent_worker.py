@@ -28,12 +28,14 @@ except ImportError:
     fcntl = None
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.7.0"
+AGENT_VERSION = "0.8.0"
 DFISE_EXTRACTOR_VERSION = "dfise-idvg-extract/1"
 DFISE_METRIC_PROFILE = "tcad-idvg-v1"
 DFISE_MIN_SS_WINDOW_POINTS = 7
 DFISE_MIN_SS_ADJACENT_PAIRS = 6
-DFISE_EXTRACTOR_SHA256 = "e44a9e6ebc22b04b6ec77474fd6188336283cf73e237a1006666a1765fbfac4e"
+DFISE_SS_METHOD = "max-adjacent-slope-v1"
+DFISE_SS_TWO_POINT_METHOD = "two-point-log-interpolation-v1"
+DFISE_EXTRACTOR_SHA256 = "caacde7dd0539de4af82b1de963df921bc4d49cbc7bcf41b262541c55fd0c1b0"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 DFISE_EXTRACTOR_PATH = os.path.join(ROOT, "dfise_idvg_extract.py")
@@ -46,10 +48,12 @@ CONFIG_PATH = os.path.join(ROOT, "config.json")
 ENV_PATH = os.path.join(ROOT, ".env")
 MANUALS_DIR = os.path.join(ROOT, "manuals")
 GOALS_DIR = os.path.join(ROOT, "goals")
+WORKFLOWS_DIR = os.path.join(ROOT, "workflows")
 GLOBAL_AGENTS_PATH = os.path.join(ROOT, "AGENTS.md")
 ALLOWED_MODELS = ["gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_REASONING_EFFORT = "max"
+DEFAULT_REASONING_SUMMARY = "auto"
 DEFAULT_LLM_TIMEOUT_SECONDS = 600
 NON_GPT_56_CONTEXT_WINDOW_TOKENS = 272000
 GPT_56_CONTEXT_WINDOW_TOKENS = 353000
@@ -96,6 +100,35 @@ def session_goal_path(session_id):
         return ""
     return os.path.join(GOALS_DIR, key + ".json")
 
+def session_workflow_path(session_id):
+    key = safe_session_key(session_id)
+    if not key:
+        return ""
+    return os.path.join(WORKFLOWS_DIR, key + ".json")
+
+def acquire_workflow_lock(session_id):
+    path = session_workflow_path(session_id)
+    if not path:
+        raise ValueError("sessionId is required for workflow state")
+    ensure_dir(WORKFLOWS_DIR)
+    handle = open(path + ".lock", "a+")
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            handle.close()
+            raise
+    return handle
+
+def release_workflow_lock(handle):
+    if handle is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
 def read_json_file(path, fallback=None):
     if not path or not os.path.exists(path):
         return fallback
@@ -105,51 +138,279 @@ def read_json_file(path, fallback=None):
     except Exception:
         return fallback
 
-def read_session_goal_record(session_id):
-    path = session_goal_path(session_id)
-    value = read_json_file(path, {})
+def atomic_replace_file(temp_path, target_path):
+    if hasattr(os, "replace"):
+        os.replace(temp_path, target_path)
+    else:
+        os.rename(temp_path, target_path)
+
+def default_session_workflow(session_id):
+    return {
+        "version": 1,
+        "revision": 0,
+        "sessionId": safe_session_key(session_id),
+        "goal": None,
+        "plan": {"mode": "default", "steps": []},
+    }
+
+def normalize_goal_record(value):
     if not isinstance(value, dict):
         return None
-    goal_text = safe_text(value.get("goal"), 2000).strip()
-    if not goal_text:
+    objective = safe_text(value.get("objective") or value.get("goal"), 2000).strip()
+    if not objective:
         return None
-    return {
-        "goal": goal_text,
-        "updatedAt": safe_text(value.get("updatedAt"), 80) or now_iso(),
-    }
-
-def session_goal_text(session_id, limit=2000):
-    record = read_session_goal_record(session_id)
-    return safe_text(record.get("goal"), limit).strip() if record else ""
-
-def write_session_goal(session_id, goal_text):
-    path = session_goal_path(session_id)
-    if not path:
-        raise ValueError("sessionId is required for /goal")
+    status = safe_text(value.get("status"), 40).strip().lower()
+    if status not in ["active", "paused", "blocked", "complete"]:
+        status = "active"
+    created_at = safe_text(value.get("createdAt") or value.get("updatedAt"), 80).strip() or now_iso()
+    updated_at = safe_text(value.get("updatedAt"), 80).strip() or created_at
     record = {
-        "goal": safe_text(goal_text, 2000).strip(),
-        "updatedAt": now_iso(),
+        "objective": objective,
+        "status": status,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
     }
-    if not record["goal"]:
-        raise ValueError("goal text cannot be empty")
-    ensure_dir(GOALS_DIR)
+    completed_at = safe_text(value.get("completedAt"), 80).strip()
+    if completed_at and status == "complete":
+        record["completedAt"] = completed_at
+    blocked_reason = safe_text(value.get("blockedReason"), 1000).strip()
+    if blocked_reason and status == "blocked":
+        record["blockedReason"] = blocked_reason
+    return record
+
+def normalize_plan_steps(value):
+    if not isinstance(value, list):
+        return []
+    steps = []
+    seen = set()
+    in_progress_count = 0
+    for index, item in enumerate(value[:64]):
+        if isinstance(item, string_types):
+            item = {"step": item}
+        if not isinstance(item, dict):
+            continue
+        text = safe_text(item.get("step"), 1000).strip()
+        if not text:
+            continue
+        step_id = re.sub(r"[^A-Za-z0-9_.:-]", "-", safe_text(item.get("id"), 80).strip())
+        step_id = step_id.strip("-") or "step-%02d" % (index + 1)
+        base_id = step_id
+        suffix = 2
+        while step_id in seen:
+            step_id = "%s-%s" % (base_id, suffix)
+            suffix += 1
+        seen.add(step_id)
+        status = safe_text(item.get("status"), 40).strip().lower()
+        if status not in ["pending", "in_progress", "completed"]:
+            status = "pending"
+        if status == "in_progress":
+            in_progress_count += 1
+            if in_progress_count > 1:
+                raise ValueError("plan may contain at most one in_progress step")
+        steps.append({"id": step_id, "step": text, "status": status})
+    return steps
+
+def normalize_plan_record(value):
+    if not isinstance(value, dict):
+        value = {}
+    mode = safe_text(value.get("mode"), 20).strip().lower()
+    if mode not in ["default", "plan"]:
+        mode = "default"
+    plan = {"mode": mode, "steps": normalize_plan_steps(value.get("steps"))}
+    explanation = safe_text(value.get("explanation"), 4000).strip()
+    if explanation:
+        plan["explanation"] = explanation
+    updated_at = safe_text(value.get("updatedAt"), 80).strip()
+    if updated_at:
+        plan["updatedAt"] = updated_at
+    approved_at = safe_text(value.get("approvedAt"), 80).strip()
+    if approved_at:
+        plan["approvedAt"] = approved_at
+    return plan
+
+def normalize_session_workflow(session_id, value):
+    result = default_session_workflow(session_id)
+    if not isinstance(value, dict):
+        return result
+    try:
+        result["revision"] = max(0, int(value.get("revision") or 0))
+    except Exception:
+        result["revision"] = 0
+    result["goal"] = normalize_goal_record(value.get("goal"))
+    result["plan"] = normalize_plan_record(value.get("plan"))
+    updated_at = safe_text(value.get("updatedAt"), 80).strip()
+    if updated_at:
+        result["updatedAt"] = updated_at
+    return result
+
+def read_session_workflow(session_id):
+    path = session_workflow_path(session_id)
+    if not path:
+        raise ValueError("sessionId is required for workflow state")
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as handle:
+                value = json.load(handle)
+        except Exception as exc:
+            raise ValueError("workflow state is unreadable: %s" % safe_text(str(exc), 300))
+        if not isinstance(value, dict):
+            raise ValueError("workflow state must be a JSON object")
+        return normalize_session_workflow(session_id, value)
+    legacy_goal = read_json_file(session_goal_path(session_id), None)
+    workflow = default_session_workflow(session_id)
+    workflow["goal"] = normalize_goal_record(legacy_goal)
+    return workflow
+
+def validate_expected_workflow_revision(current, expected_revision):
+    if expected_revision is None:
+        return
+    try:
+        expected_revision = int(expected_revision)
+    except Exception:
+        raise ValueError("expectedRevision must be a non-negative integer")
+    if expected_revision < 0:
+        raise ValueError("expectedRevision must be a non-negative integer")
+    if current.get("revision") != expected_revision:
+        raise ValueError("workflow_conflict: expected revision %s but found %s" % (expected_revision, current.get("revision")))
+
+def write_session_workflow(session_id, value, expected_revision=None):
+    path = session_workflow_path(session_id)
+    if not path:
+        raise ValueError("sessionId is required for workflow state")
+    current = read_session_workflow(session_id)
+    validate_expected_workflow_revision(current, expected_revision)
+    workflow = normalize_session_workflow(session_id, value)
+    workflow["revision"] = int(current.get("revision") or 0) + 1
+    workflow["updatedAt"] = now_iso()
+    ensure_dir(WORKFLOWS_DIR)
     temp_path = path + ".tmp.%s" % uuid.uuid4().hex[:8]
     try:
         with open(temp_path, "w") as handle:
-            handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True))
+            handle.write(json.dumps(workflow, ensure_ascii=True, sort_keys=True))
             handle.flush()
             os.fsync(handle.fileno())
-        os.rename(temp_path, path)
+        atomic_replace_file(temp_path, path)
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+    return workflow
+
+def _apply_workflow_action_unlocked(session_id, action, payload=None, expected_revision=None):
+    action = safe_text(action, 80).strip().lower()
+    payload = payload if isinstance(payload, dict) else {}
+    workflow = read_session_workflow(session_id)
+    validate_expected_workflow_revision(workflow, expected_revision)
+    timestamp = now_iso()
+    if action == "goal.set":
+        objective = safe_text(payload.get("objective"), 2000).strip()
+        if not objective:
+            raise ValueError("goal objective is required")
+        existing = workflow.get("goal") if isinstance(workflow.get("goal"), dict) else {}
+        workflow["goal"] = {
+            "objective": objective,
+            "status": "active",
+            "createdAt": existing.get("createdAt") or timestamp,
+            "updatedAt": timestamp,
+        }
+    elif action in ["goal.pause", "goal.resume", "goal.block", "goal.complete"]:
+        goal = workflow.get("goal")
+        if not isinstance(goal, dict):
+            raise ValueError("this session has no goal")
+        status_by_action = {
+            "goal.pause": "paused",
+            "goal.resume": "active",
+            "goal.block": "blocked",
+            "goal.complete": "complete",
+        }
+        goal["status"] = status_by_action[action]
+        goal["updatedAt"] = timestamp
+        if action == "goal.complete":
+            goal["completedAt"] = timestamp
+            goal.pop("blockedReason", None)
+        elif action == "goal.block":
+            reason = safe_text(payload.get("reason"), 1000).strip()
+            if reason:
+                goal["blockedReason"] = reason
+        elif action == "goal.resume":
+            goal.pop("blockedReason", None)
+            goal.pop("completedAt", None)
+    elif action == "goal.clear":
+        workflow["goal"] = None
+    elif action == "plan.enter":
+        workflow["plan"]["mode"] = "plan"
+        workflow["plan"].pop("approvedAt", None)
+        workflow["plan"]["updatedAt"] = timestamp
+    elif action == "plan.set":
+        workflow["plan"] = {
+            "mode": "plan",
+            "steps": normalize_plan_steps(payload.get("steps")),
+            "updatedAt": timestamp,
+        }
+        explanation = safe_text(payload.get("explanation"), 4000).strip()
+        if explanation:
+            workflow["plan"]["explanation"] = explanation
+    elif action == "plan.step":
+        step_id = safe_text(payload.get("stepId"), 80).strip()
+        status = safe_text(payload.get("status"), 40).strip().lower()
+        if status not in ["pending", "in_progress", "completed"]:
+            raise ValueError("plan step status is unsupported")
+        selected = None
+        for step in workflow["plan"].get("steps") or []:
+            if step.get("id") == step_id:
+                selected = step
+            elif status == "in_progress" and step.get("status") == "in_progress":
+                raise ValueError("plan may contain at most one in_progress step")
+        if selected is None:
+            raise ValueError("plan step was not found")
+        selected["status"] = status
+        workflow["plan"]["updatedAt"] = timestamp
+    elif action == "plan.approve":
+        if workflow["plan"].get("mode") != "plan":
+            raise ValueError("plan mode is not active")
+        if not workflow["plan"].get("steps"):
+            raise ValueError("plan has no steps to approve")
+        workflow["plan"]["mode"] = "default"
+        workflow["plan"]["approvedAt"] = timestamp
+        workflow["plan"]["updatedAt"] = timestamp
+    elif action == "plan.exit":
+        workflow["plan"]["mode"] = "default"
+        workflow["plan"]["updatedAt"] = timestamp
+    elif action == "plan.clear":
+        workflow["plan"] = {"mode": "default", "steps": [], "updatedAt": timestamp}
+    else:
+        raise ValueError("unsupported workflow action: %s" % action)
+    return write_session_workflow(session_id, workflow, expected_revision)
+
+def apply_workflow_action(session_id, action, payload=None, expected_revision=None):
+    lock_handle = acquire_workflow_lock(session_id)
+    try:
+        return _apply_workflow_action_unlocked(session_id, action, payload, expected_revision)
+    finally:
+        release_workflow_lock(lock_handle)
+
+def read_session_goal_record(session_id):
+    goal = read_session_workflow(session_id).get("goal")
+    if not isinstance(goal, dict):
+        return None
+    record = dict(goal)
+    record["goal"] = goal.get("objective")
+    return record
+
+def session_goal_text(session_id, limit=2000):
+    record = read_session_goal_record(session_id)
+    return safe_text(record.get("objective"), limit).strip() if record and record.get("status") == "active" else ""
+
+def write_session_goal(session_id, goal_text):
+    workflow = apply_workflow_action(session_id, "goal.set", {"objective": goal_text})
+    record = dict(workflow.get("goal") or {})
+    record["goal"] = record.get("objective")
     return record
 
 def clear_session_goal(session_id):
-    path = session_goal_path(session_id)
-    if not path or not os.path.exists(path):
+    workflow = read_session_workflow(session_id)
+    if not workflow.get("goal"):
         return False
-    os.remove(path)
+    apply_workflow_action(session_id, "goal.clear")
     return True
 
 def read_global_agents_context(limit=48000):
@@ -252,6 +513,31 @@ def base_worklog_meta(kind, session_id, turn_id_value, phase, run_id=""):
 def append_worklog(session_id, turn_id_value, phase, text, run_id=""):
     meta = base_worklog_meta("worklog_summary", session_id, turn_id_value, phase, run_id)
     return append_message("agent", text, "vm-agent-worklog", meta, "worklog")
+
+def append_reasoning_summary(session_id, turn_id_value, phase, text, run_id="", summary_index=None):
+    content = safe_text(text, 2400).strip()
+    if not content:
+        return None
+    meta = base_worklog_meta("agent_reasoning_summary", session_id, turn_id_value, phase, run_id)
+    meta["thinkingStage"] = safe_text(phase, 80) or "summary"
+    meta["thinkingStatus"] = "completed"
+    if summary_index is not None:
+        meta["summaryIndex"] = summary_index
+    return append_message("agent", content, "vm-agent-thinking", meta, "reasoning")
+
+def append_reasoning_summaries_from_meta(session_id, turn_id_value, phase, meta, run_id=""):
+    encoded = meta.get("reasoningSummariesJson") if isinstance(meta, dict) else ""
+    if not encoded:
+        return 0
+    try:
+        summaries = json.loads(encoded)
+    except Exception:
+        summaries = []
+    count = 0
+    for index, summary in enumerate(summaries[:4]):
+        if append_reasoning_summary(session_id, turn_id_value, phase, summary, run_id, index + 1):
+            count += 1
+    return count
 
 def append_file_operation(session_id, turn_id_value, operation, path, category=None, size=None, run_id=""):
     file_path = safe_text(path, 500).replace("\\", "/")
@@ -361,6 +647,7 @@ def parse_local_command(text):
         "sentaurus-status": "status",
         "help": "help",
         "goal": "goal",
+        "plan": "plan",
         "side": "side",
     }
     if name not in aliases:
@@ -369,10 +656,10 @@ def parse_local_command(text):
 
 def excluded_from_main_context(item):
     meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-    if meta.get("kind") in ["sentaurus_skill", "local_help", "goal_status", "goal_updated", "goal_cleared", "goal_error", "side_investigation"]:
+    if meta.get("kind") in ["sentaurus_skill", "local_help", "command_error", "goal_status", "goal_updated", "goal_cleared", "goal_error", "plan_status", "plan_updated", "plan_mode", "plan_error", "side_investigation"]:
         return True
     command = parse_local_command(item.get("content"))
-    return bool(command and command.get("name") in ["status", "help", "goal", "side"])
+    return bool(command and command.get("name") in ["status", "help", "goal", "plan", "side"])
 
 def context_lower(value, limit=8000):
     try:
@@ -563,6 +850,9 @@ def load_config():
         primary_model = DEFAULT_MODEL
     raw_models = env.get("LLM_MODELS") or file_config.get("llmModels") or file_config.get("LLM_MODELS")
     context_window = model_context_window_tokens(primary_model)
+    reasoning_summary = safe_text(env.get("LLM_REASONING_SUMMARY") or file_config.get("llmReasoningSummary") or file_config.get("LLM_REASONING_SUMMARY") or DEFAULT_REASONING_SUMMARY, 40).strip().lower()
+    if reasoning_summary not in ["off", "auto", "concise", "detailed"]:
+        reasoning_summary = DEFAULT_REASONING_SUMMARY
     return {
         "api_base": env.get("LLM_API_BASE") or file_config.get("llmApiBase") or file_config.get("LLM_API_BASE") or "",
         "api_key": env.get("LLM_API_KEY") or file_config.get("llmApiKey") or file_config.get("LLM_API_KEY") or "",
@@ -570,6 +860,7 @@ def load_config():
         "models": model_candidates(primary_model, raw_models),
         "api_style": env.get("LLM_API_STYLE") or file_config.get("llmApiStyle") or file_config.get("LLM_API_STYLE") or "chat-completions",
         "reasoning_effort": DEFAULT_REASONING_EFFORT,
+        "reasoning_summary": reasoning_summary,
         "context_window_tokens": context_window,
         "context_target_tokens": (context_window * 85) // 100,
         "context_hard_tokens": (context_window * 95) // 100,
@@ -749,8 +1040,8 @@ def normalize_dfise_postprocess(spec):
         raise ValueError("postprocess item must be an object")
     allowed_keys = set([
         "kind", "lowInput", "highInput", "expectedLowVd", "expectedHighVd",
-        "biasToleranceV", "vthCurrentAperUm", "ssCurrentMinAperUm",
-        "ssCurrentMaxAperUm", "minimumPointCount", "outputPrefix", "metricProfile",
+        "biasToleranceV", "vthCurrentAperUm", "diblCurrentAperUm", "ssMethod",
+        "ssCurrentMinAperUm", "ssCurrentMaxAperUm", "minimumPointCount", "outputPrefix", "metricProfile",
     ])
     unknown = sorted([safe_text(key, 120) for key in spec.keys() if key not in allowed_keys])
     if unknown:
@@ -767,7 +1058,14 @@ def normalize_dfise_postprocess(spec):
     metric_profile = safe_text(spec.get("metricProfile") or DFISE_METRIC_PROFILE, 80).strip()
     if metric_profile != DFISE_METRIC_PROFILE:
         raise ValueError("unsupported metricProfile: %s" % metric_profile)
+    ss_method = safe_text(spec.get("ssMethod") or DFISE_SS_METHOD, 80).strip()
+    if ss_method == "max-adjacent-v1":
+        ss_method = DFISE_SS_METHOD
+    if ss_method not in [DFISE_SS_METHOD, DFISE_SS_TWO_POINT_METHOD]:
+        raise ValueError("unsupported ssMethod: %s" % ss_method)
     minimum_points = int(postprocess_float(spec, "minimumPointCount", 20, 3, 100000))
+    vth_current = postprocess_float(spec, "vthCurrentAperUm", 1e-7, 1e-30, 1e6)
+    dibl_current = postprocess_float(spec, "diblCurrentAperUm", None, 1e-30, 1e6)
     normalized = {
         "kind": "dfise-idvg-v1",
         "lowInput": low_input,
@@ -775,7 +1073,9 @@ def normalize_dfise_postprocess(spec):
         "expectedLowVd": postprocess_float(spec, "expectedLowVd", None, -1000, 1000),
         "expectedHighVd": postprocess_float(spec, "expectedHighVd", None, -1000, 1000),
         "biasToleranceV": postprocess_float(spec, "biasToleranceV", 1e-6, 1e-12, 1),
-        "vthCurrentAperUm": postprocess_float(spec, "vthCurrentAperUm", 1e-7, 1e-30, 1e6),
+        "vthCurrentAperUm": vth_current,
+        "diblCurrentAperUm": dibl_current if dibl_current is not None else vth_current,
+        "ssMethod": ss_method,
         "ssCurrentMinAperUm": postprocess_float(spec, "ssCurrentMinAperUm", 1e-12, 1e-30, 1e6),
         "ssCurrentMaxAperUm": postprocess_float(spec, "ssCurrentMaxAperUm", 1e-7, 1e-30, 1e6),
         "minimumPointCount": minimum_points,
@@ -863,15 +1163,26 @@ def validate_dfise_success(run_dir, low_path, high_path, payload, request):
     if payload.get("extractorVersion") != DFISE_EXTRACTOR_VERSION:
         return False, "EXTRACTOR_VERSION_MISMATCH"
     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
-    required_metrics = ["vthLowV", "vthHighV", "ssLowMvPerDec", "ssHighMvPerDec", "diblMvPerV"]
+    required_metrics = ["vthLowV", "vthHighV", "ssLowMvPerDec", "ssHighMvPerDec", "diblMvPerV", "vgLowAtDiblCurrentV", "vgHighAtDiblCurrentV"]
+    methods = payload.get("methods") if isinstance(payload.get("methods"), dict) else {}
+    ss_method = safe_text(methods.get("ss"), 80).strip()
+    if ss_method != request.get("ssMethod"):
+        return False, "SS_METHOD_MISMATCH"
+    if ss_method == DFISE_SS_TWO_POINT_METHOD:
+        required_metrics.extend(["vgLowAtSsMinV", "vgLowAtSsMaxV", "vgHighAtSsMinV", "vgHighAtSsMaxV"])
     if not all(finite_number(metrics.get(key)) for key in required_metrics):
         return False, "NONFINITE_METRIC"
-    for window_key, pair_key in [
-        ("ssLowWindowPointCount", "ssLowAdjacentPairCount"),
-        ("ssHighWindowPointCount", "ssHighAdjacentPairCount"),
-    ]:
-        if int(metrics.get(window_key) or 0) < DFISE_MIN_SS_WINDOW_POINTS or int(metrics.get(pair_key) or 0) < DFISE_MIN_SS_ADJACENT_PAIRS:
-            return False, "SS_WINDOW_NOT_COVERED"
+    if ss_method == DFISE_SS_TWO_POINT_METHOD:
+        for lower_key, upper_key in [("vgLowAtSsMinV", "vgLowAtSsMaxV"), ("vgHighAtSsMinV", "vgHighAtSsMaxV")]:
+            if float(metrics.get(upper_key)) <= float(metrics.get(lower_key)):
+                return False, "SS_WINDOW_NOT_COVERED"
+    else:
+        for window_key, pair_key in [
+            ("ssLowWindowPointCount", "ssLowAdjacentPairCount"),
+            ("ssHighWindowPointCount", "ssHighAdjacentPairCount"),
+        ]:
+            if int(metrics.get(window_key) or 0) < DFISE_MIN_SS_WINDOW_POINTS or int(metrics.get(pair_key) or 0) < DFISE_MIN_SS_ADJACENT_PAIRS:
+                return False, "SS_WINDOW_NOT_COVERED"
     inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
     low = inputs.get("low") if isinstance(inputs.get("low"), dict) else {}
     high = inputs.get("high") if isinstance(inputs.get("high"), dict) else {}
@@ -959,6 +1270,8 @@ def run_dfise_postprocess(run_dir, session_id, spec, index, timeout_seconds=120)
         "--high", high_path,
         "--bias-tolerance", repr(normalized["biasToleranceV"]),
         "--vth-current", repr(normalized["vthCurrentAperUm"]),
+        "--dibl-current", repr(normalized["diblCurrentAperUm"]),
+        "--ss-method", normalized["ssMethod"],
         "--ss-current-min", repr(normalized["ssCurrentMinAperUm"]),
         "--ss-current-max", repr(normalized["ssCurrentMaxAperUm"]),
         "--min-points", str(normalized["minimumPointCount"]),
@@ -993,7 +1306,7 @@ def run_dfise_postprocess(run_dir, session_id, spec, index, timeout_seconds=120)
         result_status = "ok"
     elif semantic_status in ["incomplete", "invalid-input"]:
         result_status = semantic_status
-    elif error_code in ["INSUFFICIENT_POINTS", "NO_VALID_POINTS", "NONFINITE_METRIC", "SS_WINDOW_NOT_COVERED", "VTH_NOT_COVERED"]:
+    elif error_code in ["INSUFFICIENT_POINTS", "NO_VALID_POINTS", "NONFINITE_METRIC", "DIBL_NOT_COVERED", "SS_WINDOW_NOT_COVERED", "VTH_NOT_COVERED"]:
         result_status = "incomplete"
     elif error_code in ["BIAS_MISMATCH", "BIAS_ORDER_INVALID", "DATASET_NOT_FOUND", "INVALID_ARGUMENT", "MALFORMED_DATA_BLOCK", "UNSUPPORTED_METRIC_PROFILE", "UNSUPPORTED_SS_METHOD"]:
         result_status = "invalid-input"
@@ -1013,6 +1326,8 @@ def run_dfise_postprocess(run_dir, session_id, spec, index, timeout_seconds=120)
         "extractorVersion": (payload or {}).get("extractorVersion") or DFISE_EXTRACTOR_VERSION,
         "extractorSha256": extractor_hash,
         "metricProfile": (payload or {}).get("metricProfile") or DFISE_METRIC_PROFILE,
+        "methods": (payload or {}).get("methods"),
+        "parameters": (payload or {}).get("parameters"),
         "inputs": (payload or {}).get("inputs"),
         "metrics": (payload or {}).get("metrics"),
         "outputs": outputs,
@@ -1089,10 +1404,35 @@ def content_type_for_ext(ext):
         return "application/pdf"
     return "application/octet-stream"
 
+def artifact_display_priority(item):
+    rel = safe_text(item.get("path"), 500).replace("\\", "/").lower()
+    name = os.path.basename(rel)
+    if "plot" in name and name.endswith((".png", ".svg")):
+        rank = 0
+    elif name.endswith(".csv"):
+        rank = 1
+    elif name.endswith("_metrics.json"):
+        rank = 2
+    elif name.endswith("_metrics.dat"):
+        rank = 3
+    elif name.endswith("_report.txt"):
+        rank = 4
+    elif name == "run_result.json":
+        rank = 5
+    elif name.endswith(".plt"):
+        rank = 6
+    elif name.endswith(".tdr"):
+        rank = 7
+    elif rel.startswith("logs/") or name.endswith((".log", ".out", ".err")):
+        rank = 20
+    else:
+        rank = 10
+    return rank, rel
+
 def display_attachments_for_artifacts(run_id, artifacts, limit=12):
     result = []
     run_id = safe_text(run_id, 180).strip()
-    for item in artifacts or []:
+    for item in sorted(artifacts or [], key=artifact_display_priority):
         rel = safe_text(item.get("path"), 500).replace("\\", "/")
         ext = os.path.splitext(rel)[1].lower()
         if ext not in SESSION_FILE_EXTENSIONS:
@@ -1631,8 +1971,81 @@ def validate_run_request_against_reply(user_text, visible_reply, run_request):
         )
     return None
 
+CURRENT_LITERAL_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?[eE][+-]?[0-9]+)")
+
+def explicit_idvg_contract(user_text):
+    text = unicode_text(user_text, 8000).lower()
+    matches = []
+    for match in CURRENT_LITERAL_RE.finditer(text):
+        try:
+            value = float(match.group(1))
+        except Exception:
+            continue
+        if finite_number(value) and value > 0:
+            matches.append({"value": value, "start": match.start(), "end": match.end()})
+    for index in range(len(matches) - 1):
+        left = matches[index]
+        right = matches[index + 1]
+        between = text[left["end"]:right["start"]]
+        context = text[max(0, left["start"] - 100):min(len(text), right["end"] + 100)]
+        if len(between) > 40 or "ss" not in context:
+            continue
+        if not any(marker in between for marker in [u"到", u"至", "->", "~", " to ", u"–", u"—"]):
+            continue
+        return {
+            "ssMethod": DFISE_SS_TWO_POINT_METHOD,
+            "ssCurrentMinAperUm": min(left["value"], right["value"]),
+            "ssCurrentMaxAperUm": max(left["value"], right["value"]),
+        }
+    return {}
+
+def dfise_spec_from_request(run_request):
+    for item in (run_request.get("postprocess") if isinstance(run_request, dict) else []) or []:
+        if isinstance(item, dict) and item.get("kind") == "dfise-idvg-v1":
+            return item
+    return None
+
+def locked_idvg_contract(user_text, run_request):
+    contract = {}
+    spec = dfise_spec_from_request(run_request)
+    if spec:
+        for key in ["ssMethod", "ssCurrentMinAperUm", "ssCurrentMaxAperUm", "diblCurrentAperUm", "vthCurrentAperUm"]:
+            if key in spec:
+                contract[key] = spec.get(key)
+    contract.update(explicit_idvg_contract(user_text))
+    return contract
+
+def apply_locked_idvg_contract(run_request, contract):
+    if not contract:
+        return run_request
+    spec = dfise_spec_from_request(run_request)
+    if spec:
+        for key, value in contract.items():
+            spec[key] = value
+    return run_request
+
+def idvg_contract_validation_error(user_text, run_request):
+    expected = explicit_idvg_contract(user_text)
+    if not expected:
+        return ""
+    spec = dfise_spec_from_request(run_request)
+    if not spec:
+        return "The user supplied an explicit SS extraction definition, but the run request has no dfise-idvg-v1 postprocess."
+    for key, value in expected.items():
+        actual = spec.get(key)
+        if isinstance(value, (int, float)):
+            try:
+                matches = abs(float(actual) - float(value)) <= max(1e-30, abs(float(value)) * 1e-9)
+            except Exception:
+                matches = False
+        else:
+            matches = actual == value
+        if not matches:
+            return "The dfise-idvg-v1 request does not preserve the user's explicit %s=%s definition." % (key, value)
+    return ""
+
 def run_request_validation_error(run_request, visible_reply, user_text):
-    return validate_run_request_against_reply(user_text, visible_reply, run_request) or ""
+    return validate_run_request_against_reply(user_text, visible_reply, run_request) or idvg_contract_validation_error(user_text, run_request) or ""
 
 def format_validation_rejection(error_text, visible_reply=""):
     lines = []
@@ -1929,6 +2342,63 @@ def execute_run_request(request, session_id="", turn_id_value=""):
     append_progress(session_id, "artifacts", "completed" if ok else "failed", "Collected %s artifact/log file(s)" % len(artifacts), 100 if ok else 95, run_id)
     return manifest
 
+def metric_number(value, precision=8):
+    if not finite_number(value):
+        return u"n/a"
+    return unicode_text(("%%.%sg" % precision) % float(value), 80)
+
+def latest_dfise_result(result):
+    values = result.get("postprocessResults") if isinstance(result, dict) else []
+    for item in reversed(values or []):
+        if isinstance(item, dict) and item.get("kind") == "dfise-idvg-v1":
+            return item
+    return None
+
+def format_idvg_result_lines(result):
+    item = latest_dfise_result(result)
+    if not item:
+        return []
+    if item.get("status") != "ok":
+        code = unicode_text(item.get("errorCode") or "POSTPROCESS_FAILED", 120)
+        message = unicode_text(item.get("errorMessage"), 300).strip()
+        return [u"Id-Vg 提取：未完成（%s%s）" % (code, (u" - " + message) if message else u"")]
+    metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+    inputs = item.get("inputs") if isinstance(item.get("inputs"), dict) else {}
+    low = inputs.get("low") if isinstance(inputs.get("low"), dict) else {}
+    high = inputs.get("high") if isinstance(inputs.get("high"), dict) else {}
+    request = item.get("request") if isinstance(item.get("request"), dict) else {}
+    methods = item.get("methods") if isinstance(item.get("methods"), dict) else {}
+    ss_method = unicode_text(methods.get("ss") or request.get("ssMethod") or DFISE_SS_METHOD, 100)
+    vth_current = request.get("vthCurrentAperUm")
+    dibl_current = request.get("diblCurrentAperUm")
+    if dibl_current is None:
+        dibl_current = vth_current
+    lines = [u"Id-Vg 结果："]
+    lines.append(u"- 实际漏压：Vd_low=%s V，Vd_high=%s V" % (metric_number(low.get("actualVd")), metric_number(high.get("actualVd"))))
+    lines.append(u"- 有效点数：low=%s，high=%s" % (int(low.get("validPointCount") or 0), int(high.get("validPointCount") or 0)))
+    lines.append(u"- Vth_low=%s V，Vth_high=%s V（Id=%s A/um 恒流法）" % (
+        metric_number(metrics.get("vthLowV")), metric_number(metrics.get("vthHighV")), metric_number(vth_current)))
+    lines.append(u"- SS_low=%s mV/dec，SS_high=%s mV/dec（%s）" % (
+        metric_number(metrics.get("ssLowMvPerDec")), metric_number(metrics.get("ssHighMvPerDec")), ss_method))
+    if ss_method == DFISE_SS_TWO_POINT_METHOD:
+        lines.append(u"- SS 区间：Id=%s -> %s A/um；low Vg=%s -> %s V" % (
+            metric_number(request.get("ssCurrentMinAperUm")), metric_number(request.get("ssCurrentMaxAperUm")),
+            metric_number(metrics.get("vgLowAtSsMinV")), metric_number(metrics.get("vgLowAtSsMaxV"))))
+    lines.append(u"- DIBL=%s mV/V（Id=%s A/um，Vg_low=%s V，Vg_high=%s V）" % (
+        metric_number(metrics.get("diblMvPerV")), metric_number(dibl_current),
+        metric_number(metrics.get("vgLowAtDiblCurrentV")), metric_number(metrics.get("vgHighAtDiblCurrentV"))))
+    return lines
+
+def key_result_artifacts(result):
+    preferred = []
+    item = latest_dfise_result(result)
+    outputs = item.get("outputs") if isinstance(item, dict) and isinstance(item.get("outputs"), dict) else {}
+    for key in ["plot", "csv", "metricsJson", "metricsDat", "report"]:
+        value = unicode_text(outputs.get(key), 500).replace(u"\\", u"/").strip()
+        if value and value not in preferred:
+            preferred.append(value)
+    return preferred
+
 def format_run_result(result):
     lines = []
     ok = result.get("status") == "succeeded"
@@ -1948,41 +2418,61 @@ def format_run_result(result):
         lines.append("  - %s (%s bytes)" % (item.get("path"), item.get("size")))
     if len(artifacts) > 18:
         lines.append("  - ... %s more" % (len(artifacts) - 18))
-    return "\n".join(lines)
+    metric_lines = format_idvg_result_lines(result)
+    if metric_lines:
+        lines.append("")
+        lines.extend(metric_lines)
+    return u"\n".join([unicode_text(item, 12000) for item in lines])
 
 def concise_run_final_reply(visible_reply, result, attempts=None, stop_reason=""):
     attempts = attempts or []
     status = result.get("status")
-    run_id = safe_text(result.get("id"), 180)
+    run_id = unicode_text(result.get("id"), 180)
     failed = first_failed_step(result)
-    prefix = safe_text(visible_reply, 900).strip()
     lines = []
     if status == "succeeded":
-        lines.append("Sentaurus run completed with status: succeeded.")
+        lines.append(u"仿真已完成，状态：succeeded。")
         if run_id:
-            lines.append("")
-            lines.append("Run ID: %s." % run_id)
+            lines.append(u"Run ID：%s" % run_id)
         if attempts and len(attempts) > 1:
-            lines.append("Auto-debug attempted %s time(s); the final attempt succeeded." % len(attempts))
-        lines.append("")
-        lines.append("Next step: review attached/output curves, logs, and run_result.json.")
+            lines.append(u"自动修复：共执行 %s 次，最终尝试成功。" % len(attempts))
+        lines.append(u"")
+        lines.extend(format_idvg_result_lines(result))
+        artifacts = key_result_artifacts(result)
+        if artifacts:
+            lines.append(u"")
+            lines.append(u"关键产物：%s" % u"，".join(artifacts))
     else:
         if failed:
-            lines.append("Sentaurus run failed: %s %s exit %s." % (failed.get("tool"), failed.get("input"), failed.get("exitCode")))
-            stderr_tail = safe_text((failed.get("stderrTail") or "").replace("\n", " | "), 260)
+            lines.append(u"仿真未成功：%s %s，exit=%s。" % (
+                unicode_text(failed.get("tool"), 80), unicode_text(failed.get("input"), 180), failed.get("exitCode")))
+            stderr_tail = unicode_text(failed.get("stderrTail"), 260).replace(u"\n", u" | ")
             if stderr_tail:
-                lines.append("")
-                lines.append("Key log tail: %s" % stderr_tail)
+                lines.append(u"")
+                lines.append(u"关键日志：%s" % stderr_tail)
         else:
-            lines.append("Sentaurus run did not complete successfully.")
+            lines.append(u"仿真未完成或参数提取未通过。")
+            lines.extend(format_idvg_result_lines(result))
         if stop_reason:
-            lines.append("")
-            lines.append("Stop reason: %s." % safe_text(stop_reason, 260))
-        lines.append("")
-        lines.append("Next step: inspect worklog, failed step, and generated files, then retry with corrected deck/files.")
-    if prefix:
-        return prefix + "\n\n" + "\n".join(lines)
-    return "\n".join(lines)
+            lines.append(u"")
+            lines.append(u"停止原因：%s。" % unicode_text(stop_reason, 260))
+        lines.append(u"")
+        lines.append(u"请查看过程摘要、失败步骤和已产生文件。")
+    return unicode_text(u"\n".join(lines), 4000)
+
+def execution_reasoning_summary(result, attempts=None):
+    attempts = attempts or []
+    status = unicode_text(result.get("status"), 80)
+    lines = [u"执行摘要：已完成 %s 次尝试，最终状态为 %s。" % (len(attempts) or 1, status or u"unknown")]
+    for item in attempts[:-1]:
+        failed = first_failed_step(item)
+        if failed:
+            detail = failed.get("postprocessErrorCode") or ("%s exit %s" % (failed.get("tool"), failed.get("exitCode")))
+            lines.append(u"早期尝试 %s 未通过：%s。" % (item.get("autoDebugAttempt") or "?", unicode_text(detail, 180)))
+    metric_lines = format_idvg_result_lines(result)
+    if metric_lines:
+        lines.append(u"最终结论直接来自固定 DF-ISE 提取器的结构化输出，而不是运行前的预期值。")
+    return u"\n".join(lines)
 
 def run_dir_for_result(result):
     run_id = safe_text(result.get("id"), 180).strip()
@@ -2186,7 +2676,8 @@ def format_autodebug_reply(visible_reply, attempts, stop_reason, repair_notes):
 def run_with_autodebug(original_user_text, initial_run_request, visible_reply, session_id, current_message_id, turn_id_value="", initial_setup=None):
     config = load_config()
     max_attempts = int(config.get("max_autodebug_attempts") or 5)
-    run_request = initial_run_request
+    contract = locked_idvg_contract(original_user_text, initial_run_request)
+    run_request = apply_locked_idvg_contract(initial_run_request, contract)
     attempts = []
     repair_notes = []
     latest_setup = initial_setup
@@ -2213,6 +2704,7 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
         repair_prompt = build_repair_prompt(original_user_text, run_request, result, attempts)
         try:
             repair_reply, _repair_meta = run_with_timeout(llm_hard_timeout_seconds(config), "VM agent auto-debug repair LLM call", call_llm, repair_prompt, config, session_id, current_message_id)
+            append_reasoning_summaries_from_meta(session_id, turn_id_value, "debug", _repair_meta, result.get("id"))
             repair_setup, repair_without_setup = extract_json_tag(repair_reply, "SIMULATION_SETUP")
             if repair_setup:
                 latest_setup = normalize_simulation_setup(repair_setup)
@@ -2224,7 +2716,7 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
                 append_progress(session_id, "repair_llm", "failed", stop_reason, 100, result.get("id"))
                 append_run_diagnostic(session_id, turn_id_value, "Auto-debug did not return a new executable run request.", result.get("id"))
                 break
-            run_request = next_run_request
+            run_request = apply_locked_idvg_contract(next_run_request, contract)
             append_progress(session_id, "repair_llm", "completed", "Repair request ready for attempt %s/%s" % (attempt_no + 1, max_attempts), 45, result.get("id"))
             append_worklog(session_id, turn_id_value, "debug", "Generated repaired run request; preparing next attempt.", result.get("id"))
         except Exception as exc:
@@ -2366,7 +2858,7 @@ def skill_snapshot():
         "manualCount": len(manuals),
         "manualFiles": manuals[:20],
         "coreMission": "build Sentaurus simulation tasks, prepare decks/data, run allowlisted Sentaurus jobs, and export logs/artifacts/results",
-        "safeSkills": ["vm_status", "sentaurus_tools", "list_agent_instances", "sentaurus_manual_context", "simulation_setup", "sentaurus_run_request", "session_goal", "side_investigation", "global_agents_md"],
+        "safeSkills": ["vm_status", "sentaurus_tools", "list_agent_instances", "sentaurus_manual_context", "simulation_setup", "sentaurus_run_request", "session_goal", "session_plan", "side_investigation", "global_agents_md"],
         "realJobExecution": "available through a VM-local allowlisted runner when the assistant emits a valid <SENTAURUS_RUN_REQUEST> JSON block; arbitrary shell is not allowed",
         "deckGenerationGuardrails": deck_generation_guardrails(),
     }
@@ -2380,8 +2872,11 @@ def local_help_reply():
         u"- /help: show this summary.",
         u"- /status: show VM worker status, tools, manuals, and safe skills.",
         u"- /goal: show the durable goal saved for this browser session.",
-        u"- /goal clear: clear the durable goal for this browser session.",
+        u"- /goal pause|resume|block [reason]|complete|clear: update the durable goal lifecycle.",
         u"- /goal <text>: replace the durable goal for this browser session.",
+        u"- /plan: enter plan mode; /plan show displays the current plan.",
+        u"- /plan approve|exit|clear: approve, leave, or clear plan mode without directly starting a run.",
+        u"- /plan step <id> <pending|in_progress|completed>: update persisted plan progress.",
         u"- /side <question>: run a side investigation without replacing the main thread or durable goal.",
     ])
 
@@ -2412,12 +2907,67 @@ def local_goal_reply(session_id, args):
         record = read_session_goal_record(session_id)
         if not record:
             return u"This session has no durable goal yet. Use /goal <text> to set one.", {"kind": "goal_status"}
-        return u"Current durable goal:\n- %s\n- updated: %s" % (record.get("goal"), record.get("updatedAt")), {"kind": "goal_status", "sessionGoal": record.get("goal")}
+        return u"Current durable goal:\n- objective: %s\n- status: %s\n- updated: %s" % (record.get("objective"), record.get("status"), record.get("updatedAt")), {"kind": "goal_status", "sessionGoal": record.get("objective"), "goalStatus": record.get("status")}
     if command_arg.lower() in ["clear", "none", "reset", "off"]:
         cleared = clear_session_goal(session_id)
         return (u"Cleared the durable goal for this session." if cleared else u"This session did not have a durable goal to clear."), {"kind": "goal_cleared", "sessionGoal": ""}
+    lowered = command_arg.lower()
+    if lowered in ["pause", "resume", "complete"]:
+        workflow = apply_workflow_action(session_id, "goal." + lowered)
+        record = workflow.get("goal") or {}
+        return u"Updated durable goal:\n- objective: %s\n- status: %s" % (record.get("objective"), record.get("status")), {"kind": "goal_updated", "sessionGoal": record.get("objective"), "goalStatus": record.get("status"), "workflowRevision": workflow.get("revision")}
+    if lowered == "block" or lowered.startswith("block "):
+        reason = command_arg[5:].strip()
+        workflow = apply_workflow_action(session_id, "goal.block", {"reason": reason})
+        record = workflow.get("goal") or {}
+        return u"Marked durable goal blocked:\n- objective: %s\n- reason: %s" % (record.get("objective"), record.get("blockedReason") or "not specified"), {"kind": "goal_updated", "sessionGoal": record.get("objective"), "goalStatus": record.get("status"), "workflowRevision": workflow.get("revision")}
+    if lowered == "edit" or lowered == "set":
+        return u"Usage: /goal edit <objective>", {"kind": "goal_error"}
+    if lowered.startswith("edit ") or lowered.startswith("set "):
+        command_arg = command_arg.split(None, 1)[1]
     record = write_session_goal(session_id, command_arg)
-    return u"Saved durable goal for this session:\n- %s" % record.get("goal"), {"kind": "goal_updated", "sessionGoal": record.get("goal"), "sessionGoalUpdatedAt": record.get("updatedAt")}
+    workflow = read_session_workflow(session_id)
+    return u"Saved durable goal for this session:\n- %s" % record.get("objective"), {"kind": "goal_updated", "sessionGoal": record.get("objective"), "goalStatus": record.get("status"), "sessionGoalUpdatedAt": record.get("updatedAt"), "workflowRevision": workflow.get("revision")}
+
+def format_plan_reply(workflow, heading="Current session plan"):
+    plan = workflow.get("plan") if isinstance(workflow.get("plan"), dict) else {"mode": "default", "steps": []}
+    lines = [heading + ":", "- mode: %s" % plan.get("mode"), "- revision: %s" % workflow.get("revision")]
+    if plan.get("explanation"):
+        lines.append("- explanation: %s" % safe_text(plan.get("explanation"), 2000))
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    if not steps:
+        lines.append("- steps: none")
+    else:
+        lines.append("- steps:")
+        for step in steps:
+            lines.append("  - [%s] %s: %s" % (step.get("status"), step.get("id"), step.get("step")))
+    return "\n".join(lines)
+
+def local_plan_reply(session_id, args):
+    if not safe_text(session_id, 160).strip():
+        return u"/plan requires a browser session id; select or create a session first.", {"kind": "plan_error"}
+    command_arg = safe_text(args, 4000).strip()
+    lowered = command_arg.lower()
+    if lowered in ["show", "status"]:
+        workflow = read_session_workflow(session_id)
+        return format_plan_reply(workflow), {"kind": "plan_status", "workflowRevision": workflow.get("revision"), "planMode": workflow.get("plan", {}).get("mode")}
+    if not command_arg or lowered in ["enter", "on"]:
+        workflow = apply_workflow_action(session_id, "plan.enter")
+        return format_plan_reply(workflow, "Plan mode enabled; send the planning task as the next message"), {"kind": "plan_mode", "workflowRevision": workflow.get("revision"), "planMode": "plan"}
+    if lowered in ["approve", "approved"]:
+        workflow = apply_workflow_action(session_id, "plan.approve")
+        return format_plan_reply(workflow, "Plan approved; execution is unlocked but no run was started"), {"kind": "plan_updated", "workflowRevision": workflow.get("revision"), "planMode": "default"}
+    if lowered in ["exit", "off"]:
+        workflow = apply_workflow_action(session_id, "plan.exit")
+        return format_plan_reply(workflow, "Left plan mode without approving the plan"), {"kind": "plan_updated", "workflowRevision": workflow.get("revision"), "planMode": "default"}
+    if lowered in ["clear", "reset"]:
+        workflow = apply_workflow_action(session_id, "plan.clear")
+        return format_plan_reply(workflow, "Cleared the session plan"), {"kind": "plan_updated", "workflowRevision": workflow.get("revision"), "planMode": "default"}
+    parts = command_arg.split()
+    if len(parts) == 3 and parts[0].lower() == "step":
+        workflow = apply_workflow_action(session_id, "plan.step", {"stepId": parts[1], "status": parts[2]})
+        return format_plan_reply(workflow, "Updated plan progress"), {"kind": "plan_updated", "workflowRevision": workflow.get("revision"), "planMode": workflow.get("plan", {}).get("mode")}
+    return u"Usage: /plan [show|enter|approve|exit|clear|step <id> <pending|in_progress|completed>]", {"kind": "plan_error"}
 
 def deck_generation_guardrails():
     return "\n".join([
@@ -2456,11 +3006,32 @@ def responses_url(api_base):
         return base
     return base + "/responses"
 
-def parse_responses_text(data):
+def parse_responses_result(data):
+    summaries = []
+    seen_summaries = set()
+    def add_summary(value):
+        text = safe_text(value, 2400).strip()
+        if text and text not in seen_summaries:
+            seen_summaries.add(text)
+            summaries.append(text)
+    for item in data.get("output", []) or []:
+        for summary in item.get("summary", []) or []:
+            if isinstance(summary, dict):
+                add_summary(summary.get("text") or summary.get("content"))
+            else:
+                add_summary(summary)
+    reasoning = data.get("reasoning") if isinstance(data.get("reasoning"), dict) else {}
+    for summary in reasoning.get("summary", []) or []:
+        if isinstance(summary, dict):
+            add_summary(summary.get("text") or summary.get("content"))
+        else:
+            add_summary(summary)
     if data.get("output_text"):
-        return data.get("output_text")
+        return {"text": data.get("output_text"), "reasoningSummaries": summaries}
     parts = []
     for item in data.get("output", []) or []:
+        if item.get("type") == "reasoning":
+            continue
         if item.get("text"):
             parts.append(item.get("text"))
         for content in item.get("content", []) or []:
@@ -2472,12 +3043,19 @@ def parse_responses_text(data):
         text = message.get("content") or choice.get("text")
         if text:
             parts.append(text)
-    return "\n".join(parts).strip()
+    return {"text": "\n".join(parts).strip(), "reasoningSummaries": summaries}
+
+def parse_responses_text(data):
+    return parse_responses_result(data).get("text") or ""
 
 def responses_request_payload(user_text, config, model, system):
+    reasoning = {"effort": config.get("reasoning_effort") or DEFAULT_REASONING_EFFORT}
+    summary_mode = safe_text(config.get("reasoning_summary") or DEFAULT_REASONING_SUMMARY, 40).strip().lower()
+    if summary_mode != "off":
+        reasoning["summary"] = summary_mode
     return {
         "model": model,
-        "reasoning": {"effort": config.get("reasoning_effort") or DEFAULT_REASONING_EFFORT},
+        "reasoning": reasoning,
         "input": [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
@@ -2494,20 +3072,37 @@ def call_llm_model(user_text, config, model, system):
     api_style = (config.get("api_style") or "chat-completions").lower()
     if api_style in ["openai-responses", "responses"]:
         payload = responses_request_payload(user_text, config, model, system)
-        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        request = urllib2.Request(responses_url(config.get("api_base")), body, {
-            "content-type": "application/json",
-            "authorization": "Bearer %s" % config.get("api_key"),
-            "user-agent": "sentaurus-vm-agent/0.7.0",
-        })
-        response = urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS)).read()
+        summary_requested = bool((payload.get("reasoning") or {}).get("summary"))
+        summary_downgraded = False
+        def send_responses_request(request_payload):
+            body = json.dumps(request_payload, ensure_ascii=True).encode("utf-8")
+            request = urllib2.Request(responses_url(config.get("api_base")), body, {
+                "content-type": "application/json",
+                "authorization": "Bearer %s" % config.get("api_key"),
+                "user-agent": "sentaurus-vm-agent/0.8.0",
+            })
+            return urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS)).read()
+        try:
+            response = send_responses_request(payload)
+        except Exception as exc:
+            if summary_requested and getattr(exc, "code", None) in [400, 422]:
+                fallback_payload = dict(payload)
+                fallback_payload["reasoning"] = dict(payload.get("reasoning") or {})
+                fallback_payload["reasoning"].pop("summary", None)
+                audit("reasoning_summary_downgraded", {"model": model, "httpStatus": getattr(exc, "code", None)})
+                response = send_responses_request(fallback_payload)
+                summary_downgraded = True
+            else:
+                raise
         try:
             text = response.decode("utf-8", "replace")
         except AttributeError:
             text = response
-        parsed = parse_responses_text(json.loads(text))
-        if not parsed:
+        parsed = parse_responses_result(json.loads(text))
+        if not parsed.get("text"):
             raise Exception("LLM returned no content")
+        parsed["reasoningSummaryRequested"] = summary_requested
+        parsed["reasoningSummaryDowngraded"] = summary_downgraded
         return parsed
 
     payload = {
@@ -2522,7 +3117,7 @@ def call_llm_model(user_text, config, model, system):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.7.0",
+        "user-agent": "sentaurus-vm-agent/0.8.0",
     })
     response = urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS)).read()
     try:
@@ -2533,9 +3128,41 @@ def call_llm_model(user_text, config, model, system):
     parsed = data.get("choices", [{}])[0].get("message", {}).get("content") or data.get("choices", [{}])[0].get("text")
     if not parsed:
         raise Exception("LLM returned no content")
-    return parsed
+    return {"text": parsed, "reasoningSummaries": [], "reasoningSummaryRequested": False, "reasoningSummaryDowngraded": False}
 
-def build_llm_system_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context):
+def workflow_prompt_context(workflow):
+    if not isinstance(workflow, dict):
+        return "(No workflow state is available for this session.)"
+    goal = workflow.get("goal") if isinstance(workflow.get("goal"), dict) else None
+    plan = workflow.get("plan") if isinstance(workflow.get("plan"), dict) else {"mode": "default", "steps": []}
+    lines = ["Workflow revision: %s" % workflow.get("revision", 0)]
+    if goal:
+        goal_status = goal.get("status") or "active"
+        lines.append("Goal status: %s" % goal_status)
+        if goal_status == "active":
+            lines.append("Goal objective: %s" % safe_text(goal.get("objective"), 2000))
+    else:
+        lines.append("Goal: none")
+    lines.append("Plan mode: %s" % plan.get("mode", "default"))
+    if plan.get("explanation"):
+        lines.append("Plan explanation: %s" % safe_text(plan.get("explanation"), 4000))
+    for step in plan.get("steps") or []:
+        lines.append("Plan step [%s] %s: %s" % (step.get("status"), step.get("id"), safe_text(step.get("step"), 1000)))
+    return "\n".join(lines)
+
+def plan_mode_system_instructions(workflow):
+    plan = workflow.get("plan") if isinstance(workflow, dict) and isinstance(workflow.get("plan"), dict) else {}
+    if plan.get("mode") != "plan":
+        return ""
+    return (
+        "PLAN MODE IS ACTIVE. You may inspect the supplied session history, attachments, manuals, and VM status, but you must not request or perform any mutation or simulation execution. "
+        "Do not emit SIMULATION_SETUP, SENTAURUS_RUN_REQUEST, VM_SESSION_FILE, or instructions that claim a job was started. "
+        "Return a concise user-facing planning explanation followed by exactly one structured block: "
+        "<SENTAURUS_PLAN>{\"explanation\":\"...\",\"steps\":[{\"id\":\"step-01\",\"step\":\"...\",\"status\":\"pending\"}]}</SENTAURUS_PLAN>. "
+        "Use pending, in_progress, or completed as step status and include at most one in_progress step."
+    )
+
+def build_llm_system_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context, workflow=None):
     return (
         u"You are the Sentaurus TCAD simulation agent running inside the CentOS VM. "
         "Your core mission is to help the user establish complete Sentaurus simulation tasks: clarify the device/process objective, "
@@ -2546,12 +3173,12 @@ def build_llm_system_prompt(snapshot, recent_session_context, manual_context, cu
         "When the user explicitly asks you to run/simulate and you can create a self-contained minimal Sentaurus deck, include a concise human explanation, one simulation setup block, and exactly one run request block. "
         "The setup block schema is: <SIMULATION_SETUP>{\"deviceType\":\"...\",\"gateBias\":\"...\",\"drainBias\":\"...\",\"sourceBulk\":\"...\",\"geometry\":\"...\",\"dopingOrImplant\":\"...\",\"physicsModels\":\"...\",\"mesh\":\"...\",\"temperature\":\"...\",\"simulationGoals\":\"...\",\"expectedOutputs\":[\"file or curve\"],\"notes\":\"...\"}</SIMULATION_SETUP>. "
         "Populate the setup block with actual assumptions from the same browser session; omit unknown fields instead of inventing critical process/device parameters. "
-        "The block schema is: <SENTAURUS_RUN_REQUEST>{\"title\":\"short-title\",\"files\":[{\"name\":\"main.cmd\",\"content\":\"...\"}],\"steps\":[{\"tool\":\"sde|sprocess|sdevice|inspect\",\"input\":\"main.cmd\"}],\"postprocess\":[{\"kind\":\"dfise-idvg-v1\",\"lowInput\":\"idvg_low.plt\",\"highInput\":\"idvg_high.plt\",\"expectedLowVd\":0.05,\"expectedHighVd\":0.8,\"outputPrefix\":\"idvg_step0005\"}]}</SENTAURUS_RUN_REQUEST>. "
+        "The block schema is: <SENTAURUS_RUN_REQUEST>{\"title\":\"short-title\",\"files\":[{\"name\":\"main.cmd\",\"content\":\"...\"}],\"steps\":[{\"tool\":\"sde|sprocess|sdevice|inspect\",\"input\":\"main.cmd\"}],\"postprocess\":[{\"kind\":\"dfise-idvg-v1\",\"lowInput\":\"idvg_low.plt\",\"highInput\":\"idvg_high.plt\",\"expectedLowVd\":0.05,\"expectedHighVd\":0.8,\"ssMethod\":\"two-point-log-interpolation-v1\",\"ssCurrentMinAperUm\":1e-9,\"ssCurrentMaxAperUm\":1e-8,\"diblCurrentAperUm\":1e-7,\"outputPrefix\":\"idvg_step0005\"}]}</SENTAURUS_RUN_REQUEST>. "
         "A run request is atomic: the worker will execute only the JSON block you provide and will not automatically continue later based on visible text. "
         "Never say you will continue, follow up, add SDevice later, extract data later, or send final results later unless every required file and ordered step is already present in the same run request. "
         "For requests asking for final simulation results, Id-Vg curves, .plt/.csv data, or extraction, do not emit an SDE-only request; include SDevice and/or Inspect extraction steps, or ask for missing assumptions. "
         "Use only safe ASCII file names without spaces, and only .cmd, .des, .par, .scm, .tcl, .txt, or .dat files. "
-        "Capability rule dfise-plt-postprocess-v1: for readable DF-ISE .plt Id-Vg extraction, use only the fixed typed dfise-idvg-v1 postprocess; do not generate Inspect cv_* extraction or dynamic Tcl/Python parsers; read actual Vd from file content; reject expected-bias mismatch; require finite Vth_low, Vth_high, SS_low, SS_high, and DIBL before success; publish CSV/JSON/DAT/TXT/PLT through general file attachments and PNG/SVG through image preview. "
+        "Capability rule dfise-plt-postprocess-v1: for readable DF-ISE .plt Id-Vg extraction, use only the fixed typed dfise-idvg-v1 postprocess; do not generate Inspect cv_* extraction or dynamic Tcl/Python parsers; preserve the user's SS definition with ssMethod plus explicit current bounds; use diblCurrentAperUm when the DIBL constant-current target differs from Vth; read actual Vd from file content; reject expected-bias mismatch; require finite Vth_low, Vth_high, SS_low, SS_high, and DIBL before success; publish CSV/JSON/DAT/TXT/PLT through general file attachments and PNG/SVG through image preview. "
         "If the required deck cannot be made self-contained, ask for the missing files/assumptions instead of emitting a run request. "
         "Use the installed tool paths and VM state in the snapshot. Ask for missing physics/process assumptions instead of inventing critical parameters. "
         "Before saying previous files, run directories, decks, or results are unavailable, inspect the recent browser-session context below. "
@@ -2564,6 +3191,8 @@ def build_llm_system_prompt(snapshot, recent_session_context, manual_context, cu
         "The browser and host backend only relay messages; API credentials stay inside this VM. "
         u"Current VM skill snapshot: " + unicode_text(json.dumps(snapshot, ensure_ascii=True, sort_keys=True), 200000) + u"\n\n" +
         u"Durable session goal:\n" + unicode_text(current_goal or "(No durable goal set for this session.)", 24000) + u"\n\n" +
+        u"Structured session workflow:\n" + unicode_text(workflow_prompt_context(workflow), 32000) + u"\n\n" +
+        u"Current workflow-mode instructions:\n" + unicode_text(plan_mode_system_instructions(workflow) or "(Default execution mode is active.)", 16000) + u"\n\n" +
         u"VM-root AGENTS.md instructions:\n" + unicode_text(agents_context, 200000) + u"\n\n" +
         u"Durable SDE/SDevice generation guardrails:\n" + unicode_text(deck_generation_guardrails(), 200000) + u"\n\n" +
         u"Recent browser-session context, newest last:\n" + unicode_text(recent_session_context, 400000) + u"\n\n" +
@@ -2575,8 +3204,9 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
     manual_context = read_manual_context(user_text)
     recent_session_context = session_context(session_id, current_message_id)
     current_goal = session_goal_text(session_id)
+    workflow = read_session_workflow(session_id) if safe_session_key(session_id) else default_session_workflow("")
     agents_context = read_global_agents_context()
-    system = build_llm_system_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context)
+    system = build_llm_system_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context, workflow)
     context_tokens = estimate_context_tokens(system) + estimate_context_tokens(user_text)
     context_window = int(config.get("context_window_tokens") or model_context_window_tokens(config.get("model")))
     context_target = int(config.get("context_target_tokens") or ((context_window * 85) // 100))
@@ -2591,14 +3221,15 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
         recent_session_context = fit_text_to_token_budget(recent_session_context, session_budget, u"\n\n[Same-session context compressed to fit the configured model window.]")
         manual_context = fit_text_to_token_budget(manual_context, manual_budget, u"\n\n[Manual context compressed to fit the configured model window.]")
         agents_context = fit_text_to_token_budget(agents_context, agents_budget, u"\n\n[VM-root AGENTS.md context compressed to fit the configured model window.]")
-        system = build_llm_system_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context)
+        system = build_llm_system_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context, workflow)
         if estimate_context_tokens(system) + user_tokens > context_hard:
             system = fit_text_to_token_budget(system, max(20000, context_hard - user_tokens - 8000), u"\n\n[System prompt hard-truncated to protect the configured model window.]")
     models = config.get("models") or [config.get("model") or "gpt-5.5"]
     errors = []
     for index, model in enumerate(models):
         try:
-            reply = call_llm_model(user_text, config, model, system)
+            model_result = call_llm_model(user_text, config, model, system)
+            reply = model_result.get("text") or ""
             meta = {
                 "kind": "llm",
                 "llmConfigured": True,
@@ -2606,11 +3237,16 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
                 "apiStyle": config.get("api_style"),
                 "modelCandidates": ",".join(models),
                 "reasoningEffort": config.get("reasoning_effort"),
+                "reasoningSummaryMode": config.get("reasoning_summary"),
                 "contextWindowTokens": context_window,
             }
             if index > 0:
                 meta["fallbackFrom"] = ",".join(models[:index])
                 meta["fallbackCount"] = index
+            if model_result.get("reasoningSummaries"):
+                meta["reasoningSummariesJson"] = json.dumps(model_result.get("reasoningSummaries"), ensure_ascii=True)
+            if model_result.get("reasoningSummaryDowngraded"):
+                meta["reasoningSummaryDowngraded"] = True
             return reply, meta
         except Exception as exc:
             error_text = safe_text(str(exc), 500)
@@ -2619,9 +3255,27 @@ def call_llm(user_text, config, session_id="", current_message_id=""):
     raise Exception("; ".join(errors) or "no LLM model candidates configured")
 
 def strip_structured_reply_blocks(reply):
-    setup, stripped = extract_json_tag(reply, "SIMULATION_SETUP")
-    run_request, stripped = extract_run_request(stripped)
-    return safe_text(stripped, 4000).strip() or safe_text(reply, 4000).strip()
+    visible = safe_text(reply, 4000)
+    removed = False
+    for tag_name in ["SIMULATION_SETUP", "SENTAURUS_RUN_REQUEST", "SENTAURUS_PLAN"]:
+        start_tag = "<%s>" % tag_name
+        end_tag = "</%s>" % tag_name
+        while True:
+            start = visible.find(start_tag)
+            if start < 0:
+                break
+            end = visible.find(end_tag, start + len(start_tag))
+            removed = True
+            if end < 0:
+                visible = visible[:start]
+                break
+            visible = visible[:start] + visible[end + len(end_tag):]
+    visible = visible.strip()
+    if visible:
+        return visible
+    if removed:
+        return "Structured execution content was suppressed for this read-only response."
+    return safe_text(reply, 4000).strip()
 
 def side_investigation_reply(side_prompt, config, session_id="", current_message_id=""):
     question = safe_text(side_prompt, 4000).strip()
@@ -2654,7 +3308,8 @@ def side_investigation_reply(side_prompt, config, session_id="", current_message
     errors = []
     for index, model in enumerate(models):
         try:
-            reply = call_llm_model(question, config, model, system)
+            model_result = call_llm_model(question, config, model, system)
+            reply = model_result.get("text") or ""
             meta = {
                 "kind": "side_investigation",
                 "llmConfigured": True,
@@ -2662,11 +3317,16 @@ def side_investigation_reply(side_prompt, config, session_id="", current_message
                 "apiStyle": config.get("api_style"),
                 "modelCandidates": ",".join(models),
                 "reasoningEffort": config.get("reasoning_effort"),
+                "reasoningSummaryMode": config.get("reasoning_summary"),
                 "contextWindowTokens": context_window,
             }
             if index > 0:
                 meta["fallbackFrom"] = ",".join(models[:index])
                 meta["fallbackCount"] = index
+            if model_result.get("reasoningSummaries"):
+                meta["reasoningSummariesJson"] = json.dumps(model_result.get("reasoningSummaries"), ensure_ascii=True)
+            if model_result.get("reasoningSummaryDowngraded"):
+                meta["reasoningSummaryDowngraded"] = True
             return u"[Side]\n" + strip_structured_reply_blocks(reply), meta
         except Exception as exc:
             error_text = safe_text(str(exc), 500)
@@ -2686,6 +3346,8 @@ def handle_local_command(text, config, session_id="", current_message_id=""):
         return local_skill_reply(text), {"kind": "sentaurus_skill", "llmConfigured": llm_configured(config)}
     if name == "goal":
         return local_goal_reply(session_id, args)
+    if name == "plan":
+        return local_plan_reply(session_id, args)
     if name == "side":
         return run_with_timeout(llm_hard_timeout_seconds(config), "VM agent side investigation", side_investigation_reply, args, config, session_id, current_message_id)
     return local_help_reply(), {"kind": "local_help", "llmConfigured": llm_configured(config)}
@@ -2697,7 +3359,7 @@ def reply_for(text, session_id="", current_message_id=""):
         if command_reply:
             return command_reply
     except Exception as exc:
-        return "VM agent side investigation failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "llm_error", "llmConfigured": llm_configured(config), "modelCandidates": ",".join(config.get("models") or [])}
+        return "VM agent local command failed inside CentOS: %s" % safe_text(str(exc), 1000), {"kind": "command_error", "llmConfigured": llm_configured(config)}
     if not llm_configured(config):
         return (
             "VM agent is running inside CentOS, but LLM config is not set inside the VM yet. "
@@ -2755,18 +3417,63 @@ def process_queue_file(path):
                 text = user_text + u"\n\n" + unicode_text(attachment_text, MAX_ATTACHMENT_CONTEXT_CHARS)
             append_worklog(session_id, request_turn_id, "file", "Attachment context ready: %s readable/reference item(s)." % len(attachment_summaries))
         command = parse_local_command(user_text)
+        workflow = read_session_workflow(session_id) if safe_session_key(session_id) else default_session_workflow("")
+        plan_mode = not command and workflow.get("plan", {}).get("mode") == "plan"
         if command and command.get("name") == "side":
             append_progress(session_id, "side", "running", "Running an independent side investigation", 20)
             append_worklog(session_id, request_turn_id, "planning", "Running a side investigation while keeping the main thread and durable goal unchanged.")
         elif command:
             append_progress(session_id, "skill", "running", "Handling local slash-command skill", 20)
             append_worklog(session_id, request_turn_id, "planning", "Handling this local VM skill request without exposing API credentials.")
+        elif plan_mode:
+            append_progress(session_id, "plan", "running", "Building a read-only execution plan", 20)
+            append_worklog(session_id, request_turn_id, "planning", "Plan mode is active; inspecting context while simulation and file mutations remain locked.")
         else:
             append_progress(session_id, "llm_context", "running", "Building session history and manual context", 12)
             append_worklog(session_id, request_turn_id, "planning", "Building same-session history context and Sentaurus manual context.")
         append_worklog(session_id, request_turn_id, "planning", "Calling the VM-local configured model to generate a reply or safe run request.")
         reply, meta = reply_for(text, session_id, request_message_id)
-        published_file_specs, reply_without_session_files = extract_vm_session_files(reply)
+        append_reasoning_summaries_from_meta(session_id, request_turn_id, "planning", meta)
+        if not command and not plan_mode and safe_session_key(session_id):
+            latest_workflow = read_session_workflow(session_id)
+            if latest_workflow.get("plan", {}).get("mode") == "plan":
+                workflow = latest_workflow
+                plan_mode = True
+                meta["kind"] = "plan_response"
+                meta["planMode"] = "plan"
+                meta["workflowRevision"] = workflow.get("revision")
+                meta["workflowJson"] = json.dumps(workflow, ensure_ascii=True, sort_keys=True)
+                reply = (
+                    "Plan mode was enabled while this turn was running; execution and file publication were blocked.\n\n" +
+                    safe_text(reply, 3500)
+                )
+                append_worklog(session_id, request_turn_id, "planning", "Plan mode changed in another client; applying the read-only execution lock before processing model output.")
+        plan_payload = None
+        if plan_mode:
+            try:
+                plan_payload, plan_visible_reply = extract_json_tag(reply, "SENTAURUS_PLAN")
+                if plan_payload:
+                    workflow = apply_workflow_action(session_id, "plan.set", {
+                        "explanation": plan_payload.get("explanation"),
+                        "steps": plan_payload.get("steps"),
+                    }, workflow.get("revision"))
+                    reply = (safe_text(plan_visible_reply, 4000).strip() + "\n\n" + format_plan_reply(workflow, "Proposed session plan")).strip()
+                    meta["kind"] = "plan_updated"
+                    meta["workflowRevision"] = workflow.get("revision")
+                    meta["planMode"] = "plan"
+                    meta["workflowJson"] = json.dumps(workflow, ensure_ascii=True, sort_keys=True)
+                else:
+                    meta["kind"] = "plan_response"
+                    meta["planMode"] = "plan"
+            except Exception as exc:
+                meta["kind"] = "plan_error"
+                meta["planMode"] = "plan"
+                reply = "Plan response was not persisted: %s\n\n%s" % (safe_text(str(exc), 500), safe_text(reply, 3500))
+        if plan_mode:
+            _blocked_file_specs, reply_without_session_files = extract_vm_session_files(reply)
+            published_file_specs = []
+        else:
+            published_file_specs, reply_without_session_files = extract_vm_session_files(reply)
         published_display_attachments = []
         publish_errors = []
         for spec in published_file_specs:
@@ -2782,14 +3489,15 @@ def process_queue_file(path):
                 audit("vm_session_file_publish_failed", {"sessionId": session_id, "error": safe_text(str(exc), 500), "spec": spec})
         reply = reply_without_session_files
         simulation_setup = None
-        visible_reply = strip_structured_reply_blocks(reply) if command else reply
+        visible_reply = strip_structured_reply_blocks(reply) if command or plan_mode else reply
         run_request = None
-        if not command:
+        if not command and not plan_mode:
             simulation_setup, setup_visible_reply = extract_json_tag(reply, "SIMULATION_SETUP")
             if simulation_setup:
                 simulation_setup = normalize_simulation_setup(simulation_setup)
                 meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
             run_request, visible_reply = extract_run_request(setup_visible_reply)
+            run_request = apply_locked_idvg_contract(run_request, explicit_idvg_contract(text))
             append_worklog(session_id, request_turn_id, "planning", "Checking whether the model returned a safely executable Sentaurus run request.")
             validation_error = run_request_validation_error(run_request, visible_reply, text)
             if validation_error:
@@ -2797,11 +3505,13 @@ def process_queue_file(path):
                 append_worklog(session_id, request_turn_id, "debug", "Run request needs repair before execution; attempting safe completion/correction.")
                 repaired_reply, repaired_meta = repair_run_request_reply(text, reply, validation_error, session_id, request_message_id)
                 meta = repaired_meta
+                append_reasoning_summaries_from_meta(session_id, request_turn_id, "debug", repaired_meta)
                 if repaired_reply:
                     repaired_setup, repaired_visible_reply = extract_json_tag(repaired_reply, "SIMULATION_SETUP")
                     if repaired_setup:
                         simulation_setup = normalize_simulation_setup(repaired_setup)
                     run_request, visible_reply = extract_run_request(repaired_visible_reply)
+                    run_request = apply_locked_idvg_contract(run_request, explicit_idvg_contract(text))
                     validation_error = run_request_validation_error(run_request, visible_reply, text)
                 else:
                     run_request = None
@@ -2816,7 +3526,13 @@ def process_queue_file(path):
         elif run_request:
             simulation_setup = setup_from_run_request(run_request)
             meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
-        if meta.get("kind") == "sentaurus_skill":
+        if meta.get("kind") in ["plan_updated", "plan_response"]:
+            append_progress(session_id, "plan", "completed", "Plan response is ready; execution remains locked until approval", 100)
+        elif meta.get("kind") == "plan_error":
+            append_progress(session_id, "plan", "failed", "Plan command or response could not be applied", 100)
+        elif meta.get("kind") in ["command_error", "goal_error"]:
+            append_progress(session_id, "skill", "failed", "Local workflow command could not be applied", 100)
+        elif meta.get("kind") == "sentaurus_skill":
             append_progress(session_id, "skill", "completed", "Local skill reply is ready", 100)
         elif meta.get("kind") == "llm_error":
             append_progress(session_id, "llm", "failed", "LLM call failed; see agent message", 100)
@@ -2825,6 +3541,7 @@ def process_queue_file(path):
         if run_request:
             append_worklog(session_id, request_turn_id, "tool", "Run request passed validation; executing allowlisted Sentaurus flow and collecting outputs.")
             reply, result, attempts, simulation_setup, stop_reason = run_with_autodebug(text, run_request, visible_reply, session_id, request_message_id, request_turn_id, simulation_setup)
+            append_reasoning_summary(session_id, request_turn_id, "final", execution_reasoning_summary(result, attempts), result.get("id") or "")
             simulation_setup = enrich_setup_from_postprocess(simulation_setup or setup_from_run_request(run_request), result)
             artifacts = result.get("artifacts") or []
             display_attachments = display_attachments_for_artifacts(result.get("id") or "", artifacts)
@@ -2843,7 +3560,8 @@ def process_queue_file(path):
             if simulation_setup:
                 meta["simulationSetupJson"] = json.dumps(simulation_setup, ensure_ascii=True, sort_keys=True)
         elif meta.get("kind") != "llm_error":
-            append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
+            if meta.get("kind") not in ["command_error", "goal_error", "plan_error"]:
+                append_progress(session_id, "reply", "completed", "Agent reply is ready", 100)
             reply = visible_reply or reply
         display_attachments = (published_display_attachments + display_attachments)[:12]
         if published_display_attachments:
@@ -2864,7 +3582,8 @@ def process_queue_file(path):
                 sync_session_setup_to_output(session_id, simulation_setup)
         duration_ms = int((time.time() - started_at) * 1000)
         append_worklog(session_id, request_turn_id, "final", "Final response generated; conclusions and attachments are kept separate from folded worklog.")
-        has_reply_text = bool(safe_text(reply, 4000).strip())
+        final_reply_text = concise_run_final_reply(visible_reply, result, attempts, stop_reason) if run_request else safe_text(reply, 4000)
+        has_reply_text = bool(safe_text(final_reply_text, 4000).strip())
         publish_error_text = ""
         if publish_errors:
             publish_error_text = "Failed to publish %s file attachment%s: %s" % (len(publish_errors), "" if len(publish_errors) == 1 else "s", "; ".join(publish_errors[:3]))
@@ -2872,8 +3591,7 @@ def process_queue_file(path):
             text_meta = meta.copy()
             text_meta["suppressAttachmentPreview"] = True
             if has_reply_text:
-                final_text = concise_run_final_reply(visible_reply, result, attempts, stop_reason) if run_request else safe_text(reply, 4000)
-                append_run_final(session_id, request_turn_id, final_text, result if run_request else {"status": "completed"}, duration_ms)
+                append_run_final(session_id, request_turn_id, final_reply_text, result if run_request else {"status": "completed"}, duration_ms)
             if publish_error_text:
                 publish_meta = {"kind": "vm_agent_attachment_publish_error"}
                 if session_id:
@@ -2883,7 +3601,7 @@ def process_queue_file(path):
         else:
             if has_reply_text or not publish_error_text:
                 if run_request:
-                    append_run_final(session_id, request_turn_id, concise_run_final_reply(visible_reply, result, attempts, stop_reason), result, duration_ms)
+                    append_run_final(session_id, request_turn_id, final_reply_text, result, duration_ms)
                 else:
                     reply_meta = meta.copy()
                     reply_meta["turnId"] = request_turn_id
@@ -2898,6 +3616,9 @@ def process_queue_file(path):
                 if session_id:
                     publish_meta["sessionId"] = session_id
                 append_run_diagnostic(session_id, request_turn_id, publish_error_text, result.get("id") if run_request else "")
+        if queue_handle is not None:
+            queue_handle.close()
+            queue_handle = None
         shutil.move(path, os.path.join(DONE_DIR, os.path.basename(path)))
         audit("queue_processed", {"file": os.path.basename(path), "replyKind": meta.get("kind"), "workerPid": os.getpid()})
         return True
@@ -2920,7 +3641,7 @@ def process_queue_file(path):
                 pass
 
 def main():
-    for path in [ROOT, QUEUE_DIR, DONE_DIR, MANUALS_DIR, GOALS_DIR]:
+    for path in [ROOT, QUEUE_DIR, DONE_DIR, MANUALS_DIR, GOALS_DIR, WORKFLOWS_DIR]:
         ensure_dir(path)
     append_message("agent", "Sentaurus VM agent worker started. API credentials are read only from VM-local config.", "vm-agent-worker", {"kind": "worker_started"})
     while not os.path.exists(STOP_PATH):

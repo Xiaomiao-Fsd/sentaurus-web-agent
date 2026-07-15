@@ -133,7 +133,8 @@ type EnrichedVmAgentAttachmentRef = VmAgentAttachmentRef & {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.7.0";
+const agentVersion = "0.8.0";
+const defaultAgentsSource = readFileSync(new URL("../../remote/AGENTS.md", import.meta.url), "utf8");
 const dfiseExtractorSource = readFileSync(new URL("../../remote/dfise_idvg_extract.py", import.meta.url), "utf8");
 const dfiseExtractorSha256 = createHash("sha256").update(dfiseExtractorSource, "utf8").digest("hex");
 const localWorkerSource = readFileSync(new URL("../../../../agent_worker.py", import.meta.url), "utf8");
@@ -196,7 +197,7 @@ import socket
 import time
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.7.0"
+AGENT_VERSION = "0.8.0"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -334,7 +335,7 @@ payload = {
     "version": AGENT_VERSION,
     "hostname": socket.gethostname(),
     "user": getpass.getuser(),
-    "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "vm_model_switching", "sentaurus_session_output"],
+    "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "vm_model_switching", "sentaurus_session_output", "session_workflow_v1", "goal_lifecycle", "plan_mode"],
     "mailbox": "~/.sentaurus-web-agent/vm-agent",
     "messageCount": message_count(),
     "workerRunning": running,
@@ -404,7 +405,7 @@ except ImportError:
     import urllib.request as urllib2
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.7.0"
+AGENT_VERSION = "0.8.0"
 DFISE_EXTRACTOR_VERSION = "dfise-idvg-extract/1"
 DFISE_METRIC_PROFILE = "tcad-idvg-v1"
 DFISE_MIN_SS_WINDOW_POINTS = 7
@@ -3031,9 +3032,10 @@ import uuid
 import zlib
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.7.0"
+AGENT_VERSION = "0.8.0"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
+AGENTS_SOURCE_B64 = "__AGENTS_SOURCE_B64__"
 DFISE_EXTRACTOR_SOURCE_B64 = "__DFISE_EXTRACTOR_SOURCE_B64__"
 DFISE_EXTRACTOR_SHA256 = "__DFISE_EXTRACTOR_SHA256__"
 
@@ -3049,6 +3051,7 @@ DONE_DIR = os.path.join(ROOT, "processed")
 MESSAGES_PATH = os.path.join(ROOT, "messages.jsonl")
 AUDIT_PATH = os.path.join(ROOT, "audit.jsonl")
 WORKER_PATH = os.path.join(ROOT, "agent_worker.py")
+AGENTS_PATH = os.path.join(ROOT, "AGENTS.md")
 DFISE_EXTRACTOR_PATH = os.path.join(ROOT, "dfise_idvg_extract.py")
 CAPABILITIES_DIR = os.path.join(ROOT, "capabilities")
 DFISE_CAPABILITY_PATH = os.path.join(CAPABILITIES_DIR, "dfise-plt-postprocess-v1.json")
@@ -3707,6 +3710,20 @@ def write_worker_files():
     with open(WORKER_PATH, "wb") as handle:
         handle.write(worker_source)
     os.chmod(WORKER_PATH, 0o700)
+    if not os.path.lexists(AGENTS_PATH):
+        agents_source = base64.b64decode(AGENTS_SOURCE_B64)
+        descriptor = None
+        try:
+            descriptor = os.open(AGENTS_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                handle.write(agents_source)
+        except OSError:
+            if not os.path.lexists(AGENTS_PATH):
+                raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
     extractor_source = base64.b64decode(DFISE_EXTRACTOR_SOURCE_B64)
     extractor_hash = hashlib.sha256(extractor_source).hexdigest()
     if extractor_hash != DFISE_EXTRACTOR_SHA256:
@@ -3725,6 +3742,8 @@ def write_worker_files():
                 "Use the fixed dfise-idvg-v1 postprocess for readable DF-ISE .plt Id-Vg extraction.",
                 "Do not generate Inspect cv_* extraction or dynamic Tcl/Python parsers.",
                 "Read actual drain biases from file content and reject expected-bias mismatches.",
+                "Support max-adjacent-slope-v1 and two-point-log-interpolation-v1 SS definitions.",
+                "Allow the DIBL constant-current target to differ from the Vth target.",
                 "Declare success only when all required finite metrics are present.",
                 "Publish non-image outputs as general files and PNG outputs as images."
             ]
@@ -3738,12 +3757,13 @@ def write_worker_files():
                 "llmModels": ["gpt-5.5"],
                 "llmApiStyle": "openai-responses",
                 "llmReasoningEffort": "max",
+                "llmReasoningSummary": "auto",
                 "vmAgentLlmTimeoutSeconds": 600,
                 "vmAgentMaxAutodebugAttempts": 5
             }, indent=2, sort_keys=True) + "\n")
     if not os.path.exists(ENV_EXAMPLE_PATH):
         with open(ENV_EXAMPLE_PATH, "w") as handle:
-            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_MODELS=gpt-5.5\nLLM_API_STYLE=openai-responses\nLLM_REASONING_EFFORT=max\nVM_AGENT_LLM_TIMEOUT_SECONDS=600\nVM_AGENT_MAX_AUTODEBUG_ATTEMPTS=5\n")
+            handle.write("LLM_API_BASE=https://your-openai-compatible-base/v1\nLLM_API_KEY=put-real-key-here-inside-vm-only\nLLM_MODEL=gpt-5.5\nLLM_MODELS=gpt-5.5\nLLM_API_STYLE=openai-responses\nLLM_REASONING_EFFORT=max\nLLM_REASONING_SUMMARY=auto\nVM_AGENT_LLM_TIMEOUT_SECONDS=600\nVM_AGENT_MAX_AUTODEBUG_ATTEMPTS=5\n")
 
 def stop_worker(pid):
     if not pid:
@@ -3794,7 +3814,7 @@ def build_status(message_count_value=None):
         "version": AGENT_VERSION,
         "hostname": socket.gethostname(),
         "user": getpass.getuser(),
-        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "vm_model_switching", "sentaurus_skills", "sentaurus_run_request", "sentaurus_autodebug", "sentaurus_session_output"],
+        "capabilities": ["relay_message", "history", "vm_worker", "vm_local_llm_config", "vm_model_switching", "sentaurus_skills", "sentaurus_run_request", "sentaurus_autodebug", "sentaurus_session_output", "session_workflow_v1", "goal_lifecycle", "plan_mode"],
         "instanceCount": len(instances),
         "latestInstance": instances[-1] if instances else None,
         "mailbox": "~/.sentaurus-web-agent/vm-agent",
@@ -4129,10 +4149,12 @@ export function remoteAgentScript(request: RemoteAgentRequest): string {
     `DFISE_EXTRACTOR_SHA256 = "${dfiseExtractorSha256}"`
   );
   const encodedWorker = Buffer.from(workerSource, "utf8").toString("base64");
+  const encodedAgents = Buffer.from(defaultAgentsSource, "utf8").toString("base64");
   const encodedExtractor = Buffer.from(dfiseExtractorSource, "utf8").toString("base64");
   return remoteControlScript
     .replace("__REQUEST_B64__", encodedRequest)
     .replace("__WORKER_SOURCE_B64__", encodedWorker)
+    .replace("__AGENTS_SOURCE_B64__", encodedAgents)
     .replace("__DFISE_EXTRACTOR_SOURCE_B64__", encodedExtractor)
     .replace("__DFISE_EXTRACTOR_SHA256__", dfiseExtractorSha256);
 }

@@ -61,7 +61,7 @@ function syntheticRows(vd: number, order = ["gate OuterVoltage", "drain OuterVol
   });
 }
 
-function runSynthetic(lowPathname: string, highPathname: string, outputDir: string) {
+function runSynthetic(lowPathname: string, highPathname: string, outputDir: string, extraArgs: string[] = []) {
   const result = spawnSync("python", [
     parserPath,
     "--low", lowPathname,
@@ -70,7 +70,8 @@ function runSynthetic(lowPathname: string, highPathname: string, outputDir: stri
     "--expected-high-vd", "0.8",
     "--min-points", "8",
     "--output-prefix", path.join(outputDir, "idvg_synthetic"),
-    "--stdout-json"
+    "--stdout-json",
+    ...extraArgs
   ], { encoding: "utf8" });
   return {
     result,
@@ -174,6 +175,39 @@ test("parser resolves reordered datasets by name", () => {
     assert.equal(payload.status, "ok");
     assert.equal(payload.inputs.low.actualVd, 0.05);
     assert.equal(payload.inputs.high.actualVd, 0.8);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("two-point SS and an independent DIBL current use log-current interpolation", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dfise-two-point-"));
+  try {
+    const datasets = ["gate OuterVoltage", "drain OuterVoltage", "drain TotalCurrent"];
+    const low = path.join(tempDir, "low.plt");
+    const high = path.join(tempDir, "high.plt");
+    writeDfise(low, datasets, [syntheticRows(0.05)]);
+    writeDfise(high, datasets, [syntheticRows(0.8).map(([vg, vd, current]) => [vg, vd, current * 10])]);
+    const { result, payload } = runSynthetic(low, high, tempDir, [
+      "--ss-method", "two-point-log-interpolation-v1",
+      "--ss-current-min", "1e-9",
+      "--ss-current-max", "1e-8",
+      "--vth-current", "1e-6",
+      "--dibl-current", "1e-7"
+    ]);
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(payload.methods.ss, "two-point-log-interpolation-v1");
+    assert.equal(payload.parameters.diblCurrentAperUm, 1e-7);
+    assert.equal(payload.parameters.vthCurrentAperUm, 1e-6);
+    assert.ok(Math.abs(payload.metrics.ssLowMvPerDec - 100) <= 1e-9);
+    assert.ok(Math.abs(payload.metrics.ssHighMvPerDec - 100) <= 1e-9);
+    assert.ok(Math.abs(payload.metrics.vgLowAtSsMinV - 0.3) <= 1e-12);
+    assert.ok(Math.abs(payload.metrics.vgLowAtSsMaxV - 0.4) <= 1e-12);
+    assert.ok(Math.abs(payload.metrics.vgLowAtDiblCurrentV - 0.5) <= 1e-12);
+    assert.ok(Math.abs(payload.metrics.vgHighAtDiblCurrentV - 0.4) <= 1e-12);
+    assert.ok(Math.abs(payload.metrics.diblMvPerV - (100 / 0.75)) <= 1e-9);
+    assert.match(fs.readFileSync(payload.outputs.report, "utf8"), /SS_method=two-point-log-interpolation-v1/);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

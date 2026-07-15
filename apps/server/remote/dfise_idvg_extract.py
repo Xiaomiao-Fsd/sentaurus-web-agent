@@ -22,6 +22,7 @@ EXTRACTOR_VERSION = "dfise-idvg-extract/1"
 METRIC_PROFILE = "tcad-idvg-v1"
 VTH_METHOD = "constant-current-log-interpolation-v1"
 SS_METHOD = "max-adjacent-slope-v1"
+SS_TWO_POINT_METHOD = "two-point-log-interpolation-v1"
 DIBL_METHOD = "actual-drain-bias-difference-v1"
 FALLBACK_WIDTH = 33
 FALLBACK_COLUMNS = {
@@ -77,6 +78,7 @@ INCOMPLETE_CODES = set([
     "INSUFFICIENT_POINTS",
     "NO_VALID_POINTS",
     "NONFINITE_METRIC",
+    "DIBL_NOT_COVERED",
     "SS_WINDOW_NOT_COVERED",
     "VTH_NOT_COVERED",
 ])
@@ -303,7 +305,7 @@ def parse_curve(path, min_points, bias_tolerance):
     }
 
 
-def calculate_vth(points, target_current):
+def calculate_gate_voltage_at_current(points, target_current, error_code, target_label):
     for index in range(1, len(points)):
         vg0, id0 = points[index - 1]
         vg1, id1 = points[index]
@@ -320,17 +322,39 @@ def calculate_vth(points, target_current):
             return vg0 + fraction * (vg1 - vg0)
     if points and points[-1][1] == target_current:
         return points[-1][0]
-    raise ExtractionError("VTH_NOT_COVERED", "Curve does not cross the constant-current Vth target", {
+    raise ExtractionError(error_code, "Curve does not cross the constant-current %s target" % target_label, {
         "targetCurrentAperUm": target_current,
         "idMinAperUm": min(item[1] for item in points),
         "idMaxAperUm": max(item[1] for item in points),
     })
 
 
-def calculate_ss(points, current_min, current_max):
+def calculate_vth(points, target_current):
+    return calculate_gate_voltage_at_current(points, target_current, "VTH_NOT_COVERED", "Vth")
+
+
+def calculate_ss(points, current_min, current_max, method):
+    window_points = [item for item in points if current_min <= item[1] <= current_max]
+    if method == SS_TWO_POINT_METHOD:
+        vg_at_min = calculate_gate_voltage_at_current(points, current_min, "SS_WINDOW_NOT_COVERED", "SS lower-current")
+        vg_at_max = calculate_gate_voltage_at_current(points, current_max, "SS_WINDOW_NOT_COVERED", "SS upper-current")
+        decades = math.log10(current_max) - math.log10(current_min)
+        if decades <= 0 or vg_at_max <= vg_at_min:
+            raise ExtractionError("SS_WINDOW_NOT_COVERED", "Two-point SS interpolation did not produce an increasing gate-voltage interval", {
+                "ssCurrentMinAperUm": current_min,
+                "ssCurrentMaxAperUm": current_max,
+                "vgAtMinV": vg_at_min,
+                "vgAtMaxV": vg_at_max,
+            })
+        return {
+            "valueMvPerDec": 1000.0 * (vg_at_max - vg_at_min) / decades,
+            "windowPointCount": len(window_points),
+            "adjacentPairCount": max(0, len(window_points) - 1),
+            "vgAtMinV": vg_at_min,
+            "vgAtMaxV": vg_at_max,
+        }
     best_slope = None
     usable_pairs = 0
-    window_points = [item for item in points if current_min <= item[1] <= current_max]
     for index in range(1, len(points)):
         vg0, id0 = points[index - 1]
         vg1, id1 = points[index]
@@ -352,7 +376,11 @@ def calculate_ss(points, current_min, current_max):
             "idMinAperUm": min(item[1] for item in points),
             "suggestedSweepDirection": "extend Vg lower" if points[0][1] > current_min else "extend Vg range",
         })
-    return 1000.0 / best_slope, len(window_points), usable_pairs
+    return {
+        "valueMvPerDec": 1000.0 / best_slope,
+        "windowPointCount": len(window_points),
+        "adjacentPairCount": usable_pairs,
+    }
 
 
 def validate_expected_bias(curve, expected, tolerance, label):
@@ -518,7 +546,7 @@ def success_payload(args, low, high, metrics, outputs):
         "extractorVersion": EXTRACTOR_VERSION,
         "methods": {
             "vth": VTH_METHOD,
-            "ss": SS_METHOD,
+            "ss": args.ss_method,
             "dibl": DIBL_METHOD,
         },
         "units": {
@@ -568,6 +596,7 @@ def success_payload(args, low, high, metrics, outputs):
             "expectedHighVd": args.expected_high_vd,
             "biasToleranceV": args.bias_tolerance,
             "vthCurrentAperUm": args.vth_current,
+            "diblCurrentAperUm": args.dibl_current,
             "ssCurrentMinAperUm": args.ss_current_min,
             "ssCurrentMaxAperUm": args.ss_current_max,
             "minimumPointCount": args.min_points,
@@ -598,11 +627,22 @@ def write_outputs(args, low, high, metrics):
         "high.validPointCount=%s" % high["validPointCount"],
         "Vth_low=%s V" % stable_number(metrics["vthLowV"]),
         "Vth_high=%s V" % stable_number(metrics["vthHighV"]),
+        "DIBL.current=%s A/um" % stable_number(args.dibl_current),
+        "DIBL.Vg_low=%s V" % stable_number(metrics["vgLowAtDiblCurrentV"]),
+        "DIBL.Vg_high=%s V" % stable_number(metrics["vgHighAtDiblCurrentV"]),
+        "SS_method=%s" % args.ss_method,
         "SS_low=%s mV/dec" % stable_number(metrics["ssLowMvPerDec"]),
         "SS_high=%s mV/dec" % stable_number(metrics["ssHighMvPerDec"]),
         "DIBL=%s mV/V" % stable_number(metrics["diblMvPerV"]),
         "",
     ]
+    if "vgLowAtSsMinV" in metrics:
+        report_lines[-1:-1] = [
+            "SS_low.Vg_at_min=%s V" % stable_number(metrics["vgLowAtSsMinV"]),
+            "SS_low.Vg_at_max=%s V" % stable_number(metrics["vgLowAtSsMaxV"]),
+            "SS_high.Vg_at_min=%s V" % stable_number(metrics["vgHighAtSsMinV"]),
+            "SS_high.Vg_at_max=%s V" % stable_number(metrics["vgHighAtSsMaxV"]),
+        ]
     write_text(outputs["report"], "\n".join(report_lines))
     dat_lines = [
         "status=ok",
@@ -612,11 +652,22 @@ def write_outputs(args, low, high, metrics):
         "actual_vd_high_v=%s" % stable_number(high["actualVd"]),
         "vth_low_v=%s" % stable_number(metrics["vthLowV"]),
         "vth_high_v=%s" % stable_number(metrics["vthHighV"]),
+        "dibl_current_a_per_um=%s" % stable_number(args.dibl_current),
+        "vg_low_at_dibl_current_v=%s" % stable_number(metrics["vgLowAtDiblCurrentV"]),
+        "vg_high_at_dibl_current_v=%s" % stable_number(metrics["vgHighAtDiblCurrentV"]),
+        "ss_method=%s" % args.ss_method,
         "ss_low_mv_per_dec=%s" % stable_number(metrics["ssLowMvPerDec"]),
         "ss_high_mv_per_dec=%s" % stable_number(metrics["ssHighMvPerDec"]),
         "dibl_mv_per_v=%s" % stable_number(metrics["diblMvPerV"]),
         "",
     ]
+    if "vgLowAtSsMinV" in metrics:
+        dat_lines[-1:-1] = [
+            "vg_low_at_ss_min_v=%s" % stable_number(metrics["vgLowAtSsMinV"]),
+            "vg_low_at_ss_max_v=%s" % stable_number(metrics["vgLowAtSsMaxV"]),
+            "vg_high_at_ss_min_v=%s" % stable_number(metrics["vgHighAtSsMinV"]),
+            "vg_high_at_ss_max_v=%s" % stable_number(metrics["vgHighAtSsMaxV"]),
+        ]
     write_text(outputs["metricsDat"], "\n".join(dat_lines))
     write_plot_png(outputs["plot"], low["points"], high["points"])
     return outputs
@@ -643,6 +694,8 @@ def error_payload(error, args):
             "expectedHighVd": args.expected_high_vd,
             "biasToleranceV": args.bias_tolerance,
             "vthCurrentAperUm": args.vth_current,
+            "diblCurrentAperUm": args.dibl_current,
+            "ssMethod": args.ss_method,
             "ssCurrentMinAperUm": args.ss_current_min,
             "ssCurrentMaxAperUm": args.ss_current_max,
         },
@@ -659,6 +712,7 @@ def parse_args(argv):
     parser.add_argument("--expected-high-vd", type=float)
     parser.add_argument("--bias-tolerance", type=float, default=1e-6)
     parser.add_argument("--vth-current", type=float, default=1e-7)
+    parser.add_argument("--dibl-current", type=float)
     parser.add_argument("--ss-current-min", type=float, default=1e-12)
     parser.add_argument("--ss-current-max", type=float, default=1e-7)
     parser.add_argument("--ss-method", default=SS_METHOD)
@@ -675,6 +729,7 @@ def validate_arguments(args):
         ("expected-high-vd", args.expected_high_vd, True),
         ("bias-tolerance", args.bias_tolerance, False),
         ("vth-current", args.vth_current, False),
+        ("dibl-current", args.dibl_current, True),
         ("ss-current-min", args.ss_current_min, False),
         ("ss-current-max", args.ss_current_max, False),
     ]
@@ -687,6 +742,8 @@ def validate_arguments(args):
         raise ExtractionError("INVALID_ARGUMENT", "--bias-tolerance must be greater than zero")
     if args.vth_current <= 0:
         raise ExtractionError("INVALID_ARGUMENT", "--vth-current must be greater than zero")
+    if args.dibl_current is not None and args.dibl_current <= 0:
+        raise ExtractionError("INVALID_ARGUMENT", "--dibl-current must be greater than zero")
     if args.ss_current_min <= 0 or args.ss_current_max <= 0:
         raise ExtractionError("INVALID_ARGUMENT", "SS current bounds must be greater than zero")
     if args.ss_current_min >= args.ss_current_max:
@@ -713,7 +770,9 @@ def run(argv=None):
     if args.metric_profile != METRIC_PROFILE:
         print(json.dumps(error_payload(ExtractionError("UNSUPPORTED_METRIC_PROFILE", "Unsupported metric profile", {"metricProfile": args.metric_profile}), args), sort_keys=True))
         return 2
-    if args.ss_method not in [SS_METHOD, "max-adjacent-v1"]:
+    if args.ss_method == "max-adjacent-v1":
+        args.ss_method = SS_METHOD
+    if args.ss_method not in [SS_METHOD, SS_TWO_POINT_METHOD]:
         print(json.dumps(error_payload(ExtractionError("UNSUPPORTED_SS_METHOD", "Unsupported SS method", {"ssMethod": args.ss_method}), args), sort_keys=True))
         return 2
     metrics_path = output_paths(args.output_prefix)["metricsJson"]
@@ -727,21 +786,33 @@ def run(argv=None):
                 "actualLowVd": low["actualVd"],
                 "actualHighVd": high["actualVd"],
             })
+        args.dibl_current = args.dibl_current if args.dibl_current is not None else args.vth_current
         vth_low = calculate_vth(low["points"], args.vth_current)
         vth_high = calculate_vth(high["points"], args.vth_current)
-        ss_low, low_window_points, low_pairs = calculate_ss(low["points"], args.ss_current_min, args.ss_current_max)
-        ss_high, high_window_points, high_pairs = calculate_ss(high["points"], args.ss_current_min, args.ss_current_max)
+        dibl_vg_low = calculate_gate_voltage_at_current(low["points"], args.dibl_current, "DIBL_NOT_COVERED", "DIBL")
+        dibl_vg_high = calculate_gate_voltage_at_current(high["points"], args.dibl_current, "DIBL_NOT_COVERED", "DIBL")
+        ss_low = calculate_ss(low["points"], args.ss_current_min, args.ss_current_max, args.ss_method)
+        ss_high = calculate_ss(high["points"], args.ss_current_min, args.ss_current_max, args.ss_method)
         metrics = {
             "vthLowV": vth_low,
             "vthHighV": vth_high,
-            "ssLowMvPerDec": ss_low,
-            "ssHighMvPerDec": ss_high,
-            "diblMvPerV": 1000.0 * (vth_low - vth_high) / (high["actualVd"] - low["actualVd"]),
-            "ssLowWindowPointCount": low_window_points,
-            "ssHighWindowPointCount": high_window_points,
-            "ssLowAdjacentPairCount": low_pairs,
-            "ssHighAdjacentPairCount": high_pairs,
+            "ssLowMvPerDec": ss_low["valueMvPerDec"],
+            "ssHighMvPerDec": ss_high["valueMvPerDec"],
+            "diblMvPerV": 1000.0 * (dibl_vg_low - dibl_vg_high) / (high["actualVd"] - low["actualVd"]),
+            "vgLowAtDiblCurrentV": dibl_vg_low,
+            "vgHighAtDiblCurrentV": dibl_vg_high,
+            "ssLowWindowPointCount": ss_low["windowPointCount"],
+            "ssHighWindowPointCount": ss_high["windowPointCount"],
+            "ssLowAdjacentPairCount": ss_low["adjacentPairCount"],
+            "ssHighAdjacentPairCount": ss_high["adjacentPairCount"],
         }
+        if args.ss_method == SS_TWO_POINT_METHOD:
+            metrics.update({
+                "vgLowAtSsMinV": ss_low["vgAtMinV"],
+                "vgLowAtSsMaxV": ss_low["vgAtMaxV"],
+                "vgHighAtSsMinV": ss_high["vgAtMinV"],
+                "vgHighAtSsMaxV": ss_high["vgAtMaxV"],
+            })
         if not all(finite(value) for key, value in metrics.items() if key.endswith(("V", "Dec"))):
             raise ExtractionError("NONFINITE_METRIC", "Required metric is not finite")
         outputs = write_outputs(args, low, high, metrics)

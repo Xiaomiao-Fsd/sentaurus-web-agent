@@ -99,9 +99,12 @@ LLM_API_KEY=your-real-key
 LLM_MODEL=gpt-5.5
 LLM_MODELS=gpt-5.5,gpt-5.4
 LLM_API_STYLE=chat-completions # or openai-responses
+LLM_REASONING_SUMMARY=auto # off|auto|concise|detailed for compatible Responses endpoints
 ```
 
 `LLM_MODEL` is the primary model. `LLM_MODELS` is an optional comma-separated fallback list that is tried entirely inside the CentOS VM, so the VM agent can keep running independently when one provider channel returns 503.
+
+For Responses-style providers, the worker requests a public reasoning summary and publishes it separately from the final answer. Unsupported providers are retried without the summary field. Raw hidden reasoning is never written to VM message history.
 
 The agent also writes `config.example.json` and `.env.example` in that VM directory. Do not copy real keys back to the host repo.
 
@@ -166,7 +169,7 @@ and executes only these allowlisted tool forms:
 - `sdevice <file>`
 - `inspect -batch -f <file>`
 
-Run files must use safe ASCII basenames and one of `.cmd`, `.des`, `.par`, `.scm`, `.tcl`, `.txt`, or `.dat`. Arbitrary shell commands, hidden files, path traversal, and unsupported extensions are rejected. The final chat message includes the VM run directory, each step's exit code, and generated log/artifact file names. A smoke test on CentOS has verified `sde` execution through this path.
+Run files must use safe ASCII basenames and one of `.cmd`, `.des`, `.par`, `.scm`, `.tcl`, `.txt`, or `.dat`. Arbitrary shell commands, hidden files, path traversal, and unsupported extensions are rejected. When typed Id-Vg postprocessing is present, the final chat message is generated from `postprocessResults` and includes actual biases, point counts, Vth, SS, DIBL, extraction definitions, and prioritized result artifacts. A smoke test on CentOS has verified `sde` execution through this path.
 
 ## Development commands
 
