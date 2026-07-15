@@ -51,6 +51,29 @@ export function isAgentStreamingDraft(message: VmAgentMessage): boolean {
     || state === "streaming";
 }
 
+export function isAgentTurnTerminal(message: VmAgentMessage): boolean {
+  const kind = messageKind(message);
+  if (message.role === "system") return kind === "llm_error" || kind === "worker_error";
+  if (message.role !== "agent") return false;
+  if (kind === "agent_reasoning_summary"
+    || kind.startsWith("agent_reasoning_summary_")
+    || kind === "agent_thinking"
+    || kind === "worklog_summary"
+    || kind === "file_operation"
+    || kind === "tool_run"
+    || kind === "run_progress"
+    || kind === "run_diagnostic"
+    || kind === "vm_agent_attachments"
+    || kind === "agent_trace"
+    || kind === "worker_ready") return false;
+  return message.meta?.terminal === true
+    || kind === "run_final"
+    || kind === "agent_response_done"
+    || kind === "agent_response_error"
+    || kind === "llm"
+    || kind === "llm_error";
+}
+
 function metaString(message: VmAgentMessage, key: string): string | null {
   const value = message.meta?.[key];
   return typeof value === "string" && value.trim() ? value : null;

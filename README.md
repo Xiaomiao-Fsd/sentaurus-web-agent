@@ -106,6 +106,8 @@ LLM_REASONING_SUMMARY=auto # off|auto|concise|detailed for compatible Responses 
 
 For Responses-style providers, the worker streams public reasoning summary items separately from the final answer. Summary deltas are keyed by provider item and summary index, while observable file/tool/run activity remains in structured worklogs. The former standalone progress event stream has been removed. Unsupported providers are retried without the summary field. Raw hidden reasoning is never written to VM message history.
 
+Auto-debug retries reuse a previously successful Id-Vg branch when the failed and successful branches can be identified unambiguously. Reused PLT inputs must still exist inside the prior run and match the SHA-256 values recorded by the fixed extractor; otherwise the worker conservatively falls back to a full retry.
+
 The agent also writes `config.example.json` and `.env.example` in that VM directory. Do not copy real keys back to the host repo.
 
 Optional Sentaurus manuals or converted reference notes can be placed in VM-local text formats under:

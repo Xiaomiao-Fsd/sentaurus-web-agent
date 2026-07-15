@@ -28,7 +28,7 @@ except ImportError:
     fcntl = None
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.9.0"
+AGENT_VERSION = "0.9.1"
 DFISE_EXTRACTOR_VERSION = "dfise-idvg-extract/1"
 DFISE_METRIC_PROFILE = "tcad-idvg-v1"
 DFISE_MIN_SS_WINDOW_POINTS = 7
@@ -616,6 +616,9 @@ def append_run_final(session_id, turn_id_value, content, result, duration_ms=Non
     meta["foldable"] = False
     meta["collapsedByDefault"] = False
     meta["summaryOfGroup"] = True
+    meta["terminal"] = True
+    meta["done"] = True
+    meta["streamState"] = "done"
     status = safe_text(result.get("status"), 80) if isinstance(result, dict) else ""
     if status:
         meta["runStatus"] = status
@@ -2250,7 +2253,53 @@ def setup_from_run_request(request):
             setup[key] = value
     return setup
 
-def execute_run_request(request, session_id="", turn_id_value=""):
+def stage_reused_artifacts(run_dir, reuse_plan, session_id="", turn_id_value="", run_id=""):
+    if not isinstance(reuse_plan, dict):
+        return []
+    source_run_id = safe_text(reuse_plan.get("sourceRunId"), 180).strip()
+    if not re.match(r"^run_[A-Za-z0-9_-]+$", source_run_id):
+        raise ValueError("selective repair source run id is invalid")
+    source_root = os.path.abspath(os.path.join(RUNS_DIR, source_run_id))
+    runs_root = os.path.abspath(RUNS_DIR)
+    if not source_root.startswith(runs_root + os.sep) or not os.path.isdir(source_root):
+        raise ValueError("selective repair source run is unavailable")
+    artifacts = reuse_plan.get("artifacts") or []
+    if not isinstance(artifacts, list) or len(artifacts) > 8:
+        raise ValueError("selective repair artifact plan is invalid")
+    reused = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            raise ValueError("selective repair artifact item is invalid")
+        source_name = safe_file_name(item.get("sourcePath"))
+        target_name = safe_file_name(item.get("targetPath"))
+        if os.path.splitext(source_name)[1].lower() != ".plt" or os.path.splitext(target_name)[1].lower() != ".plt":
+            raise ValueError("selective repair may only reuse validated .plt inputs")
+        expected_hash = safe_text(item.get("sha256"), 128).strip().lower()
+        if not re.match(r"^[a-f0-9]{64}$", expected_hash):
+            raise ValueError("selective repair artifact hash is invalid")
+        source = os.path.abspath(os.path.join(source_root, source_name))
+        target = os.path.abspath(os.path.join(run_dir, target_name))
+        if not source.startswith(source_root + os.sep) or not target.startswith(os.path.abspath(run_dir) + os.sep):
+            raise ValueError("selective repair artifact path escapes its run directory")
+        if not os.path.isfile(source) or sha256_path(source) != expected_hash:
+            raise ValueError("selective repair source artifact failed hash validation: %s" % source_name)
+        if os.path.exists(target):
+            raise ValueError("selective repair target already exists: %s" % target_name)
+        shutil.copy2(source, target)
+        if sha256_path(target) != expected_hash:
+            raise ValueError("selective repair copied artifact failed hash validation: %s" % target_name)
+        size = os.path.getsize(target)
+        reused.append({
+            "sourceRunId": source_run_id,
+            "sourcePath": source_name,
+            "targetPath": target_name,
+            "sha256": expected_hash,
+            "size": size,
+        })
+        append_file_operation(session_id, turn_id_value, "reused", target_name, OUTPUT_CATEGORY_RESULTS, size, run_id)
+    return reused
+
+def execute_run_request(request, session_id="", turn_id_value="", reuse_plan=None):
     ensure_dir(RUNS_DIR)
     title = safe_text(request.get("title") or session_id or "sentaurus-job", 120)
     run_id = "run_%s_%s_%s" % (datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"), safe_run_slug(title), uuid.uuid4().hex[:6])
@@ -2286,6 +2335,13 @@ def execute_run_request(request, session_id="", turn_id_value=""):
         write_utf8(os.path.join(run_dir, name), content)
         written.append(name)
         append_file_operation(session_id, turn_id_value, "created", name, OUTPUT_CATEGORY_PARAMS, len(content), run_id)
+    reused_artifacts = stage_reused_artifacts(run_dir, reuse_plan, session_id, turn_id_value, run_id)
+    for item in reused_artifacts:
+        target_name = item.get("targetPath")
+        if target_name not in written:
+            written.append(target_name)
+    if len(written) > 30:
+        raise ValueError("run request and reused artifacts contain too many files")
     steps = request.get("steps") or []
     if not isinstance(steps, list) or not steps:
         tool = safe_text(request.get("tool"), 40).strip().lower()
@@ -2308,6 +2364,12 @@ def execute_run_request(request, session_id="", turn_id_value=""):
         "postprocess": postprocess,
         "status": "running",
     }
+    if reused_artifacts:
+        manifest["reusedArtifacts"] = reused_artifacts
+        manifest["selectiveRepair"] = {
+            "sourceRunId": safe_text((reuse_plan or {}).get("sourceRunId"), 180),
+            "skippedSteps": (reuse_plan or {}).get("skippedSteps") or [],
+        }
     write_utf8(os.path.join(run_dir, "run_request.json"), json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
     append_file_operation(session_id, turn_id_value, "created", "run_request.json", OUTPUT_CATEGORY_PARAMS, 0, run_id)
     audit("sentaurus_run_started", {"runId": run_id, "title": title, "sessionId": session_id})
@@ -2601,6 +2663,130 @@ def is_recoverable_run_failure(result):
     ]
     return not any(marker in text for marker in nonrecoverable)
 
+BRANCH_GENERIC_TOKENS = set([
+    "cmd", "des", "device", "drain", "gate", "high", "idvg", "low", "mesh", "msh",
+    "plt", "repair", "retry", "run", "sde", "sdevice", "sweep", "transfer", "vd", "vds",
+])
+
+def normalized_branch_token(value):
+    token = safe_text(value, 80).strip().lower()
+    aliases = {
+        "engineering": "eng",
+        "practical": "eng",
+        "reference": "ideal",
+    }
+    return aliases.get(token, token)
+
+def file_branch_tokens(value):
+    name = os.path.splitext(os.path.basename(safe_text(value, 220).strip().lower()))[0]
+    tokens = set()
+    for raw in re.findall(r"[a-z]+", name):
+        token = normalized_branch_token(raw)
+        if token and token not in BRANCH_GENERIC_TOKENS:
+            tokens.add(token)
+    return tokens
+
+def dfise_branch_tokens(value):
+    spec = value.get("request") if isinstance(value, dict) and isinstance(value.get("request"), dict) else value
+    if not isinstance(spec, dict):
+        return set()
+    low = file_branch_tokens(spec.get("lowInput"))
+    high = file_branch_tokens(spec.get("highInput"))
+    return low.intersection(high) if low and high else set()
+
+def prepare_selective_repair_request(next_run_request, previous_result):
+    if not isinstance(next_run_request, dict) or not isinstance(previous_result, dict):
+        return next_run_request, None
+    results = [item for item in (previous_result.get("postprocessResults") or []) if isinstance(item, dict) and item.get("kind") == "dfise-idvg-v1"]
+    successful = [item for item in results if item.get("status") == "ok" and item.get("exitCode") == 0]
+    failed = [item for item in results if item.get("status") != "ok" or item.get("exitCode") != 0]
+    if not successful or not failed:
+        return next_run_request, None
+    successful_tokens = set()
+    failed_tokens = set()
+    for item in successful:
+        successful_tokens.update(dfise_branch_tokens(item))
+    for item in failed:
+        failed_tokens.update(dfise_branch_tokens(item))
+    droppable_tokens = successful_tokens.difference(failed_tokens)
+    if not droppable_tokens or not failed_tokens:
+        return next_run_request, None
+    try:
+        candidate = json.loads(json.dumps(next_run_request, ensure_ascii=True))
+        next_specs = normalize_postprocess_request(candidate)
+    except Exception:
+        return next_run_request, None
+    source_run_id = safe_text(previous_result.get("id"), 180).strip()
+    source_root = os.path.abspath(os.path.join(RUNS_DIR, source_run_id))
+    if not re.match(r"^run_[A-Za-z0-9_-]+$", source_run_id) or not os.path.isdir(source_root):
+        return next_run_request, None
+    reuse_artifacts = []
+    seen_targets = set()
+    for item in successful:
+        branch_tokens = dfise_branch_tokens(item)
+        matches = [spec for spec in next_specs if branch_tokens and branch_tokens.intersection(dfise_branch_tokens(spec))]
+        if len(matches) != 1:
+            return next_run_request, None
+        previous_spec = item.get("request") if isinstance(item.get("request"), dict) else {}
+        next_spec = matches[0]
+        inputs = item.get("inputs") if isinstance(item.get("inputs"), dict) else {}
+        for label, input_key in [("low", "lowInput"), ("high", "highInput")]:
+            input_meta = inputs.get(label) if isinstance(inputs.get(label), dict) else {}
+            try:
+                source_name = safe_file_name(previous_spec.get(input_key))
+                target_name = safe_file_name(next_spec.get(input_key))
+            except Exception:
+                return next_run_request, None
+            expected_hash = safe_text(input_meta.get("sha256"), 128).strip().lower()
+            source = os.path.abspath(os.path.join(source_root, source_name))
+            if target_name in seen_targets or not re.match(r"^[a-f0-9]{64}$", expected_hash):
+                return next_run_request, None
+            if not source.startswith(source_root + os.sep) or not os.path.isfile(source) or sha256_path(source) != expected_hash:
+                return next_run_request, None
+            seen_targets.add(target_name)
+            reuse_artifacts.append({"sourcePath": source_name, "targetPath": target_name, "sha256": expected_hash})
+    request_file_names = set()
+    for item in candidate.get("files") or []:
+        if isinstance(item, dict):
+            request_file_names.add(safe_text(item.get("name"), 180).strip())
+    if any(item.get("targetPath") in request_file_names for item in reuse_artifacts):
+        return next_run_request, None
+    steps = candidate.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        return next_run_request, None
+    kept_steps = []
+    skipped_steps = []
+    failed_branch_step_found = False
+    for step in steps:
+        if not isinstance(step, dict):
+            kept_steps.append(step)
+            continue
+        entry = safe_text(step.get("input") or step.get("entry") or step.get("entryFile"), 180).strip()
+        tokens = file_branch_tokens(entry)
+        if tokens.intersection(failed_tokens):
+            failed_branch_step_found = True
+            kept_steps.append(step)
+        elif tokens.intersection(droppable_tokens):
+            skipped_steps.append({"tool": safe_text(step.get("tool"), 40), "input": entry})
+        else:
+            kept_steps.append(step)
+    if not failed_branch_step_found or not kept_steps:
+        return next_run_request, None
+    skipped_inputs = set(item.get("input") for item in skipped_steps)
+    candidate["steps"] = kept_steps
+    candidate["files"] = [
+        item for item in (candidate.get("files") or [])
+        if not isinstance(item, dict) or safe_text(item.get("name"), 180).strip() not in skipped_inputs
+    ]
+    plan = {
+        "sourceRunId": source_run_id,
+        "artifacts": reuse_artifacts,
+        "skippedSteps": skipped_steps,
+        "failedBranchTokens": sorted(failed_tokens),
+        "reusedBranchTokens": sorted(droppable_tokens),
+    }
+    return candidate, plan
+
 def build_repair_prompt(original_user_text, previous_run_request, result, attempts):
     failed = first_failed_step(result)
     failed_input = safe_text(failed.get("input"), 180).strip() if failed else ""
@@ -2651,6 +2837,8 @@ def build_repair_prompt(original_user_text, previous_run_request, result, attemp
         "- For DF-ISE .plt extraction, keep kind=dfise-idvg-v1 and only adjust lowInput/highInput, expected biases, outputPrefix, or the SDevice sweep that produces the inputs.",
         "- Never generate, edit, replace, or inline the fixed dfise_idvg_extract.py parser. Never replace it with Inspect cv_* or dynamic Tcl parsing.",
         "- If convergence failed, adjust solver, physics, or sweep settings conservatively.",
+        "- If one of multiple independent Id-Vg postprocess branches already succeeded, keep that successful postprocess spec but return executable steps only for the failed branch; the worker can hash-verify and reuse the successful branch PLT inputs.",
+        "- Preserve clear branch prefixes such as ideal_* and eng_* in deck and PLT names so the worker can prove which independent branch is safe to skip.",
         "",
         "Durable SDE/SDevice generation guardrails:",
         deck_generation_guardrails(),
@@ -2704,9 +2892,10 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
     repair_notes = []
     latest_setup = initial_setup
     stop_reason = ""
+    reuse_plan = None
     for attempt_no in range(1, max_attempts + 1):
         append_worklog(session_id, turn_id_value, "tool", "Starting Sentaurus attempt %s/%s and recording files/tool steps." % (attempt_no, max_attempts))
-        result = execute_run_request(run_request, session_id, turn_id_value)
+        result = execute_run_request(run_request, session_id, turn_id_value, reuse_plan)
         result["autoDebugAttempt"] = attempt_no
         attempts.append(result)
         if result.get("status") == "succeeded":
@@ -2735,8 +2924,18 @@ def run_with_autodebug(original_user_text, initial_run_request, visible_reply, s
                 stop_reason = "repair LLM did not produce a corrected run request"
                 append_run_diagnostic(session_id, turn_id_value, "Auto-debug did not return a new executable run request.", result.get("id"))
                 break
-            run_request = apply_locked_idvg_contract(next_run_request, contract)
-            append_worklog(session_id, turn_id_value, "debug", "Generated repaired run request; preparing next attempt.", result.get("id"))
+            repaired_request = apply_locked_idvg_contract(next_run_request, contract)
+            run_request, reuse_plan = prepare_selective_repair_request(repaired_request, result)
+            if reuse_plan:
+                append_worklog(
+                    session_id,
+                    turn_id_value,
+                    "debug",
+                    "Selective repair will reuse %s validated PLT input(s) and skip %s successful branch step(s)." % (len(reuse_plan.get("artifacts") or []), len(reuse_plan.get("skippedSteps") or [])),
+                    result.get("id"),
+                )
+            else:
+                append_worklog(session_id, turn_id_value, "debug", "Generated repaired run request; preparing next attempt.", result.get("id"))
         except Exception as exc:
             stop_reason = "repair LLM failed: %s" % safe_text(str(exc), 500)
             append_run_diagnostic(session_id, turn_id_value, "Auto-debug repair call failed: %s" % safe_text(str(exc), 500), result.get("id"))
@@ -3176,7 +3375,7 @@ def call_llm_model(user_text, config, model, system, on_reasoning_event=None):
                 "content-type": "application/json",
                 "authorization": "Bearer %s" % config.get("api_key"),
                 "accept": "text/event-stream",
-                "user-agent": "sentaurus-vm-agent/0.9.0",
+                "user-agent": "sentaurus-vm-agent/0.9.1",
             })
             return urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS))
         try:
@@ -3211,7 +3410,7 @@ def call_llm_model(user_text, config, model, system, on_reasoning_event=None):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.9.0",
+        "user-agent": "sentaurus-vm-agent/0.9.1",
     })
     response = urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS)).read()
     try:
@@ -3688,6 +3887,9 @@ def process_queue_file(path):
                     reply_meta["kind"] = reply_meta.get("kind") or "run_final"
                     reply_meta["foldable"] = False
                     reply_meta["collapsedByDefault"] = False
+                    reply_meta["terminal"] = True
+                    reply_meta["done"] = True
+                    reply_meta["streamState"] = "done"
                     append_message("agent", reply, "vm-agent-worker", reply_meta, "final")
             if publish_error_text:
                 publish_meta = {"kind": "vm_agent_attachment_publish_error"}
@@ -3702,6 +3904,9 @@ def process_queue_file(path):
         return True
     except Exception as exc:
         error_meta = {"kind": "worker_error"}
+        error_meta["terminal"] = True
+        error_meta["done"] = True
+        error_meta["streamState"] = "error"
         if session_id:
             error_meta["sessionId"] = session_id
         if request_turn_id:

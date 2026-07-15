@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import type { VmAgentHistoryResponse } from "@sentaurus-agent/shared";
-import { mergeMessageList } from "../src/messageStreams.js";
+import { isAgentTurnTerminal, mergeMessageList } from "../src/messageStreams.js";
 import {
   assertHistoryResponse,
   completedSessionHistoryState,
@@ -148,6 +148,18 @@ test("frontend merges reasoning deltas into one completed thinking item", () => 
   assert.equal(merged[0]?.meta?.kind, "agent_reasoning_summary");
   assert.equal(merged[0]?.meta?.thinkingStatus, "completed");
   assert.equal(merged[0]?.meta?.done, true);
+});
+
+test("only terminal agent messages end a pending turn", () => {
+  const base = { role: "agent" as const, content: "status", createdAt: "2026-07-16T00:00:00Z" };
+  assert.equal(isAgentTurnTerminal({ ...base, id: "worklog", meta: { kind: "worklog_summary" } }), false);
+  assert.equal(isAgentTurnTerminal({ ...base, id: "tool", meta: { kind: "tool_run", status: "succeeded" } }), false);
+  assert.equal(isAgentTurnTerminal({ ...base, id: "reasoning", meta: { kind: "agent_reasoning_summary_done", done: true } }), false);
+  assert.equal(isAgentTurnTerminal({ ...base, id: "attachments", meta: { kind: "vm_agent_attachments" } }), false);
+  assert.equal(isAgentTurnTerminal({ ...base, id: "llm", meta: { kind: "llm" } }), true);
+  assert.equal(isAgentTurnTerminal({ ...base, id: "run-final", meta: { kind: "run_final", terminal: true, done: true } }), true);
+  assert.equal(isAgentTurnTerminal({ ...base, id: "custom-final", meta: { kind: "status", terminal: true } }), true);
+  assert.equal(isAgentTurnTerminal({ ...base, id: "error", role: "system", meta: { kind: "worker_error" } }), true);
 });
 
 

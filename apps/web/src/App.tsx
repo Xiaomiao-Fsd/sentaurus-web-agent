@@ -62,7 +62,7 @@ import {
   loadingSessionHistoryState,
   shouldLoadSelectedSessionHistory
 } from "./sessionHistory.js";
-import { isAgentStreamingDraft, mergeMessageList, messageKind } from "./messageStreams.js";
+import { isAgentTurnTerminal, mergeMessageList, messageKind } from "./messageStreams.js";
 import { vmSessionFilesCompletionState } from "./vmSessionFilesState.js";
 import type { SessionHistoryState } from "./sessionHistory.js";
 import { errorMessage, formatBytes, formatCompactNumber, formatDate, formatFullDate, normalizeAuthToken, shortId } from "./utils/format.js";
@@ -526,12 +526,17 @@ function turnHasWorklog(group: ChatTurnGroup): boolean {
 }
 
 function turnHasFinalResult(group: ChatTurnGroup): boolean {
-  return group.messages.some((message) => {
-    if (message.role === "user" || isFoldableWorklogMessage(message)) return false;
-    if (isAgentStreamingDraft(message)) return false;
-    const kind = messageKind(message);
-    return kind === "run_final" || kind === "vm_agent_attachments" || message.meta?.summaryOfGroup === true || message.role === "agent";
-  });
+  return group.messages.some(isAgentTurnTerminal);
+}
+
+function sessionHasActiveTurn(messages: VmAgentMessage[], sessionId: string | null): boolean {
+  if (!sessionId) return false;
+  const visible = messagesForSession(messages, sessionId).filter((message) => !isThinkingMessage(message) && !isProgressMessage(message));
+  return chatItemsForMessages(visible).some((item) => (
+    item.type === "turn"
+    && item.group.messages.some((message) => message.role === "user")
+    && !turnHasFinalResult(item.group)
+  ));
 }
 
 function globalAgentMessages(messages: VmAgentMessage[]): VmAgentMessage[] {
@@ -673,9 +678,7 @@ function sentaurusRunStatus(message: VmAgentMessage): string | null {
 
 function hasAgentReplyForSession(messages: VmAgentMessage[] | undefined, sessionId: string): boolean {
   return !!messages?.some((message) => {
-    const isAgentReply = message.role === "agent" && !isAgentStreamingDraft(message);
-    const isSystemError = message.role === "system" && (message.meta?.kind === "llm_error" || message.meta?.kind === "worker_error");
-    if (!isAgentReply && !isSystemError) return false;
+    if (!isAgentTurnTerminal(message)) return false;
     const scopedSession = messageSessionId(message);
     return scopedSession === sessionId || scopedSession === null;
   });
@@ -845,6 +848,7 @@ export default function App() {
   const [attachmentUploading, setAttachmentUploading] = useState(false);
   const [pendingReplySessionId, setPendingReplySessionId] = useState<string | null>(null);
   const [pendingReplyRetryCount, setPendingReplyRetryCount] = useState(0);
+  const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const [vmAgentStreamState, setVmAgentStreamState] = useState("idle");
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
@@ -965,11 +969,11 @@ export default function App() {
     return true;
   }), [currentMessages]);
   const chatItems = useMemo(() => chatItemsForMessages(visibleMessages), [visibleMessages]);
-  const hasActiveWorklog = useMemo(() => chatItems.some((item) => (
-    item.type === "turn"
-    && item.group.messages.some((message) => message.role === "user")
-    && !turnHasFinalResult(item.group)
-  )), [chatItems]);
+  const hasActiveWorklog = useMemo(() => sessionHasActiveTurn(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
+  const pendingReplyHasActiveWorklog = useMemo(
+    () => sessionHasActiveTurn(vmAgentMessages, pendingReplySessionId),
+    [pendingReplySessionId, vmAgentMessages]
+  );
   const thinkingMessages = useMemo(() => thinkingMessagesForSession(vmAgentMessages, selectedRunId), [selectedRunId, vmAgentMessages]);
   const messageSimulationSetup = useMemo(() => latestSimulationSetupFromMessages(currentMessages), [currentMessages]);
   const currentSimulationSetup = messageSimulationSetup || runDetail?.run.simulationSetup || selectedRun?.simulationSetup || null;
@@ -1000,7 +1004,17 @@ export default function App() {
   const canSendMessage = !!authKey && !!selectedRunId && !messageSending && !attachmentUploading;
   const composerDropEnabled = !!authKey && !!selectedRunId && !messageSending && !attachmentUploading;
   const waitingForAgentReply = !!pendingReplySessionId;
-  const startAgentDisabled = !authKey || vmAgentConnectLoading || messageSending || waitingForAgentReply;
+  const waitingForSelectedAgentReply = !!pendingReplySessionId && pendingReplySessionId === selectedRunId;
+  const agentTurnActive = waitingForSelectedAgentReply || hasActiveWorklog;
+  const startAgentDisabled = !authKey || vmAgentConnectLoading || messageSending || waitingForAgentReply || hasActiveWorklog;
+
+  useEffect(() => {
+    setThinkingExpanded(false);
+  }, [selectedRunId]);
+
+  useEffect(() => {
+    if (agentTurnActive && thinkingMessages.length > 0) setThinkingExpanded(true);
+  }, [agentTurnActive, thinkingMessages.at(-1)?.id]);
 
   useEffect(() => {
     if (!hasActiveWorklog) return undefined;
@@ -1651,12 +1665,18 @@ export default function App() {
   }
 
   function renderThinkingPanel() {
-    if (thinkingMessages.length === 0 && !waitingForAgentReply) return null;
+    if (thinkingMessages.length === 0 && !agentTurnActive) return null;
     const latest = thinkingMessages.at(-1);
     return (
-      <details className="thinking-panel" open={waitingForAgentReply || undefined}>
+      <details
+        className="thinking-panel"
+        open={agentTurnActive || thinkingExpanded}
+        onToggle={(event) => {
+          if (!agentTurnActive) setThinkingExpanded(event.currentTarget.open);
+        }}
+      >
         <summary>
-          <span>{waitingForAgentReply ? "Agent working" : "Agent summary"}</span>
+          <span>{agentTurnActive ? "Agent working" : "Agent summary"}</span>
           <small>{latest ? `${thinkingStageLabel(latest)} / ${metaString(latest, "thinkingStatus") || "running"}` : "waiting"}</small>
         </summary>
         <div className="thinking-steps">
@@ -2183,13 +2203,13 @@ export default function App() {
       const nextRetry = pendingReplyRetryRef.current + 1;
       pendingReplyRetryRef.current = nextRetry;
       setPendingReplyRetryCount(nextRetry);
-      if (nextRetry >= MAX_REPLY_RETRIES) {
+      if (nextRetry >= MAX_REPLY_RETRIES && !pendingReplyHasActiveWorklog) {
         clearPendingAgentReply(waitingSessionId);
         recordSystemNotice("No agent reply after 30 minutes. Stopped waiting so the agent can be restarted manually.", "error");
       }
     }, REPLY_RETRY_INTERVAL_MS);
     return () => window.clearInterval(interval);
-  }, [pendingReplySessionId, authKey]);
+  }, [pendingReplySessionId, authKey, pendingReplyHasActiveWorklog]);
 
   useEffect(() => {
     if (!selectedRunId || !authKey) return;
@@ -2279,7 +2299,7 @@ export default function App() {
   const pendingAttachmentCount = pendingAttachments.length + pendingVmAttachments.length;
   const composerStatus = pendingAttachmentCount
     ? `${pendingAttachmentCount} attachment${pendingAttachmentCount === 1 ? "" : "s"} ready`
-    : waitingForAgentReply
+    : agentTurnActive
       ? "Waiting for agent"
       : canSendMessage
         ? "Ready"
@@ -2434,9 +2454,15 @@ export default function App() {
             <button
               onClick={() => void handleConnectVmAgent()}
               disabled={startAgentDisabled}
-              title={waitingForAgentReply ? "Disabled while waiting for the current agent reply to avoid interrupting a long task." : undefined}
+              title={agentTurnActive ? "Disabled while the current agent turn is still active." : undefined}
             >
-              {waitingForAgentReply ? `Waiting reply ${formatReplyWait(pendingReplyRetryCount)}` : vmAgentConnectLoading ? "Starting" : "Start agent"}
+              {agentTurnActive
+                ? waitingForSelectedAgentReply
+                  ? `Waiting reply ${formatReplyWait(pendingReplyRetryCount)}`
+                  : "Turn active"
+                : vmAgentConnectLoading
+                  ? "Starting"
+                  : "Start agent"}
             </button>
             {waitingForAgentReply && (
               <button className="secondary danger-button" onClick={forceStopPendingReply} type="button">

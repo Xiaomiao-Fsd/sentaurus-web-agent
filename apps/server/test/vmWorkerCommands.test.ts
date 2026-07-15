@@ -199,6 +199,125 @@ print("WORKER_STREAM_RESULT=" + json.dumps({
   }
 });
 
+test("VM worker selectively retries a failed Id-Vg branch with hash-verified reuse", async () => {
+  const temporaryHome = await mkdtemp(path.join(os.tmpdir(), "sentaurus-worker-selective-repair-test-"));
+  const scriptPath = path.join(temporaryHome, "worker_selective_repair_test.py");
+  const harness = String.raw`
+ensure_dir(RUNS_DIR)
+source_run_id = "run_previous"
+source_dir = os.path.join(RUNS_DIR, source_run_id)
+ensure_dir(source_dir)
+write_utf8(os.path.join(source_dir, "ideal_idvg_low.plt"), "ideal-low")
+write_utf8(os.path.join(source_dir, "ideal_idvg_high.plt"), "ideal-high")
+low_hash = sha256_path(os.path.join(source_dir, "ideal_idvg_low.plt"))
+high_hash = sha256_path(os.path.join(source_dir, "ideal_idvg_high.plt"))
+previous_result = {
+    "id": source_run_id,
+    "status": "incomplete",
+    "postprocessResults": [
+        {
+            "kind": "dfise-idvg-v1", "status": "ok", "exitCode": 0,
+            "request": {"lowInput": "ideal_idvg_low.plt", "highInput": "ideal_idvg_high.plt"},
+            "inputs": {"low": {"sha256": low_hash}, "high": {"sha256": high_hash}},
+        },
+        {
+            "kind": "dfise-idvg-v1", "status": "incomplete", "exitCode": 3,
+            "errorCode": "VTH_NOT_COVERED",
+            "request": {"lowInput": "eng_idvg_low.plt", "highInput": "eng_idvg_high.plt"},
+        },
+    ],
+}
+next_request = {
+    "title": "selective-repair",
+    "files": [
+        {"name": "ideal28_sde.cmd", "content": "ideal sde"},
+        {"name": "ideal_low.cmd", "content": "ideal low"},
+        {"name": "ideal_high.cmd", "content": "ideal high"},
+        {"name": "eng28_sde.cmd", "content": "eng sde"},
+        {"name": "eng_low.cmd", "content": "eng low"},
+        {"name": "eng_high.cmd", "content": "eng high"},
+    ],
+    "steps": [
+        {"tool": "sde", "input": "ideal28_sde.cmd"},
+        {"tool": "sdevice", "input": "ideal_low.cmd"},
+        {"tool": "sdevice", "input": "ideal_high.cmd"},
+        {"tool": "sde", "input": "eng28_sde.cmd"},
+        {"tool": "sdevice", "input": "eng_low.cmd"},
+        {"tool": "sdevice", "input": "eng_high.cmd"},
+    ],
+    "postprocess": [
+        {"kind": "dfise-idvg-v1", "lowInput": "ideal_idvg_low.plt", "highInput": "ideal_idvg_high.plt", "outputPrefix": "ideal_retry"},
+        {"kind": "dfise-idvg-v1", "lowInput": "eng_idvg_low.plt", "highInput": "eng_idvg_high.plt", "outputPrefix": "eng_retry"},
+    ],
+}
+selected_request, reuse_plan = prepare_selective_repair_request(next_request, previous_result)
+already_selective_request = dict(next_request)
+already_selective_request["steps"] = list(next_request["steps"][3:])
+already_selective_request["files"] = list(next_request["files"][3:])
+_, already_selective_plan = prepare_selective_repair_request(already_selective_request, previous_result)
+destination = os.path.join(RUNS_DIR, "run_destination")
+ensure_dir(destination)
+reused = stage_reused_artifacts(destination, reuse_plan)
+tamper_error = ""
+write_utf8(os.path.join(source_dir, "ideal_idvg_low.plt"), "tampered")
+try:
+    second_destination = os.path.join(RUNS_DIR, "run_destination_tampered")
+    ensure_dir(second_destination)
+    stage_reused_artifacts(second_destination, reuse_plan)
+except Exception as exc:
+    tamper_error = str(exc)
+ambiguous_result = dict(previous_result)
+ambiguous_result["postprocessResults"] = [dict(item) for item in previous_result["postprocessResults"]]
+ambiguous_result["postprocessResults"][0] = dict(ambiguous_result["postprocessResults"][0])
+ambiguous_result["postprocessResults"][0]["request"] = {"lowInput": "idvg_low.plt", "highInput": "idvg_high.plt"}
+_, ambiguous_plan = prepare_selective_repair_request(next_request, ambiguous_result)
+terminal_message = append_run_final("session", "turn", "done", {"id": "run_destination", "status": "succeeded"})
+print("WORKER_SELECTIVE_REPAIR_RESULT=" + json.dumps({
+    "steps": [item.get("input") for item in selected_request.get("steps") or []],
+    "files": [item.get("name") for item in selected_request.get("files") or []],
+    "reuseTargets": [item.get("targetPath") for item in reused],
+    "reusedContents": [open(os.path.join(destination, item.get("targetPath")), "rb").read().decode("utf-8") for item in reused],
+    "skippedSteps": [item.get("input") for item in reuse_plan.get("skippedSteps") or []],
+    "tamperError": tamper_error,
+    "ambiguousFallback": ambiguous_plan is None,
+    "alreadySelectiveReuseCount": len((already_selective_plan or {}).get("artifacts") or []),
+    "alreadySelectiveSkippedCount": len((already_selective_plan or {}).get("skippedSteps") or []),
+    "terminalMeta": terminal_message.get("meta"),
+}, ensure_ascii=True, sort_keys=True))
+`;
+
+  try {
+    await writeFile(scriptPath, `${embeddedWorkerSource()}\n${harness}`, "utf8");
+    const { stdout } = await execFileAsync(process.env.PYTHON || "python", [scriptPath], {
+      env: {
+        ...process.env,
+        HOME: temporaryHome,
+        USERPROFILE: temporaryHome,
+        SENTAURUS_VM_AGENT_IMPORT_ONLY: "1"
+      },
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 20_000
+    });
+    const line = stdout.split(/\r?\n/).find((item) => item.startsWith("WORKER_SELECTIVE_REPAIR_RESULT="));
+    assert.ok(line, `worker selective repair harness did not return its result: ${stdout.slice(0, 500)}`);
+    const result = JSON.parse(line.slice("WORKER_SELECTIVE_REPAIR_RESULT=".length)) as Record<string, any>;
+    assert.deepEqual(result.steps, ["eng28_sde.cmd", "eng_low.cmd", "eng_high.cmd"]);
+    assert.deepEqual(result.files, ["eng28_sde.cmd", "eng_low.cmd", "eng_high.cmd"]);
+    assert.deepEqual(result.reuseTargets, ["ideal_idvg_low.plt", "ideal_idvg_high.plt"]);
+    assert.deepEqual(result.reusedContents, ["ideal-low", "ideal-high"]);
+    assert.deepEqual(result.skippedSteps, ["ideal28_sde.cmd", "ideal_low.cmd", "ideal_high.cmd"]);
+    assert.match(result.tamperError, /failed hash validation/);
+    assert.equal(result.ambiguousFallback, true);
+    assert.equal(result.alreadySelectiveReuseCount, 2);
+    assert.equal(result.alreadySelectiveSkippedCount, 0);
+    assert.equal(result.terminalMeta.terminal, true);
+    assert.equal(result.terminalMeta.done, true);
+    assert.equal(result.terminalMeta.streamState, "done");
+  } finally {
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
 test("VM worker final reply is grounded in extracted metrics and publishes a safe execution summary", async () => {
   const temporaryHome = await mkdtemp(path.join(os.tmpdir(), "sentaurus-worker-final-test-"));
   const scriptPath = path.join(temporaryHome, "worker_final_test.py");

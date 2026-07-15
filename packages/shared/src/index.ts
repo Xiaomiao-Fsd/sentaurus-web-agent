@@ -54,6 +54,7 @@ export type VmAgentMessageMeta = {
   append?: boolean;
   delta?: boolean;
   done?: boolean;
+  terminal?: boolean;
   streamState?: "queued" | "running" | "streaming" | "done" | "completed" | "error" | string;
   thinkingStage?: string;
   thinkingStatus?: string;
