@@ -43,7 +43,9 @@ test("default VM AGENTS.md templates stay aligned and cover the simulation workf
     "## 8. 数据对比规则",
     "## 9. 论文阅读与仿真复现",
     "## 10. 模糊需求与参数优化",
-    "## 12. 最终回复格式"
+    "## 12. 最终回复格式",
+    "每段约 100 到 200 个中文字符",
+    "当前阶段与完成进度"
   ]) {
     assert.match(serverTemplate, new RegExp(requiredSection.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }

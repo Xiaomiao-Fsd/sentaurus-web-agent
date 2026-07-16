@@ -28,7 +28,7 @@ except ImportError:
     fcntl = None
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.9.1"
+AGENT_VERSION = "0.9.2"
 DFISE_EXTRACTOR_VERSION = "dfise-idvg-extract/1"
 DFISE_METRIC_PROFILE = "tcad-idvg-v1"
 DFISE_MIN_SS_WINDOW_POINTS = 7
@@ -3196,8 +3196,18 @@ def deck_generation_guardrails():
         "- If a previous run failed with duplicate region/contact names, PM_UNBALANCED_STATES, or unknown snmesh option, repair those exact patterns before changing physics goals.",
     ])
 
+def public_reasoning_summary_instructions():
+    return (
+        u"所有 provider 允许公开的 reasoning summary 必须使用简体中文。仅在形成有意义的阶段进展时生成摘要，"
+        u"每段约 100 到 200 个中文字符，并整合说明：当前处于什么阶段、已经完成到哪里；检查、新建或修改了哪些文件，"
+        u"没有文件变化时明确说明；遇到的具体问题或阻塞；下一步准备如何解决和验证。不要输出英文摘要、单行微标题、"
+        u"项目符号、Markdown 粗体标题、planning/streaming/final 等状态标签，也不要重复改写同一件事。"
+        u"只描述可公开的动作、证据和决策，不泄露隐藏思维链。"
+    )
+
 def build_side_investigation_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context):
     return (
+        public_reasoning_summary_instructions() + u"\n\n" +
         u"You are the Sentaurus TCAD simulation agent running inside the CentOS VM. "
         u"This turn is a /side investigation: answer the side question directly, do not replace the main thread, and do not modify the durable session goal. "
         u"Do not emit <SIMULATION_SETUP>, <SENTAURUS_RUN_REQUEST>, or promise autonomous follow-up work. "
@@ -3375,7 +3385,7 @@ def call_llm_model(user_text, config, model, system, on_reasoning_event=None):
                 "content-type": "application/json",
                 "authorization": "Bearer %s" % config.get("api_key"),
                 "accept": "text/event-stream",
-                "user-agent": "sentaurus-vm-agent/0.9.1",
+                "user-agent": "sentaurus-vm-agent/0.9.2",
             })
             return urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS))
         try:
@@ -3410,7 +3420,7 @@ def call_llm_model(user_text, config, model, system, on_reasoning_event=None):
     request = urllib2.Request(chat_completions_url(config.get("api_base")), body, {
         "content-type": "application/json",
         "authorization": "Bearer %s" % config.get("api_key"),
-        "user-agent": "sentaurus-vm-agent/0.9.1",
+        "user-agent": "sentaurus-vm-agent/0.9.2",
     })
     response = urllib2.urlopen(request, timeout=int(config.get("llm_timeout_seconds") or DEFAULT_LLM_TIMEOUT_SECONDS)).read()
     try:
@@ -3457,6 +3467,7 @@ def plan_mode_system_instructions(workflow):
 
 def build_llm_system_prompt(snapshot, recent_session_context, manual_context, current_goal, agents_context, workflow=None):
     return (
+        public_reasoning_summary_instructions() + u"\n\n" +
         u"You are the Sentaurus TCAD simulation agent running inside the CentOS VM. "
         "Your core mission is to help the user establish complete Sentaurus simulation tasks: clarify the device/process objective, "
         "create or revise SDE/SProcess/SDevice/SWB decks and parameter data, prepare run directories and extraction plans, "

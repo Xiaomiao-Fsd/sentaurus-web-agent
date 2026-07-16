@@ -8,6 +8,7 @@ test("server source wires AGENTS.md relay and local worker sync", () => {
   const workerSource = readFileSync(new URL("../../../agent_worker.py", import.meta.url), "utf8");
 
   assert.match(serviceSource, /const localWorkerSource = readFileSync\(new URL\("\.\.\/\.\.\/\.\.\/\.\.\/agent_worker\.py"/);
+  assert.match(serviceSource, /const agentVersion = "0\.9\.2"/);
   assert.match(serviceSource, /remoteAgentsMdScript/);
   assert.match(serviceSource, /export async function getVmAgentAgentsMd/);
   assert.match(serviceSource, /export async function saveVmAgentAgentsMd/);
@@ -20,5 +21,6 @@ test("server source wires AGENTS.md relay and local worker sync", () => {
   assert.match(workerSource, /def side_investigation_reply/);
   assert.match(workerSource, /def local_goal_reply/);
   assert.match(workerSource, /def excluded_from_main_context/);
+  assert.match(workerSource, /def public_reasoning_summary_instructions/);
   assert.match(workerSource, /command\.get\("name"\) in \["status", "help", "goal", "side"\]/);
 });

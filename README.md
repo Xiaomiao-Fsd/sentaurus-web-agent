@@ -104,7 +104,7 @@ LLM_REASONING_SUMMARY=auto # off|auto|concise|detailed for compatible Responses 
 
 `LLM_MODEL` is the primary model. `LLM_MODELS` is an optional comma-separated fallback list that is tried entirely inside the CentOS VM, so the VM agent can keep running independently when one provider channel returns 503.
 
-For Responses-style providers, the worker streams public reasoning summary items separately from the final answer. Summary deltas are keyed by provider item and summary index, while observable file/tool/run activity remains in structured worklogs. The former standalone progress event stream has been removed. Unsupported providers are retried without the summary field. Raw hidden reasoning is never written to VM message history.
+For Responses-style providers, the worker streams public reasoning summary items separately from the final answer. The system prompt requires coherent Simplified Chinese phase summaries of roughly 100-200 Chinese characters covering progress, touched files, concrete blockers, and the next resolution or verification step. Summary deltas remain keyed by provider item and summary index for machine consumers, while the human CLI aggregates completed items. Unsupported providers are retried without the summary field. Raw hidden reasoning is never written to VM message history.
 
 Auto-debug retries reuse a previously successful Id-Vg branch when the failed and successful branches can be identified unambiguously. Reused PLT inputs must still exist inside the prior run and match the SHA-256 values recorded by the fixed extractor; otherwise the worker conservatively falls back to a full retry.
 

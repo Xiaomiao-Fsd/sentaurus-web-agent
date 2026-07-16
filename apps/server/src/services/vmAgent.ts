@@ -133,7 +133,7 @@ type EnrichedVmAgentAttachmentRef = VmAgentAttachmentRef & {
 };
 
 const agentName = "sentaurus-vm-agent";
-const agentVersion = "0.9.1";
+const agentVersion = "0.9.2";
 const defaultAgentsSource = readFileSync(new URL("../../remote/AGENTS.md", import.meta.url), "utf8");
 const dfiseExtractorSource = readFileSync(new URL("../../remote/dfise_idvg_extract.py", import.meta.url), "utf8");
 const dfiseExtractorSha256 = createHash("sha256").update(dfiseExtractorSource, "utf8").digest("hex");
@@ -197,7 +197,7 @@ import socket
 import time
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.9.1"
+AGENT_VERSION = "0.9.2"
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".sentaurus-web-agent", "vm-agent")
 QUEUE_DIR = os.path.join(ROOT, "queue")
@@ -398,7 +398,7 @@ import uuid
 import zlib
 
 AGENT_NAME = "sentaurus-vm-agent"
-AGENT_VERSION = "0.9.1"
+AGENT_VERSION = "0.9.2"
 REQUEST_B64 = "__REQUEST_B64__"
 WORKER_SOURCE_B64 = "__WORKER_SOURCE_B64__"
 AGENTS_SOURCE_B64 = "__AGENTS_SOURCE_B64__"

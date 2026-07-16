@@ -199,6 +199,58 @@ print("WORKER_STREAM_RESULT=" + json.dumps({
   }
 });
 
+test("VM worker requests coherent Chinese public reasoning summaries", async () => {
+  const temporaryHome = await mkdtemp(path.join(os.tmpdir(), "sentaurus-worker-summary-language-test-"));
+  const scriptPath = path.join(temporaryHome, "worker_summary_language_test.py");
+  const harness = String.raw`
+guidance = public_reasoning_summary_instructions()
+main_prompt = build_llm_system_prompt({}, "", "", "", "", default_session_workflow("session_summary"))
+side_prompt = build_side_investigation_prompt({}, "", "", "", "")
+print("WORKER_SUMMARY_GUIDANCE=" + json.dumps({
+    "version": AGENT_VERSION,
+    "usesChinese": u"简体中文" in guidance,
+    "usesTargetLength": u"100 到 200" in guidance,
+    "coversProgress": u"当前处于什么阶段" in guidance,
+    "coversFiles": u"修改了哪些文件" in guidance,
+    "coversProblem": u"具体问题或阻塞" in guidance,
+    "coversNextStep": u"下一步准备如何解决和验证" in guidance,
+    "rejectsLabels": "planning/streaming/final" in guidance,
+    "mainPromptIncludesGuidance": guidance in main_prompt,
+    "sidePromptIncludesGuidance": guidance in side_prompt,
+}, ensure_ascii=True, sort_keys=True))
+`;
+
+  try {
+    await writeFile(scriptPath, `${embeddedWorkerSource()}\n${harness}`, "utf8");
+    const { stdout } = await execFileAsync(process.env.PYTHON || "python", [scriptPath], {
+      env: {
+        ...process.env,
+        HOME: temporaryHome,
+        USERPROFILE: temporaryHome,
+        SENTAURUS_VM_AGENT_IMPORT_ONLY: "1"
+      },
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 20_000
+    });
+    const line = stdout.split(/\r?\n/).find((item) => item.startsWith("WORKER_SUMMARY_GUIDANCE="));
+    assert.ok(line, `worker summary guidance harness did not return its result: ${stdout.slice(0, 500)}`);
+    assert.deepEqual(JSON.parse(line.slice("WORKER_SUMMARY_GUIDANCE=".length)), {
+      coversFiles: true,
+      coversNextStep: true,
+      coversProblem: true,
+      coversProgress: true,
+      mainPromptIncludesGuidance: true,
+      rejectsLabels: true,
+      sidePromptIncludesGuidance: true,
+      usesChinese: true,
+      usesTargetLength: true,
+      version: "0.9.2"
+    });
+  } finally {
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
 test("VM worker selectively retries a failed Id-Vg branch with hash-verified reuse", async () => {
   const temporaryHome = await mkdtemp(path.join(os.tmpdir(), "sentaurus-worker-selective-repair-test-"));
   const scriptPath = path.join(temporaryHome, "worker_selective_repair_test.py");
